@@ -1,0 +1,314 @@
+import { spawn } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
+import { constants } from 'node:fs';
+import { open, readFile, readdir, readlink } from 'node:fs/promises';
+import { dirname, isAbsolute, join } from 'node:path';
+
+const UUID = '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}';
+const STORE = new RegExp(`^/(?:[^/]+/)*\\.cursor/chats/[^/]+/(${UUID})/store\\.db$`, 'i');
+const SESSION = new RegExp(`^${UUID}$`, 'i');
+const MAX_PASTED_TEXT_BYTES = 8 * 1024 * 1024;
+
+function paneTarget(paneId) {
+  if (typeof paneId !== 'string' || !/^%\d+$/.test(paneId)) throw new Error('A tmux pane ID such as %1 is required');
+  return paneId;
+}
+
+function sessionTarget(sessionId) {
+  if (typeof sessionId !== 'string' || !SESSION.test(sessionId)) throw new Error('An exact Cursor session UUID is required');
+  return sessionId.toLowerCase();
+}
+
+function defaultRunner(tmuxPath, { commandTimeoutMs, maxOutputBytes }) {
+  return (args, { input } = {}) => new Promise((resolve, reject) => {
+    const child = spawn(tmuxPath, args, { shell: false, stdio: ['pipe', 'pipe', 'pipe'] });
+    const stdout = []; const stderr = [];
+    let outputBytes = 0; let settled = false; let killTimer;
+    const settle = (error, result) => {
+      if (settled) return;
+      settled = true; clearTimeout(timeout);
+      if (error) reject(error); else resolve(result);
+    };
+    const abort = (error) => {
+      if (settled) return;
+      // kill() targets only the spawned tmux CLI client PID. Do not kill a
+      // process group, send tmux kill-* commands, or signal the Cursor process.
+      child.kill('SIGTERM');
+      killTimer = setTimeout(() => child.kill('SIGKILL'), 100);
+      killTimer.unref();
+      child.stdin.destroy();
+      settle(error);
+    };
+    const timeout = setTimeout(() => abort(new Error(`tmux ${args[0]} timed out after ${commandTimeoutMs}ms`)), commandTimeoutMs);
+    timeout.unref();
+    const collect = (destination) => (chunk) => {
+      if (settled) return;
+      outputBytes += chunk.length;
+      if (outputBytes > maxOutputBytes) abort(new Error(`tmux ${args[0]} exceeded the ${maxOutputBytes}-byte output limit`));
+      else destination.push(chunk);
+    };
+    child.stdout.on('data', collect(stdout));
+    child.stderr.on('data', collect(stderr));
+    // A server disappearing may close stdin before it consumes the private buffer.
+    child.stdin.on('error', (error) => { if (error.code !== 'EPIPE') abort(error); });
+    child.once('error', (error) => settle(error));
+    child.once('close', (code, signal) => {
+      clearTimeout(killTimer);
+      const result = { stdout: Buffer.concat(stdout).toString('utf8'), stderr: Buffer.concat(stderr).toString('utf8') };
+      if (code === 0) settle(null, result);
+      else settle(new Error(`tmux ${args[0]} failed (${signal || code}): ${result.stderr.trim()}`));
+    });
+    child.stdin.end(input);
+  });
+}
+
+async function batches(values, operation, width = 32) {
+  const output = [];
+  for (let index = 0; index < values.length; index += width) {
+    output.push(...await Promise.all(values.slice(index, index + width).map(operation)));
+  }
+  return output;
+}
+
+async function processStat(procRoot, pid) {
+  try {
+    const text = await readFile(join(procRoot, String(pid), 'stat'), 'utf8');
+    const boundary = text.lastIndexOf(') ');
+    if (boundary < 0 || Number(text.slice(0, text.indexOf(' '))) !== pid) return null;
+    const fields = text.slice(boundary + 2).trim().split(/\s+/);
+    const ppid = Number(fields[1]); const pgrp = Number(fields[2]); const tty = Number(fields[4]); const foregroundPgrp = Number(fields[5]); const startTime = fields[19];
+    if (!Number.isSafeInteger(ppid) || !/^\d+$/.test(startTime || '') || ['Z', 'X', 'x'].includes(fields[0])) return null;
+    return { pid, ppid, pgrp, tty, foregroundPgrp, startTime };
+  } catch { return null; }
+}
+
+function sameProcess(left, right) {
+  return Boolean(left && right && left.pid === right.pid && left.ppid === right.ppid && left.startTime === right.startTime);
+}
+
+function ancestorChain(processes, pid, rootPid) {
+  const chain = []; const seen = new Set();
+  for (let current = processes.get(pid); current && !seen.has(current.pid); current = processes.get(current.ppid)) {
+    seen.add(current.pid); chain.push(current);
+    if (current.pid === rootPid) return chain;
+  }
+  return null;
+}
+
+async function cursorStores(procRoot, pid) {
+  let names;
+  try { names = await readdir(join(procRoot, String(pid), 'fd')); } catch { return []; }
+  const paths = await batches(names.filter((name) => /^\d+$/.test(name)), async (name) => {
+    try { return await readlink(join(procRoot, String(pid), 'fd', name)); } catch { return null; }
+  });
+  return [...new Set(paths.filter((path) => typeof path === 'string' && STORE.test(path)))];
+}
+
+async function readPastedTextFile(filename) {
+  // A nonblocking, non-symlink regular file cannot redirect this read to a pipe
+  // or another session's paste store. Bound reads as well as the initial size:
+  // Cursor may append to the file between stat() and read().
+  const handle = await open(filename, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+  try {
+    const info = await handle.stat();
+    if (!info.isFile()) throw new Error('Cursor pasted text store must be a regular file');
+    if (info.size > MAX_PASTED_TEXT_BYTES) throw new Error('Cursor pasted text store exceeds the 8 MiB limit');
+    const chunks = []; let size = 0;
+    while (size <= MAX_PASTED_TEXT_BYTES) {
+      const buffer = Buffer.alloc(Math.min(64 * 1024, MAX_PASTED_TEXT_BYTES + 1 - size));
+      const { bytesRead } = await handle.read(buffer, 0, buffer.length, null);
+      if (!bytesRead) break;
+      size += bytesRead;
+      if (size > MAX_PASTED_TEXT_BYTES) throw new Error('Cursor pasted text store exceeds the 8 MiB limit');
+      chunks.push(buffer.subarray(0, bytesRead));
+    }
+    const value = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(Buffer.concat(chunks, size)));
+    const plainObject = item => item !== null && typeof item === 'object' && !Array.isArray(item) && Object.getPrototypeOf(item) === Object.prototype;
+    if (!plainObject(value) || !plainObject(value.entries) || Object.values(value.entries).some(text => typeof text !== 'string')) {
+      throw new Error('Cursor pasted text store entries must be a plain string map');
+    }
+    return { entries: value.entries };
+  } finally { await handle.close(); }
+}
+
+/**
+ * Connects to an already-running Cursor TUI. It never starts an agent or changes
+ * tmux configuration. The caller must establish that the prompt is idle and its
+ * draft is empty before paste(); this transport cannot interpret the TUI.
+ *
+ * A test runner may be injected as run(tmuxArgs, { input } = {}), returning
+ * { stdout, stderr }. Input goes to stdin and is never interpreted by a shell.
+ */
+export class TmuxClient {
+  constructor({ tmuxPath = 'tmux', procRoot = '/proc', run, commandTimeoutMs = 5_000, maxOutputBytes = 8 * 1024 * 1024 } = {}) {
+    if (!Number.isSafeInteger(commandTimeoutMs) || commandTimeoutMs <= 0) throw new Error('Tmux command timeout must be a positive integer');
+    if (!Number.isSafeInteger(maxOutputBytes) || maxOutputBytes <= 0) throw new Error('Tmux output limit must be a positive integer');
+    this.procRoot = procRoot;
+    this.run = run || defaultRunner(tmuxPath, { commandTimeoutMs, maxOutputBytes });
+    this.identities = new Map();
+    this.panes = new Map();
+    this.observations = new Map();
+    this.snapshots = new WeakMap();
+  }
+
+  async discover() {
+    try { return await this.scan(); }
+    catch (error) {
+      this.identities = new Map(); this.panes = new Map(); this.observations = new Map();
+      if (error.code === 'ENOENT' || /\bno server running\b|\bno sessions\b|error connecting[^\n]*No such file or directory/i.test(error.message || '')) return [];
+      throw error;
+    }
+  }
+
+  async scan() {
+    // tmux sanitizes literal control characters in formats on some versions.
+    // Keep cwd last so a visible separator inside a path cannot shift fields.
+    const result = await this.run(['list-panes', '-a', '-F', '#{pane_id}|#{pane_pid}|#{pane_in_mode}|#{pane_dead}|#{pane_current_path}']);
+    const panes = String(result.stdout || '').split('\n').flatMap((line) => {
+      const match = /^(%\d+)\|([1-9]\d*)\|([01])\|([01])\|(.*)$/.exec(line);
+      return match ? [{ paneId: match[1], panePid: Number(match[2]), inMode: match[3] === '1', dead: match[4] === '1', paneCwd: match[5] }] : [];
+    });
+    let entries;
+    try { entries = await readdir(this.procRoot); } catch { this.identities = new Map(); this.panes = new Map(); this.observations = new Map(); return []; }
+    const stats = await batches(entries.filter((entry) => /^[1-9]\d*$/.test(entry)), (entry) => processStat(this.procRoot, Number(entry)));
+    const processes = new Map(stats.filter(Boolean).map((stat) => [stat.pid, stat]));
+    const bindings = []; const identities = new Map(); const paneStates = new Map(); const observations = new Map();
+    for (const pane of panes) {
+      const descendants = [...processes.values()].flatMap((stat) => {
+        const chain = ancestorChain(processes, stat.pid, pane.panePid);
+        return chain ? [{ stat, chain }] : [];
+      });
+      const matches = (await batches(descendants, async ({ stat, chain }) => {
+        const stores = await cursorStores(this.procRoot, stat.pid);
+        return stores.map((store) => ({ stat, chain, store }));
+      })).flat();
+      // A pane containing several Cursor databases cannot identify one session.
+      if (new Set(matches.map(({ store }) => store)).size !== 1) continue;
+      const candidate = matches.sort((left, right) => left.chain.length - right.chain.length || left.stat.pid - right.stat.pid)[0];
+      if (!candidate) continue;
+      const rechecked = await Promise.all(candidate.chain.map((stat) => processStat(this.procRoot, stat.pid)));
+      if (!candidate.chain.every((stat, index) => sameProcess(stat, rechecked[index]))) continue;
+      // Closing the database, replacing a process, or leaving the pane invalidates
+      // the observation; a later poll can establish a new binding.
+      if (!(await cursorStores(this.procRoot, candidate.stat.pid)).includes(candidate.store)) continue;
+      let cwd;
+      try { cwd = await readlink(join(this.procRoot, String(candidate.stat.pid), 'cwd')); } catch { continue; }
+      if (!isAbsolute(cwd)) continue;
+      const sessionId = STORE.exec(candidate.store)[1].toLowerCase();
+      const binding = { paneId: pane.paneId, panePid: pane.panePid, agentPid: candidate.stat.pid, agentStartTime: candidate.stat.startTime, cwd, sessionId };
+      bindings.push(binding);
+      const identity = `${candidate.chain.map(({ pid, startTime }) => `${pid}:${startTime}`).join('/')}:${candidate.store}`;
+      identities.set(pane.paneId, identity);
+      const current = rechecked[0]; const paneProcess = rechecked.at(-1);
+      const state = { inMode: pane.inMode, dead: pane.dead, foreground: Number.isSafeInteger(current.tty) && current.tty !== 0 && current.tty === paneProcess.tty && current.pgrp > 0 && current.pgrp === current.foregroundPgrp && current.pgrp === paneProcess.foregroundPgrp };
+      paneStates.set(pane.paneId, state);
+      observations.set(pane.paneId, { binding, identity, state });
+      this.snapshots.set(binding, { ...binding, identity, storePath: candidate.store });
+    }
+    this.identities = identities;
+    this.panes = paneStates;
+    this.observations = observations;
+    return bindings;
+  }
+
+  /** Uses the most recent discovery; pass an object returned by this client. */
+  isVerified(binding) {
+    const snapshot = binding && this.snapshots.get(binding);
+    const latest = snapshot && this.observations.get(snapshot.paneId);
+    return Boolean(latest && latest.identity === snapshot.identity &&
+      Object.keys(snapshot).filter((key) => key !== 'identity' && key !== 'storePath').every((key) => binding[key] === snapshot[key] && latest.binding[key] === snapshot[key]) &&
+      !latest.state.inMode && !latest.state.dead && latest.state.foreground);
+  }
+
+  /** Rechecks the process and foreground immediately; never sends any keys. */
+  async verifiedBinding(binding) {
+    const snapshot = binding && this.snapshots.get(binding);
+    if (!snapshot) throw new Error('A binding returned by this TmuxClient is required');
+    await this.discover();
+    if (!this.isVerified(binding)) throw new Error('Cursor tmux binding changed, is in copy-mode, or is no longer in the foreground');
+    return this.observations.get(snapshot.paneId).binding;
+  }
+
+  /** Reads Cursor's saved paste expansions without sending input to its TUI. */
+  async readPastedTexts(binding) {
+    const current = await this.verifiedBinding(binding);
+    const { storePath } = this.snapshots.get(binding);
+    const stores = await cursorStores(this.procRoot, current.agentPid);
+    if (stores.length !== 1 || stores[0] !== storePath || STORE.exec(storePath)?.[1].toLowerCase() !== current.sessionId) {
+      throw new Error('Cursor tmux database identity changed while reading pasted text');
+    }
+    try {
+      try { return await readPastedTextFile(join(dirname(storePath), 'pasted_text.json')); }
+      catch (error) {
+        if (error.code === 'ENOENT') return { entries: {} };
+        throw error;
+      }
+    } finally {
+      // Missing files also require this check: absence must not hide a reused
+      // PID, a different session, copy-mode, or a changed foreground process.
+      await this.verifiedBinding(binding);
+    }
+  }
+
+  async capture(paneId, { escapes = true } = {}) {
+    const result = await this.run(['capture-pane', '-p', ...(escapes ? ['-e'] : []), '-J', '-S', '-500', '-t', paneTarget(paneId)]);
+    return String(result.stdout || '');
+  }
+
+  async binding(paneId, sessionId, identity) {
+    const target = paneTarget(paneId); const expected = sessionTarget(sessionId);
+    const matches = (await this.discover()).filter((entry) => entry.paneId === target && entry.sessionId === expected);
+    const currentIdentity = this.identities.get(target);
+    if (matches.length !== 1 || !currentIdentity || (identity && identity !== currentIdentity)) {
+      throw new Error('Cursor tmux session changed or is no longer running; no further keys were sent');
+    }
+    const state = this.panes.get(target);
+    if (state.inMode || state.dead || !state.foreground) throw new Error('Cursor tmux pane is in copy-mode, closed, or no longer in the foreground; no further keys were sent');
+    return currentIdentity;
+  }
+
+  async paste(paneId, text, { sessionId, beforePaste, afterPaste } = {}) {
+    if (typeof text !== 'string' || !text.length) throw new Error('A nonempty text prompt is required');
+    if ((beforePaste !== undefined && typeof beforePaste !== 'function') || (afterPaste !== undefined && typeof afterPaste !== 'function')) {
+      throw new Error('Tmux paste guards must be functions');
+    }
+    // LF is the only allowed control character: bracketed paste preserves the
+    // multiline prompt. In particular, ESC, CR, TAB, DEL and C1 are rejected.
+    if (/[\u0000-\u0009\u000b-\u001f\u007f-\u009f]/u.test(text) || !text.isWellFormed()) {
+      throw new Error('Cursor prompts cannot contain terminal control characters or malformed Unicode');
+    }
+    const identity = await this.binding(paneId, sessionId);
+    const buffer = `cursor_bridge_${randomUUID().replaceAll('-', '')}`;
+    try {
+      await this.run(['load-buffer', '-b', buffer, '-'], { input: text });
+      await this.binding(paneId, sessionId, identity);
+      // The caller can reject an active prompt, approval, or a concurrent draft
+      // immediately before any text reaches the TUI.
+      await beforePaste?.();
+      await this.run(['paste-buffer', '-p', '-d', '-b', buffer, '-t', paneId]);
+      await this.binding(paneId, sessionId, identity);
+      // Verify that the visible draft contains exactly this prompt before Enter.
+      // A rejection leaves the draft in place and never submits it.
+      await afterPaste?.();
+      await this.run(['send-keys', '-t', paneId, 'Enter']);
+    } finally {
+      // load-buffer can fail after creation; paste-buffer -d normally removes it.
+      try { await this.run(['delete-buffer', '-b', buffer]); } catch { /* Already absent, or the tmux server exited. */ }
+    }
+  }
+
+  /** Submits an existing draft only after the caller proves its exact contents. */
+  async submitDraft(paneId, { sessionId, beforeSubmit } = {}) {
+    if (typeof beforeSubmit !== 'function') throw new Error('A Cursor draft submission guard is required');
+    const identity = await this.binding(paneId, sessionId);
+    await beforeSubmit();
+    await this.binding(paneId, sessionId, identity);
+    await this.run(['send-keys', '-t', paneId, 'Enter']);
+  }
+
+  async cancel(paneId, { sessionId, key = 'Escape' } = {}) {
+    if (!['Escape', 'C-c'].includes(key)) throw new Error('The Cursor stop key must be Escape or C-c');
+    await this.binding(paneId, sessionId);
+    await this.run(['send-keys', '-t', paneId, key]);
+  }
+}

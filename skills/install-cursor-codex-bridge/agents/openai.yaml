@@ -1,0 +1,4 @@
+interface:
+  display_name: "Install Cursor Codex Bridge"
+  short_description: "Install and manage a remote Cursor bridge for Codex"
+  default_prompt: "Use $install-cursor-codex-bridge to install the bridge using my existing SSH alias and run diagnostics."

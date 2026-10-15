@@ -1,0 +1,41 @@
+{
+  "name": "cursor-codex-bridge",
+  "version": "0.1.1",
+  "private": false,
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "bin": {
+    "cursor-codex": "./cli.mjs"
+  },
+  "scripts": {
+    "test": "node --test *.test.mjs installer/*.test.mjs"
+  },
+  "dependencies": {
+    "wrap-ansi": "10.0.0",
+    "ws": "8.22.0"
+  },
+  "description": "Use remote Cursor Agent sessions and models in the Codex desktop app over SSH",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/KatarinaYuan/cursor-codex-bridge.git"
+  },
+  "homepage": "https://github.com/KatarinaYuan/cursor-codex-bridge#readme",
+  "bugs": {
+    "url": "https://github.com/KatarinaYuan/cursor-codex-bridge/issues"
+  },
+  "files": [
+    "*.mjs",
+    "!*.test.mjs",
+    "installer/*.mjs",
+    "!installer/*.test.mjs",
+    "installer/remote.py",
+    "skills/",
+    "README.md",
+    "docs/",
+    "LICENSE",
+    "installer/bootstrap.py"
+  ]
+}
