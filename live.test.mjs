@@ -384,6 +384,71 @@ test('drafts, approval overlays, shell mode and unrecognized screens never recei
   }
 });
 
+function branchWrappedFooter() {
+  const frameWidth = row('').replace(/\x1b\[[\d;]*m/gu, '').length;
+  const indent = '  ';
+  const pathPrefix = '/fixtures/';
+  const firstLine = `${indent}${pathPrefix}${'a'.repeat(frameWidth - indent.length - pathPrefix.length - 1)} `;
+  assert.equal(firstLine.length, frameWidth);
+  assert.equal(firstLine.at(-1), ' ', 'the separator space occupies the final frame column');
+  return `  ${dim('Composer 2.5 · 5.1%')}\n${dim(firstLine)}\n${indent}${dim('· feat/example')}`;
+}
+
+test('an idle footer with its branch wrapped after the separator submits once to the original pane', async t => {
+  const footer = branchWrappedFooter();
+  const { session, client } = await start(t, { client: new MockTmuxClient(frame({ footer })) });
+  await session.assertReady();
+  assert.equal(session.screen.inputEmpty, true);
+  assert.equal(session.screen.prompt, '');
+  assert.deepEqual(client.calls, []);
+
+  const prompt = 'Continue the example';
+  client.pastedFrame = frame({ input: `→ ${prompt}`, footer });
+  const response = session.prompt([{ type: 'text', text: prompt }]);
+  response.catch(() => {});
+  const submitted = await Promise.race([
+    client.submitted.then(() => true),
+    new Promise(resolve => setTimeout(() => resolve(false), 300)),
+  ]);
+  assert.equal(submitted, true, 'the exact pasted draft with the wrapped footer should receive Enter');
+  assert.deepEqual(client.calls, [
+    { type: 'paste-request', paneId: binding.paneId, text: prompt, sessionId: binding.sessionId },
+    { type: 'paste', paneId: binding.paneId, text: prompt },
+    { type: 'Enter', paneId: binding.paneId },
+  ]);
+  session.acceptHistory(history([turn('old', 'Earlier question'), turn('wrapped-footer', prompt)]));
+  assert.equal((await response).sourceTurn.id, 'wrapped-footer');
+  session.turnCommitted();
+  await session.poll();
+  assert.equal(client.calls.filter(call => call.type === 'Enter').length, 1);
+});
+
+test('a wrapped branch footer still blocks approval rows, menus and an existing local draft without typing', async t => {
+  const footer = branchWrappedFooter();
+  const blocked = [
+    frame({ footer: `${footer}\n  Allow this command? [y/n]` }),
+    frame({ footer: `${footer}\n  ${dim('Always allow')}` }),
+    frame({ input: '→ Keep this local draft', footer }),
+  ];
+  for (const raw of blocked) {
+    const { session, client } = await start(t, { client: new MockTmuxClient(raw) });
+    await assert.rejects(session.assertReady(), /input is unavailable/);
+    await assert.rejects(session.prompt([{ type: 'text', text: 'A native message' }]), /input is unavailable/);
+    assert.deepEqual(client.calls, []);
+    assert.equal(client.raw, raw, 'the original terminal contents must remain untouched');
+    await session.close();
+  }
+});
+
+test('a wrapped branch footer cannot bypass the exact post-paste draft check', async t => {
+  const footer = branchWrappedFooter();
+  const { session, client } = await start(t, { client: new MockTmuxClient(frame({ footer })) });
+  client.pastedFrame = frame({ input: '→ A native message plus local text', footer });
+  await assert.rejects(session.prompt([{ type: 'text', text: 'A native message' }]), /unsubmitted draft/);
+  assert.deepEqual(client.calls.map(call => call.type), ['paste-request', 'paste']);
+  assert.match(client.raw, /plus local text/);
+});
+
 test('a draft arriving immediately before paste prevents both paste and Enter', async t => {
   const { session, client } = await start(t);
   client.beforeGuard = () => { client.raw = frame({ input: '→ Typed concurrently in tmux' }); };

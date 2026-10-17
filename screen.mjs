@@ -47,7 +47,10 @@ function screenLines(raw) {
     if (value === '\n') lines.push({ cells: [] });
     else if (value !== '\r' && !/[\x00-\x08\x0b-\x1f\x7f]/.test(value)) lines.at(-1).cells.push({ value, background, foreground, dim, inverse });
   }
-  for (const line of lines) line.text = line.cells.map(cell => cell.value).join('').trimEnd();
+  for (const line of lines) {
+    line.rawText = line.cells.map(cell => cell.value).join('');
+    line.text = line.rawText.trimEnd();
+  }
   return lines;
 }
 
@@ -92,15 +95,21 @@ function cwdFooter(lines, frameWidth) {
   if (!/^(?:~(?:\/.*)?|\/.*|[A-Za-z]:[\\/].*|\.{1,2}\/.*)$/u.test(lines[0].text.trim())) return false;
   const indent = lines[0].text.match(/^ */)[0].length;
   for (let index = 1; index < lines.length; index++) {
-    const previous = lines[index - 1].text;
+    const previous = lines[index - 1];
+    const continuation = lines[index].text.trim();
+    const separatorContinuation = /^[·•] [^\s]+$/u.test(continuation);
     // Cursor hard-wraps long cwd/branch text at the input frame's right edge.
     // Without a known column width (e.g. wide Unicode), reject continuation
     // rather than treating a menu or approval row as more path text.
-    if (!/^[\x20-\x7e]*$/.test(previous) || previous.length !== frameWidth
+    // A separator can start the next row only when its preceding single space
+    // occupied the final column. Retain that raw space as edge evidence;
+    // arbitrarily padded short paths must not authorize an extra footer row.
+    if (!/^[\x20-\x7e]*$/.test(previous.rawText) || previous.rawText.length !== frameWidth
+      || previous.text.length !== frameWidth - (separatorContinuation ? 1 : 0)
       || lines[index].text.match(/^ */)[0].length !== indent) return false;
-    const continuation = lines[index].text.trim();
-    if (!/^[^\s·•]+(?: [·•] [^\s]+)?$/u.test(continuation)
-      || /^(?:allow|always|deny|accept|approve|cancel|continue|yes|no|enter|escape)(?:\s|$)/iu.test(continuation)) return false;
+    if (!separatorContinuation && !/^[^\s·•]+(?: [·•] [^\s]+)?$/u.test(continuation)
+      || /^(?:allow|always|deny|accept|approve|cancel|continue|yes|no|enter|escape)(?:\s|$)/iu.test(
+        separatorContinuation ? continuation.slice(2) : continuation)) return false;
   }
   return true;
 }

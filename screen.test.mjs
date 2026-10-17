@@ -71,6 +71,46 @@ test('recognizes a hard-wrapped cwd and branch only at the frame edge', () => {
   assert.equal(parseCursorScreen(screen({ footer: footer.replace('studio · feat/bench', 'Allow') })).ready, false);
 });
 
+test('recognizes a wrapped branch separator after a space at the frame edge', () => {
+  // The final separator space occupies column 72 even though display text
+  // trims it. Both rows are synthetic and use the same two-column indent.
+  const cwdFirst = `  /${'a'.repeat(68)} `;
+  for (const separator of ['·', '•']) {
+    const footer = `  ${dim('Composer 2.5 · 5.1%')}\n${dim(cwdFirst)}\n  ${dim(`${separator} feat/example`)}`;
+    assert.equal(parseCursorScreen(screen({ footer })).ready, true);
+    const draft = parseCursorScreen(screen({ footer, input: '→ unfinished draft' }));
+    assert.equal(draft.ready, false);
+    assert.equal(draft.inputAvailable, true);
+    assert.equal(draft.reason, 'input-has-draft');
+  }
+});
+
+test('wrapped branch rows require exact edge geometry, dim styling and branch syntax', () => {
+  const cwdFirst = `  /${'a'.repeat(68)} `;
+  const row = `  ${dim('· feat/example')}`;
+  const footer = (cwd, continuation) => `  ${dim('Composer 2.5 · 5.1%')}\n${cwd}\n${continuation}`;
+  for (const [cwd, continuation] of [
+    [dim(cwdFirst.trimEnd()), row],
+    [dim(`${cwdFirst.trimEnd()}a`), row],
+    [dim(`  /${'a'.repeat(67)}  `), row],
+    [dim(`  /${'a'.repeat(67)} `), row],
+    [dim(`${cwdFirst} `), row],
+    [dim(cwdFirst.replace('a', '界')), row],
+    [cwdFirst, row],
+    [dim(cwdFirst), '  · feat/example'],
+    [dim(cwdFirst), ` ${dim('· feat/example')}`],
+    [dim(cwdFirst), `  ${dim('feat/example')}`],
+    [dim(cwdFirst), `  ${dim('· feat/example extra')}`],
+    [dim(cwdFirst), `  ${dim('· Allow')}`],
+    [dim(cwdFirst), `  ${dim('· Continue')}`],
+    [dim(cwdFirst), `  ${dim('· feat/example')}\n  ${dim('Allow')}`],
+  ]) {
+    const parsed = parseCursorScreen(screen({ footer: footer(cwd, continuation) }));
+    assert.equal(parsed.inputAvailable, false);
+    assert.equal(parsed.reason, 'unrecognized-footer-or-overlay');
+  }
+});
+
 test('status badges cannot disguise approvals, unknown labels, or unstyled menus', () => {
   for (const status of ['\x1b[35mAllow command?\x1b[39m', 'Run Everything', '\x1b[2mRun Everything\x1b[0m']) {
     const footer = ` ${dim('Composer 2.5 · 5.1% · 2 files edited')}   ${status}\n ${dim('/data/workspace')}`;
