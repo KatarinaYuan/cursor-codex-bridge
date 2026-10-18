@@ -1,6 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import wrapAnsi from 'wrap-ansi';
+import stringWidth from 'string-width';
 import { TmuxSession } from './live.mjs';
+import { parseCursorScreen } from './screen.mjs';
 
 // These frames reproduce Cursor's default light-theme capture-pane -e output:
 // user messages use a grey background, while the prompt has an inverse caret.
@@ -33,6 +36,7 @@ class MockTmuxClient {
     this.raw = raw;
     this.calls = [];
     this.captures = 0;
+    this.minimumColumnRequests = [];
     this.submitted = new Promise(resolve => { this.didSubmit = resolve; });
   }
 
@@ -43,6 +47,7 @@ class MockTmuxClient {
   }
 
   async paste(paneId, text, options) {
+    this.minimumColumnRequests.push(options.minimumColumns);
     this.calls.push({ type: 'paste-request', paneId, text, sessionId: options.sessionId });
     await this.beforeGuard?.();
     await options.beforePaste();
@@ -59,7 +64,8 @@ class MockTmuxClient {
     this.pasteReads = (this.pasteReads || 0) + 1;
     return typeof this.pastedTexts === 'function' ? this.pastedTexts() : this.pastedTexts || { entries: {} };
   }
-  async submitDraft(paneId, { sessionId, beforeSubmit }) {
+  async submitDraft(paneId, { sessionId, beforeSubmit, minimumColumns }) {
+    this.minimumColumnRequests.push(minimumColumns);
     this.calls.push({ type: 'submit-draft-request', paneId, sessionId });
     await this.beforeSubmitGuard?.();
     await beforeSubmit();
@@ -68,6 +74,71 @@ class MockTmuxClient {
   }
   async kill() { this.calls.push({ type: 'kill' }); }
   async close() { this.calls.push({ type: 'client-close' }); }
+}
+
+// All contents are synthetic. Cursor reserves seven terminal columns around
+// its input, and keeps only the last six visual rows of an uncollapsed draft.
+const narrowWrapper = `<codex_delegation>\n  <source_thread_id>00000000-1111-4222-8333-444444444444</source_thread_id>\n  <input>${'R'.repeat(260)}</input>\n</codex_delegation>`;
+function sizedFrame(columns, draft = null, overlay = '') {
+  const inputWidth = columns - 7;
+  const paint = text => {
+    return ` \x1b[48;2;242;242;242m${text}${' '.repeat(Math.max(0, columns - 2 - stringWidth(text)))}\x1b[49m`;
+  };
+  const rows = draft === null ? [` ${placeholder('Add a follow-up')}`]
+    : `${draft}\x1b[7m \x1b[27m`.split('\n').flatMap(line =>
+      wrapAnsi(line, inputWidth, { trim: false, hard: true }).split('\n')
+        .map((part, index) => index ? part.replace(/^ +/u, '') : part))
+      .slice(-6).map((part, index) => ` ${index ? '  ' : '→ '}${part}`);
+  return `  Cursor Agent\n  ${dim('v2025.01.01-test')}\n\n${userBox('Earlier question')}\n\n  Earlier answer\n\n${paint('')}\n${rows.map(paint).join('\n')}\n${paint('')}\n\n  ${dim('Composer 2.5 · 5.1%')}\n  ${dim('/fixture/project')}\n${overlay}\n`;
+}
+
+class NarrowTmuxClient extends MockTmuxClient {
+  constructor(draft = null) {
+    super();
+    this.columns = 93;
+    this.draft = draft;
+    this.overlay = '';
+    this.columnTransactions = [];
+  }
+
+  async capture(paneId) {
+    this.raw = sizedFrame(this.columns, this.draft, this.overlay);
+    return super.capture(paneId);
+  }
+
+  async withColumns(minimumColumns, callback) {
+    this.minimumColumnRequests.push(minimumColumns);
+    const original = this.columns;
+    this.columns = Math.max(original, minimumColumns ?? original);
+    const transaction = { requested: minimumColumns, active: this.columns };
+    this.columnTransactions.push(transaction);
+    try { return await callback(); }
+    finally { this.columns = original; transaction.restored = this.columns; }
+  }
+
+  async paste(paneId, text, options) {
+    this.calls.push({ type: 'paste-request', paneId, text, sessionId: options.sessionId });
+    return this.withColumns(options.minimumColumns, async () => {
+      await this.beforeGuard?.();
+      await options.beforePaste();
+      this.calls.push({ type: 'paste', paneId, text });
+      this.draft = this.alterPastedText?.(text) ?? text;
+      await this.afterPasteGuard?.();
+      await options.afterPaste();
+      this.calls.push({ type: 'Enter', paneId });
+      this.didSubmit();
+    });
+  }
+
+  async submitDraft(paneId, options) {
+    this.calls.push({ type: 'submit-draft-request', paneId, sessionId: options.sessionId });
+    return this.withColumns(options.minimumColumns, async () => {
+      await this.beforeSubmitGuard?.();
+      await options.beforeSubmit();
+      this.calls.push({ type: 'Enter', paneId });
+      this.didSubmit();
+    });
+  }
 }
 
 async function start(t, { client = new MockTmuxClient(), source = history([turn('old', 'Earlier question', 'Earlier answer')]), sourceTurnIds = [], models, modelDefinitions } = {}) {
@@ -188,6 +259,7 @@ test('a long paste token must expand to the exact original text before Enter', a
   const response = session.prompt([{ type: 'text', text: prompt }]);
   await client.submitted;
   assert.equal(client.pasteReads, 1);
+  assert.deepEqual(client.minimumColumnRequests, [undefined], 'collapsed paste tokens keep their existing verification path');
   session.acceptHistory(history([turn('old', 'Earlier question'), turn('long-paste', prompt)]));
   assert.equal((await response).sourceTurn.id, 'long-paste');
 });
@@ -229,6 +301,184 @@ const retryFor = (text, overrides = {}) => ({ text, proof: {
   agentPid: binding.agentPid, agentStartTime: binding.agentStartTime,
   model: 'composer-2.5[fast=true]', sourceTurnIds: ['old'], ...overrides,
 } });
+
+test('a narrow terminal automatically exposes a seven-row wrapped message for exact verification', async t => {
+  const clipped = parseCursorScreen(sizedFrame(93, narrowWrapper), { knownCursor: true });
+  assert.equal(narrowWrapper.length < 800, true, 'Cursor does not collapse this message to a paste token');
+  assert.equal(clipped.inputDraft.width, 86);
+  assert.equal(clipped.inputDraft.rows.length, 6);
+  assert.equal(clipped.inputDraft.rows[0].includes('<codex_delegation>'), false, 'the original leading line is hidden at this width');
+
+  const { session, client } = await start(t, { client: new NarrowTmuxClient() });
+  const response = session.prompt([{ type: 'text', text: narrowWrapper }]);
+  response.catch(() => {});
+  await Promise.race([client.submitted, response]);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(client.minimumColumnRequests, [100], '93 input columns plus seven frame columns expose all six rows');
+  assert.deepEqual(client.columnTransactions, [{ requested: 100, active: 100, restored: 93 }]);
+  assert.equal(client.draft, narrowWrapper, 'the complete original message is pasted without rewriting it');
+  assert.deepEqual(client.calls.map(call => call.type), ['paste-request', 'paste', 'Enter']);
+  session.acceptHistory(history([turn('old', 'Earlier question'), turn('narrow-native', narrowWrapper)]));
+  assert.equal((await response).sourceTurn.id, 'narrow-native');
+});
+
+test('a wrapped message already within six visual rows does not resize the terminal', async t => {
+  const prompt = narrowWrapper.replace('R'.repeat(260), 'R'.repeat(170));
+  const { session, client } = await start(t, { client: new NarrowTmuxClient() });
+  const response = session.prompt([{ type: 'text', text: prompt }]);
+  response.catch(() => {});
+  await Promise.race([client.submitted, response]);
+  assert.deepEqual(client.minimumColumnRequests, [undefined]);
+  session.acceptHistory(history([turn('old', 'Earlier question'), turn('fitting-native', prompt)]));
+  assert.equal((await response).sourceTurn.id, 'fitting-native');
+});
+
+test('automatic width planning counts wide Chinese cells when exposing the complete draft', async t => {
+  const prompt = narrowWrapper.replace('R'.repeat(260), '中'.repeat(160));
+  const clipped = parseCursorScreen(sizedFrame(93, prompt), { knownCursor: true });
+  assert.equal(clipped.inputDraft.rows[0].includes('<codex_delegation>'), false);
+  assert.equal(prompt.length < 800, true);
+  const { session, client } = await start(t, { client: new NarrowTmuxClient() });
+  const response = session.prompt([{ type: 'text', text: prompt }]);
+  response.catch(() => {});
+  await Promise.race([client.submitted, response]);
+  assert.equal(client.minimumColumnRequests[0] > 100, true, 'CJK cell widths require more room than character counts suggest');
+  assert.equal(client.draft, prompt);
+  assert.deepEqual(client.calls.map(call => call.type), ['paste-request', 'paste', 'Enter']);
+  session.acceptHistory(history([turn('old', 'Earlier question'), turn('cjk-resize', prompt)]));
+  assert.equal((await response).sourceTurn.id, 'cjk-resize');
+});
+
+test('a clipped failed draft retries at a verifiable width with one Enter and no second paste', async t => {
+  const { session, client } = await start(t, { client: new NarrowTmuxClient(narrowWrapper) });
+  const retryDraft = retryFor(narrowWrapper);
+  await assert.rejects(session.assertReady({ retryDraft }), /draft changed/);
+  const response = session.prompt([{ type: 'text', text: narrowWrapper }], { retryDraft });
+  response.catch(() => {});
+  await Promise.race([client.submitted, response]);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(client.minimumColumnRequests, [100]);
+  assert.deepEqual(client.calls.map(call => call.type), ['submit-draft-request', 'Enter']);
+  assert.equal(client.draft, narrowWrapper);
+  assert.equal(client.columns, 93);
+  session.acceptHistory(history([turn('old', 'Earlier question'), turn('narrow-retry', narrowWrapper)]));
+  assert.equal((await response).sourceTurn.id, 'narrow-retry');
+});
+
+test('a changed hidden first line cannot authorize retry after automatic widening', async t => {
+  const changed = narrowWrapper.replace('<codex_delegation>', '<other_delegation>');
+  const { session, client } = await start(t, { client: new NarrowTmuxClient(changed) });
+  const error = await session.prompt([{ type: 'text', text: narrowWrapper }], { retryDraft: retryFor(narrowWrapper) }).catch(error => error);
+  assert.match(error.message, /draft changed/);
+  assert.deepEqual(client.minimumColumnRequests, [100]);
+  assert.deepEqual(client.calls.map(call => call.type), ['submit-draft-request']);
+  assert.equal(client.columns, 93);
+  assert.equal(client.draft, changed, 'a person\'s changed draft is retained intact');
+});
+
+test('an overlay on a clipped retry is rejected before a resize or Enter is requested', async t => {
+  const client = new NarrowTmuxClient(narrowWrapper);
+  client.overlay = '  Allow this command? [y/n]';
+  const { session } = await start(t, { client });
+  await assert.rejects(session.prompt([{ type: 'text', text: narrowWrapper }], { retryDraft: retryFor(narrowWrapper) }), /unavailable|no longer available|draft changed/i);
+  assert.deepEqual(client.calls, []);
+  assert.deepEqual(client.minimumColumnRequests, []);
+});
+
+test('a local draft arriving during automatic widening prevents paste and Enter', async t => {
+  const { session, client } = await start(t, { client: new NarrowTmuxClient() });
+  client.beforeGuard = () => { client.draft = 'Keep this concurrent local draft'; };
+  await assert.rejects(session.prompt([{ type: 'text', text: narrowWrapper }]), /changed before paste/);
+  assert.deepEqual(client.calls.map(call => call.type), ['paste-request']);
+  assert.equal(client.columns, 93);
+  assert.equal(client.draft, 'Keep this concurrent local draft');
+});
+
+test('automatic widening waits for Cursor to render its new input width before pasting', async t => {
+  const { session, client } = await start(t, { client: new NarrowTmuxClient() });
+  const capture = client.capture.bind(client);
+  let staleCaptures = 0;
+  client.capture = async paneId => client.columns > 93 && staleCaptures++ < 2
+    ? sizedFrame(93, client.draft, client.overlay) : capture(paneId);
+  client.afterPasteGuard = () => assert.equal(staleCaptures >= 3, true, 'paste waits for a capture at the new width');
+  const response = session.prompt([{ type: 'text', text: narrowWrapper }]);
+  response.catch(() => {});
+  await Promise.race([client.submitted, response]);
+  assert.equal(staleCaptures >= 3, true, 'the two stale captures cannot authorize paste');
+  assert.deepEqual(client.calls.map(call => call.type), ['paste-request', 'paste', 'Enter']);
+  session.acceptHistory(history([turn('old', 'Earlier question'), turn('delayed-resize', narrowWrapper)]));
+  assert.equal((await response).sourceTurn.id, 'delayed-resize');
+});
+
+test('a TUI that never renders the widened input cannot receive paste or Enter', async t => {
+  const { session, client } = await start(t, { client: new NarrowTmuxClient() });
+  client.capture = async () => sizedFrame(93, client.draft, client.overlay);
+  await assert.rejects(session.prompt([{ type: 'text', text: narrowWrapper }]), /width|resize|columns/i);
+  assert.deepEqual(client.calls.map(call => call.type), ['paste-request']);
+  assert.equal(client.columns, 93);
+  assert.equal(client.draft, null);
+});
+
+test('a transient incomplete redraw after widening is retried before one exact paste and Enter', async t => {
+  const { session, client } = await start(t, { client: new NarrowTmuxClient() });
+  const partial = `  Cursor Agent\n  ${dim('v2025.01.01-test')}\n\n${row(placeholder('Add a follow-up'))}\n\n  ${dim('Composer 2.5 · 5.1%')}\n  ${dim('/fixture/project')}\n`;
+  assert.equal(parseCursorScreen(partial, { knownCursor: true }).reason, 'incomplete-input-frame');
+  const capture = client.capture.bind(client);
+  let widenedCaptures = 0;
+  client.capture = async paneId => client.columns > 93 && widenedCaptures++ < 2 ? partial : capture(paneId);
+  client.afterPasteGuard = () => assert.equal(widenedCaptures >= 3, true, 'an incomplete frame cannot authorize paste');
+  const response = session.prompt([{ type: 'text', text: narrowWrapper }]);
+  response.catch(() => {});
+  await Promise.race([client.submitted, response]);
+  assert.deepEqual(client.calls.map(call => call.type), ['paste-request', 'paste', 'Enter']);
+  assert.equal(client.draft, narrowWrapper);
+  session.acceptHistory(history([turn('old', 'Earlier question'), turn('partial-redraw', narrowWrapper)]));
+  assert.equal((await response).sourceTurn.id, 'partial-redraw');
+  assert.equal(client.columns, 93);
+});
+
+test('a persistently incomplete redraw after widening never receives paste or Enter', async t => {
+  const { session, client } = await start(t, { client: new NarrowTmuxClient() });
+  const capture = client.capture.bind(client);
+  let widenedCaptures = 0;
+  client.capture = async paneId => {
+    if (client.columns <= 93) return capture(paneId);
+    widenedCaptures++;
+    return `  Cursor Agent\n  ${dim('v2025.01.01-test')}\n\n${row(placeholder('Add a follow-up'))}\n`;
+  };
+  await assert.rejects(session.prompt([{ type: 'text', text: narrowWrapper }]), /resize|width|incomplete-input-frame/i);
+  assert.equal(widenedCaptures > 1, true, 'a partial redraw receives a bounded render opportunity');
+  assert.deepEqual(client.calls.map(call => call.type), ['paste-request']);
+  assert.equal(client.columns, 93);
+  assert.equal(client.draft, null);
+});
+
+test('an approval overlay that persists after widening never receives paste or Enter', async t => {
+  const { session, client } = await start(t, { client: new NarrowTmuxClient() });
+  client.beforeGuard = () => { client.overlay = '  Allow this command? [y/n]'; };
+  await assert.rejects(session.prompt([{ type: 'text', text: narrowWrapper }]), /resize|width|overlay|changed before paste/i);
+  assert.deepEqual(client.calls.map(call => call.type), ['paste-request']);
+  assert.equal(client.columns, 93);
+  assert.equal(client.draft, null);
+  assert.equal(client.overlay, '  Allow this command? [y/n]');
+});
+
+test('automatic widening still rejects an altered message instead of sending Enter', async t => {
+  const { session, client } = await start(t, { client: new NarrowTmuxClient() });
+  client.alterPastedText = text => text.replace('<codex_delegation>', '<other_delegation>');
+  await assert.rejects(session.prompt([{ type: 'text', text: narrowWrapper }]), /unsubmitted draft/);
+  assert.deepEqual(client.calls.map(call => call.type), ['paste-request', 'paste']);
+  assert.equal(client.columns, 93);
+  assert.equal(client.draft.startsWith('<other_delegation>'), true);
+});
+
+test('a short seven-hard-line input is rejected before paste because width cannot expose it', async t => {
+  const { session, client } = await start(t, { client: new NarrowTmuxClient() });
+  const prompt = 'first\nsecond\nthird\nfourth\nfifth\nsixth\nseventh';
+  await assert.rejects(session.prompt([{ type: 'text', text: prompt }]), /six|6|visible.*lines|cannot.*(?:verify|fit)/i);
+  assert.deepEqual(client.calls, []);
+  assert.equal(client.draft, null);
+});
 
 test('an eligible failed trailing-LF draft retries with a guarded Enter and no second paste', async t => {
   const prompt = '好呀\n';

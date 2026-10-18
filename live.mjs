@@ -56,6 +56,21 @@ function matchesRenderedDraft(screen, text) {
     && /^ *$/u.test(row.slice(expected.rows[index].length)));
 }
 
+function minimumInputColumns(text, width) {
+  // Cursor folds pastes longer than 800 UTF-16 code units into a saved token.
+  // Smaller pastes stay inline, in a viewport capped at six visual rows.
+  if (text.length > 800) return undefined;
+  if (!Number.isSafeInteger(width) || width < 1) throw new Error('The Cursor input width could not be verified; no text was pasted');
+  if (renderDraft(text, width)?.rows.length <= 6) return undefined;
+  if (text.split('\n').length > 6) {
+    throw new Error('This inline Cursor message cannot fit its six visible input rows because it has more than six hard lines; no text was pasted');
+  }
+  for (let candidate = width + 1; candidate <= 1000; candidate++) {
+    if (renderDraft(text, candidate)?.rows.length <= 6) return candidate + 7;
+  }
+  throw new Error('This Cursor message cannot fit within six visible input rows at the supported terminal width; no text was pasted');
+}
+
 function visibleDraft(screen) {
   const { rows, caret } = screen.inputDraft || {};
   // A bracketed paste ends with its caret after the inserted text. Cursor's
@@ -235,7 +250,24 @@ export class TmuxSession extends EventEmitter {
     if (!matched) throw new Error('The failed Cursor draft changed or its exact contents could not be verified; no Enter was sent');
   }
 
-  async assertReady({ retryDraft } = {}) {
+  async captureInputWidth(minimumColumns) {
+    let reason;
+    for (let attempt = 0; attempt < 50; attempt++) {
+      this.assertVerified();
+      const epoch = this.verificationEpoch;
+      const screen = parseCursorScreen(await this.client.capture(this.binding.paneId), { knownCursor: true });
+      this.assertVerified(epoch);
+      if (minimumColumns === undefined || screen.inputAvailable && screen.inputWidth >= minimumColumns - 7) return screen;
+      // resize-window returns before Cursor has redrawn its input. Wait for the
+      // actual complete frame rather than pasting into a stale or partially
+      // redrawn viewport. An overlay never authorizes input while we wait.
+      reason = screen.reason;
+      await new Promise(resolve => setTimeout(resolve, 40));
+    }
+    throw new Error(`Cursor input width did not become verifiable after terminal resize (${reason}); no Enter was sent`);
+  }
+
+  async assertReady({ retryDraft, deferDraftCheck = false } = {}) {
     this.assertVerified();
     if (this.pending) throw new Error('The original Cursor Agent is already running a turn');
     if (this.committing) throw new Error('The previous Cursor turn is still being committed to Codex');
@@ -244,7 +276,14 @@ export class TmuxSession extends EventEmitter {
     this.assertVerified(epoch);
     this.screen = screen;
     if (retryDraft) {
-      await this.assertDraft(screen, retryDraft.proof?.model, retryDraft);
+      if (deferDraftCheck) {
+        // A proven failed draft may be clipped until the transport expands its
+        // viewport. Full content verification still runs immediately before Enter.
+        this.observeModel(screen, true);
+        this.assertRetryProof(retryDraft);
+        this.requireModel(retryDraft.proof.model);
+        if (!screen.inputAvailable || screen.inputEmpty) throw new Error('The failed Cursor draft is no longer available; no Enter was sent');
+      } else await this.assertDraft(screen, retryDraft.proof?.model, retryDraft);
       return screen;
     }
     if (!screen.ready) throw new Error(`Original Cursor tmux input is unavailable (${screen.reason}); keep its draft or finish the current action in Cursor CLI`);
@@ -297,7 +336,7 @@ export class TmuxSession extends EventEmitter {
     const prompt = blocks.map(block => block.text).join('\n');
     if (!prompt.trim()) throw new Error('Message is empty');
     if (retryDraft && retryDraft.text !== prompt) throw new Error('Only the exact failed Cursor message may submit its existing draft');
-    try { await this.assertReady({ retryDraft }); }
+    try { await this.assertReady({ retryDraft, deferDraftCheck: Boolean(retryDraft) }); }
     catch (error) {
       if (retryDraft?.proof) {
         const { sessionId, paneId, agentPid, agentStartTime, model, sourceTurnIds } = retryDraft.proof;
@@ -306,19 +345,19 @@ export class TmuxSession extends EventEmitter {
       throw error;
     }
     if (model !== undefined) this.requireModel(model);
+    const minimumColumns = minimumInputColumns(prompt, this.screen.inputWidth);
     const expectedModel = this.model;
     const evidence = this.draftEvidence();
     const pending = this.begin('native', prompt);
     try {
+      let submitted;
       if (retryDraft) {
-        await this.client.submitDraft(this.binding.paneId, {
+        submitted = await this.client.submitDraft(this.binding.paneId, {
           sessionId: this.sessionId,
+          minimumColumns,
           beforeSubmit: async () => {
             try {
-              this.assertVerified();
-              const epoch = this.verificationEpoch;
-              const screen = parseCursorScreen(await this.client.capture(this.binding.paneId), { knownCursor: true });
-              this.assertVerified(epoch);
+              const screen = await this.captureInputWidth(minimumColumns);
               await this.assertDraft(screen, expectedModel, retryDraft);
             } catch (error) {
               // This callback runs before transport's sole Enter operation.
@@ -327,13 +366,11 @@ export class TmuxSession extends EventEmitter {
             }
           },
         });
-      } else await this.client.paste(this.binding.paneId, prompt, {
+      } else submitted = await this.client.paste(this.binding.paneId, prompt, {
         sessionId: this.sessionId,
+        minimumColumns,
         beforePaste: async () => {
-          this.assertVerified();
-          const epoch = this.verificationEpoch;
-          const screen = parseCursorScreen(await this.client.capture(this.binding.paneId), { knownCursor: true });
-          this.assertVerified(epoch);
+          const screen = await this.captureInputWidth(minimumColumns);
           if (!screen.ready) throw new Error(`Cursor input changed before paste (${screen.reason}); no message was pasted`);
           this.observeModel(screen, true);
           this.requireModel(expectedModel);
@@ -365,8 +402,16 @@ export class TmuxSession extends EventEmitter {
           }
         },
       });
+      if (submitted?.viewportRestoreError) {
+        // Enter already succeeded. A restore conflict must not turn a delivered
+        // message into a failed send that the caller might duplicate by retrying.
+        try { this.log(`Cursor message submitted; terminal viewport restoration needs attention: ${submitted.viewportRestoreError}`); } catch { /* Logging cannot undo a send. */ }
+      }
       return await pending.promise;
     } catch (error) {
+      if (error.viewportRestoreError) {
+        try { this.log(`Cursor message was not submitted; terminal viewport restoration needs attention: ${error.viewportRestoreError}`); } catch { /* Keep the original send error and retry evidence. */ }
+      }
       if (this.pending === pending) { this.pending = null; pending.reject(error); }
       throw error;
     }

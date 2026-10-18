@@ -4,6 +4,7 @@ import { mkdtemp, mkdir, rm, symlink, writeFile, unlink, chmod, readFile } from 
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { TmuxClient } from './tmux.mjs';
+import { retainUnsubmittedDraft, UNSUBMITTED_DRAFT_ERROR } from './draft-recovery.mjs';
 
 const CHAT = '11111111-2222-4333-8444-555555555555';
 const OTHER = '22222222-3333-4444-8555-666666666666';
@@ -28,11 +29,28 @@ async function fixture(t) {
   f.run = async (args, options = {}) => {
     f.calls.push({ args, ...options });
     if (f.onRun) await f.onRun(args, options);
-    return { stdout: args[0] === 'list-panes' ? f.paneLines : args[0] === 'capture-pane' ? '\u001b[48;5;236m› 草稿\u001b[0m\n' : '', stderr: '' };
+    let stdout = args[0] === 'list-panes' ? f.paneLines : args[0] === 'capture-pane' ? '\u001b[48;5;236m› 草稿\u001b[0m\n' : '';
+    if (f.viewport) {
+      const v = f.viewport;
+      if (args[0] === 'display-message') stdout = `%1|${v.windowId}|${v.width}|${v.height}|${v.paneWidth ?? v.width}|${v.paneHeight ?? v.height}|${v.panes}|${Number(v.zoomed)}\n`;
+      if (args[0] === 'show-options') stdout = v.option === null ? '' : `${v.option}\n`;
+      if (args[0] === 'resize-window') {
+        v.width = Number(args[args.indexOf('-x') + 1]); v.height = Number(args[args.indexOf('-y') + 1]); v.option = 'manual';
+      }
+      if (args[0] === 'set-option') v.option = args.includes('-wu') ? null : args.at(-1);
+    }
+    if (f.afterRun) await f.afterRun(args, options);
+    return { stdout, stderr: '' };
   };
   await f.process(10, 1, [], { pgrp: 10, foreground: 20 });
   await f.process(20, 10, [database()]);
   f.client = new TmuxClient({ procRoot, run: f.run });
+  return f;
+}
+
+async function viewportFixture(t, overrides = {}) {
+  const f = await fixture(t);
+  f.viewport = { windowId: '@2', width: 48, height: 27, panes: 1, zoomed: false, option: null, ...overrides };
   return f;
 }
 
@@ -310,6 +328,221 @@ test('draft submission requires its guard and never sends Enter after rejection 
     beforeSubmit: async () => writeFile(join(f.procRoot, '20', 'stat'), stat(20, 10, { start: '101' })),
   }), /session changed/);
   assert.ok(f.calls.every(({ args }) => args[0] === 'list-panes'));
+});
+
+test('widens a narrow exclusive window for a seven-row soft-wrapped prompt and restores it after Enter', async (t) => {
+  const f = await viewportFixture(t);
+  const original = { ...f.viewport };
+  const text = 'a long literal message '.repeat(13);
+  const rows = width => Math.ceil(text.length / (width - 4));
+  assert.equal(rows(original.width), 7, 'The original six-row input viewport would hide the first row');
+  let draft = ''; let entered = false;
+  f.afterRun = async (args, { input } = {}) => {
+    if (args[0] === 'load-buffer') draft = input;
+    if (args[0] === 'send-keys') { assert.equal(f.viewport.width, 96); entered = true; }
+  };
+  const result = await f.client.paste('%1', text, {
+    sessionId: CHAT, minimumColumns: 96,
+    beforePaste: async () => assert.equal(f.viewport.width, 96),
+    afterPaste: async () => {
+      assert.ok(rows(f.viewport.width) <= 6);
+      const visible = draft.slice(-6 * (f.viewport.width - 4));
+      assert.equal(visible, text, 'The exact full draft is visible before Enter');
+    },
+  });
+  assert.deepEqual(result, { submitted: true });
+  assert.equal(entered, true);
+  assert.deepEqual(f.viewport, original);
+  assert.deepEqual(f.calls.filter(({ args }) => args[0] === 'resize-window').map(({ args }) => args), [
+    ['resize-window', '-t', '@2', '-x', '96', '-y', '27'],
+    ['resize-window', '-t', '@2', '-x', '48', '-y', '27'],
+  ]);
+  assert.equal(f.calls.filter(({ args }) => args[0] === 'send-keys').length, 1);
+  assert.deepEqual(f.calls.find(({ args }) => args[0] === 'set-option').args, ['set-option', '-wu', '-t', '@2', 'window-size']);
+});
+
+test('temporary widening restores inherited and explicit window-size options after either paste guard rejects', async (t) => {
+  for (const option of [null, 'latest', 'smallest', 'largest', 'manual']) {
+    for (const failing of ['beforePaste', 'afterPaste']) {
+      const f = await viewportFixture(t, { option });
+      const original = { ...f.viewport };
+      await assert.rejects(f.client.paste('%1', 'long prompt', {
+        sessionId: CHAT, minimumColumns: 96,
+        [failing]: async () => { throw new Error(`rejected ${failing}`); },
+      }), new RegExp(`rejected ${failing}`));
+      assert.deepEqual(f.viewport, original);
+      assert.equal(f.calls.some(({ args }) => args[0] === 'send-keys'), false);
+      assert.equal(f.calls.some(({ args }) => args[0] === 'paste-buffer'), failing === 'afterPaste');
+      assert.deepEqual(f.calls.find(({ args }) => args[0] === 'set-option').args, option === null
+        ? ['set-option', '-wu', '-t', '@2', 'window-size']
+        : ['set-option', '-w', '-t', '@2', 'window-size', option]);
+    }
+  }
+});
+
+test('widening also restores geometry after transport failure and draft guard rejection', async (t) => {
+  for (const failing of ['load-buffer', 'paste-buffer', 'send-keys']) {
+    const f = await viewportFixture(t);
+    const original = { ...f.viewport };
+    f.onRun = args => { if (args[0] === failing) throw new Error(`mock ${failing} failure`); };
+    await assert.rejects(f.client.paste('%1', 'long prompt', { sessionId: CHAT, minimumColumns: 96 }), new RegExp(`mock ${failing}`));
+    assert.deepEqual(f.viewport, original);
+  }
+  const f = await viewportFixture(t, { option: 'largest' });
+  const original = { ...f.viewport };
+  await assert.rejects(f.client.submitDraft('%1', {
+    sessionId: CHAT, minimumColumns: 96,
+    beforeSubmit: async () => { assert.equal(f.viewport.width, 96); throw new Error('Draft differs'); },
+  }), /Draft differs/);
+  assert.deepEqual(f.viewport, original);
+  assert.equal(f.calls.some(({ args }) => args[0] === 'send-keys' || args[0] === 'load-buffer'), false);
+});
+
+test('a sufficiently wide input avoids all viewport mutations, even with multiple panes', async (t) => {
+  const f = await viewportFixture(t, { width: 160, paneWidth: 96, panes: 2, option: 'latest' });
+  const original = { ...f.viewport };
+  assert.deepEqual(await f.client.paste('%1', 'long prompt', { sessionId: CHAT, minimumColumns: 96 }), { submitted: true });
+  assert.deepEqual(f.viewport, original);
+  assert.equal(f.calls.some(({ args }) => ['resize-window', 'set-option', 'show-options'].includes(args[0])), false);
+});
+
+test('unsafe narrow layouts reject before any buffer or draft mutation', async (t) => {
+  for (const layout of [{ panes: 2 }, { zoomed: true }, { paneWidth: 40 }, { paneHeight: 20 }]) {
+    const f = await viewportFixture(t, layout);
+    const original = { ...f.viewport };
+    await assert.rejects(f.client.paste('%1', 'long prompt', { sessionId: CHAT, minimumColumns: 96 }), /multiple panes or is zoomed/);
+    assert.deepEqual(f.viewport, original);
+    assert.equal(f.calls.some(({ args }) => ['load-buffer', 'paste-buffer', 'send-keys', 'resize-window', 'set-option'].includes(args[0])), false);
+  }
+});
+
+test('restoration preserves a concurrent resize, option change, pane move, split, or zoom after successful submission', async (t) => {
+  for (const change of [
+    v => { v.width = 120; },
+    v => { v.height = 30; },
+    v => { v.option = 'largest'; },
+    v => { v.option = null; },
+    v => { v.windowId = '@3'; },
+    v => { v.panes = 2; },
+    v => { v.zoomed = true; },
+  ]) {
+    const f = await viewportFixture(t);
+    f.afterRun = args => { if (args[0] === 'send-keys') change(f.viewport); };
+    const result = await f.client.paste('%1', 'long prompt', { sessionId: CHAT, minimumColumns: 96 });
+    const concurrent = { ...f.viewport };
+    assert.equal(result.submitted, true, 'Cleanup must not turn a delivered message into a retryable failure');
+    assert.match(result.viewportRestoreError, /changed concurrently/);
+    assert.deepEqual(f.viewport, concurrent);
+    assert.equal(f.calls.filter(({ args }) => args[0] === 'resize-window').length, 1);
+    assert.equal(f.calls.some(({ args }) => args[0] === 'set-option'), false);
+  }
+});
+
+test('cleanup errors before Enter preserve exact draft error classification and persistent retry proof', async (t) => {
+  const f = await viewportFixture(t);
+  const proof = { sessionId: CHAT, paneId: '%1', agentPid: 20, agentStartTime: '100', model: 'test-model', sourceTurnIds: ['earlier-source-turn'] };
+  const guardError = Object.assign(new Error(UNSUBMITTED_DRAFT_ERROR), { unsubmittedDraft: proof });
+  await assert.rejects(f.client.paste('%1', 'long prompt', {
+    sessionId: CHAT, minimumColumns: 96,
+    afterPaste: async () => { f.viewport.width = 120; throw guardError; },
+  }), error => {
+    assert.equal(error, guardError, 'Keep the exact original guard error and its retry proof');
+    assert.equal(error.unsubmittedDraft, proof);
+    assert.equal(error.message, UNSUBMITTED_DRAFT_ERROR, 'Recovery classification requires this exact message');
+    assert.match(error.viewportRestoreError, /changed concurrently/);
+    const turn = { id: 'failed-native-turn', status: 'failed', error: { message: error.message }, items: [{ type: 'userMessage', content: [{ type: 'text', text: 'long prompt' }] }] };
+    const record = { backend: 'legacy', cursorSessionId: CHAT, tmuxAffinity: { paneId: '%1', agentPid: 20, agentStartTime: '100' }, thread: { model: 'test-model', turns: [turn] } };
+    assert.equal(retainUnsubmittedDraft(record, turn, error.unsubmittedDraft), true, 'Persist the guard proof despite the viewport cleanup conflict');
+    assert.deepEqual(turn.unsubmittedDraft, { version: 1, turnId: turn.id, ...proof });
+    return true;
+  });
+  assert.equal(f.viewport.width, 120);
+  assert.equal(f.calls.some(({ args }) => args[0] === 'send-keys'), false);
+});
+
+test('restoration preserves an option changed immediately after restoring the geometry', async (t) => {
+  const f = await viewportFixture(t);
+  let resizes = 0;
+  f.afterRun = args => { if (args[0] === 'resize-window' && ++resizes === 2) f.viewport.option = 'largest'; };
+  const result = await f.client.submitDraft('%1', { sessionId: CHAT, minimumColumns: 96, beforeSubmit: async () => {} });
+  assert.equal(result.submitted, true);
+  assert.match(result.viewportRestoreError, /changed during automatic restoration/);
+  assert.equal(f.viewport.option, 'largest');
+  assert.equal(f.calls.some(({ args }) => args[0] === 'set-option'), false);
+});
+
+test('a failed or partially completed initial resize never pastes and restores only its own changes', async (t) => {
+  for (const completed of [false, true]) {
+    const f = await viewportFixture(t, { option: 'latest' });
+    const original = { ...f.viewport };
+    let resizes = 0;
+    const failFirstResize = args => { if (args[0] === 'resize-window' && ++resizes === 1) throw new Error('resize transport failure'); };
+    if (completed) f.afterRun = failFirstResize;
+    else f.onRun = failFirstResize;
+    await assert.rejects(f.client.paste('%1', 'long prompt', { sessionId: CHAT, minimumColumns: 96 }), /resize transport failure/);
+    assert.deepEqual(f.viewport, original);
+    assert.equal(f.calls.some(({ args }) => ['load-buffer', 'paste-buffer', 'send-keys'].includes(args[0])), false);
+  }
+});
+
+test('cleanup command failures after Enter remain successful delivery with an explicit warning', async (t) => {
+  for (const failing of ['restore-resize', 'restore-option']) {
+    const f = await viewportFixture(t);
+    let resizes = 0;
+    f.onRun = args => {
+      if (args[0] === 'resize-window' && ++resizes === 2 && failing === 'restore-resize') throw new Error('resize restore failed');
+      if (args[0] === 'set-option' && failing === 'restore-option') throw new Error('option restore failed');
+    };
+    const result = await f.client.submitDraft('%1', { sessionId: CHAT, minimumColumns: 96, beforeSubmit: async () => {} });
+    assert.equal(result.submitted, true);
+    assert.match(result.viewportRestoreError, /restore failed/);
+    assert.equal(f.calls.filter(({ args }) => args[0] === 'send-keys').length, 1);
+  }
+});
+
+test('does not restore a matching concurrent resize when widening was rejected before any mutation', async (t) => {
+  const f = await viewportFixture(t);
+  let geometryReads = 0;
+  f.onRun = args => {
+    if (args[0] === 'display-message' && ++geometryReads === 2) { f.viewport.width = 96; f.viewport.option = 'manual'; }
+  };
+  await assert.rejects(f.client.paste('%1', 'long prompt', { sessionId: CHAT, minimumColumns: 96 }), /changed before automatic widening/);
+  assert.equal(f.viewport.width, 96);
+  assert.equal(f.viewport.option, 'manual');
+  assert.equal(f.calls.some(({ args }) => ['resize-window', 'set-option', 'load-buffer', 'paste-buffer', 'send-keys'].includes(args[0])), false);
+});
+
+test('a changed process during viewport inspection prevents the initial resize and paste', async (t) => {
+  const f = await viewportFixture(t);
+  let optionReads = 0;
+  f.afterRun = async args => {
+    if (args[0] === 'show-options' && ++optionReads === 2) await writeFile(join(f.procRoot, '20', 'stat'), stat(20, 10, { start: '101' }));
+  };
+  await assert.rejects(f.client.paste('%1', 'long prompt', { sessionId: CHAT, minimumColumns: 96 }), /session changed/);
+  assert.equal(f.calls.some(({ args }) => ['resize-window', 'set-option', 'load-buffer', 'paste-buffer', 'send-keys'].includes(args[0])), false);
+});
+
+test('rechecks process identity after either paste guard and never presses Enter for a replacement process', async (t) => {
+  for (const guard of ['beforePaste', 'afterPaste']) {
+    const f = await viewportFixture(t);
+    const original = { ...f.viewport };
+    await assert.rejects(f.client.paste('%1', 'long prompt', {
+      sessionId: CHAT, minimumColumns: 96,
+      [guard]: async () => writeFile(join(f.procRoot, '20', 'stat'), stat(20, 10, { start: '101' })),
+    }), /session changed/);
+    assert.equal(f.calls.some(({ args }) => args[0] === 'send-keys'), false);
+    assert.equal(f.calls.some(({ args }) => args[0] === 'paste-buffer'), guard === 'afterPaste');
+    assert.deepEqual(f.viewport, original);
+  }
+});
+
+test('validates bounded automatic input width before invoking tmux', async (t) => {
+  const f = await viewportFixture(t);
+  for (const minimumColumns of [0, -1, 1.5, 1008, Infinity, NaN, '96', null]) {
+    await assert.rejects(f.client.paste('%1', 'prompt', { sessionId: CHAT, minimumColumns }), /minimumColumns/);
+    await assert.rejects(f.client.submitDraft('%1', { sessionId: CHAT, minimumColumns, beforeSubmit: async () => {} }), /minimumColumns/);
+  }
+  assert.equal(f.calls.length, 0);
 });
 
 test('missing tmux or an absent server yields no bindings and unknown failures clear cached trust', async (t) => {

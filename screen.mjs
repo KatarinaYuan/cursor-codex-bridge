@@ -204,6 +204,7 @@ export function parseCursorScreen(rawANSI, { knownCursor = false } = {}) {
   const inputAvailable = reason === 'ready';
   if (inputAvailable && !inputEmpty) reason = 'input-has-draft';
   const ready = reason === 'ready';
-  return { text, body, currentTurnBody, currentReplyBody, inputText, inputDraft: draft, inputEmpty, inputAvailable, ready, busy, stopKey, blocked: !ready, prompt,
+  const inputWidth = completeFrame ? lines[frame.start].cells.filter(cell => cell.background === INPUT_BACKGROUND).length - 5 : null;
+  return { text, body, currentTurnBody, currentReplyBody, inputText, inputDraft: draft, inputWidth, inputEmpty, inputAvailable, ready, busy, stopKey, blocked: !ready, prompt,
     modelName: modelMatch?.[1]?.trim() ?? null, userMessages, reason };
 }

@@ -8,6 +8,14 @@ const UUID = '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}';
 const STORE = new RegExp(`^/(?:[^/]+/)*\\.cursor/chats/[^/]+/(${UUID})/store\\.db$`, 'i');
 const SESSION = new RegExp(`^${UUID}$`, 'i');
 const MAX_PASTED_TEXT_BYTES = 8 * 1024 * 1024;
+const MAX_INPUT_COLUMNS = 1007;
+
+function inputColumns(value) {
+  if (value !== undefined && (!Number.isSafeInteger(value) || value < 1 || value > MAX_INPUT_COLUMNS)) {
+    throw new Error(`Cursor input minimumColumns must be an integer from 1 to ${MAX_INPUT_COLUMNS}`);
+  }
+  return value;
+}
 
 function paneTarget(paneId) {
   if (typeof paneId !== 'string' || !/^%\d+$/.test(paneId)) throw new Error('A tmux pane ID such as %1 is required');
@@ -133,7 +141,8 @@ async function readPastedTextFile(filename) {
 
 /**
  * Connects to an already-running Cursor TUI. It never starts an agent or changes
- * tmux configuration. The caller must establish that the prompt is idle and its
+ * persistent tmux configuration. A requested input width may temporarily widen
+ * an exclusive window and is restored immediately after Enter. The caller must establish that the prompt is idle and its
  * draft is empty before paste(); this transport cannot interpret the TUI.
  *
  * A test runner may be injected as run(tmuxArgs, { input } = {}), returning
@@ -267,7 +276,90 @@ export class TmuxClient {
     return currentIdentity;
   }
 
-  async paste(paneId, text, { sessionId, beforePaste, afterPaste } = {}) {
+  async inputViewport(paneId) {
+    const { stdout } = await this.run(['display-message', '-p', '-t', paneTarget(paneId), '#{pane_id}|#{window_id}|#{window_width}|#{window_height}|#{pane_width}|#{pane_height}|#{window_panes}|#{window_zoomed_flag}']);
+    const match = /^(%\d+)\|(@\d+)\|([1-9]\d*)\|([1-9]\d*)\|([1-9]\d*)\|([1-9]\d*)\|([1-9]\d*)\|([01])$/.exec(String(stdout || '').trim());
+    if (!match || match[1] !== paneId || match.slice(3, 8).some(value => !Number.isSafeInteger(Number(value)))) {
+      throw new Error('Cursor tmux input window geometry could not be verified');
+    }
+    return { paneId: match[1], windowId: match[2], width: Number(match[3]), height: Number(match[4]), paneWidth: Number(match[5]), paneHeight: Number(match[6]), panes: Number(match[7]), zoomed: match[8] === '1' };
+  }
+
+  async localWindowSize(windowId) {
+    const { stdout } = await this.run(['show-options', '-w', '-qv', '-t', windowId, 'window-size']);
+    const value = String(stdout || '').trim();
+    if (value && !['largest', 'smallest', 'manual', 'latest'].includes(value)) throw new Error('Cursor tmux local window-size option could not be verified');
+    // Without -A, an empty value means this window inherits the global option.
+    return value || null;
+  }
+
+  async restoreInputViewport(paneId, original, columns, originalOption) {
+    const current = await this.inputViewport(paneId);
+    const option = await this.localWindowSize(original.windowId);
+    const exclusive = current.windowId === original.windowId && current.panes === 1 && !current.zoomed && current.paneWidth === current.width && current.paneHeight === current.height;
+    if (!exclusive || current.width !== columns || current.height !== original.height || option !== 'manual') {
+      // A failed resize that made no changes needs no cleanup. Any other state
+      // belongs to a concurrent actor; never overwrite their layout or option.
+      if (exclusive && current.width === original.width && current.height === original.height && option === originalOption) return;
+      throw new Error('Cursor tmux input window changed concurrently; automatic width restoration was skipped to preserve the current layout and window-size option');
+    }
+    await this.run(['resize-window', '-t', original.windowId, '-x', String(original.width), '-y', String(original.height)]);
+    const restored = await this.inputViewport(paneId);
+    if (restored.windowId !== original.windowId || restored.width !== original.width || restored.height !== original.height || restored.paneWidth !== original.width || restored.paneHeight !== original.height || restored.panes !== 1 || restored.zoomed || await this.localWindowSize(original.windowId) !== 'manual') {
+      throw new Error('Cursor tmux input window changed during automatic restoration; the current window-size option was preserved');
+    }
+    // resize-window sets a local manual option. Restore inheritance with -u,
+    // rather than freezing the global value as a new local override.
+    await this.run(originalOption === null
+      ? ['set-option', '-wu', '-t', original.windowId, 'window-size']
+      : ['set-option', '-w', '-t', original.windowId, 'window-size', originalOption]);
+  }
+
+  async withInputViewport(paneId, sessionId, identity, minimumColumns, operation) {
+    if (minimumColumns === undefined) return operation();
+    const original = await this.inputViewport(paneId);
+    if (original.paneWidth >= minimumColumns) return operation();
+    if (original.panes !== 1 || original.zoomed || original.paneWidth !== original.width || original.paneHeight !== original.height) {
+      throw new Error('Cursor long input requires more columns, but its tmux window has multiple panes or is zoomed; no new draft was pasted');
+    }
+    const originalOption = await this.localWindowSize(original.windowId);
+    let result; let failure; let resizeAttempted = false;
+    try {
+      await this.binding(paneId, sessionId, identity);
+      const current = await this.inputViewport(paneId);
+      if (JSON.stringify(current) !== JSON.stringify(original) || await this.localWindowSize(original.windowId) !== originalOption) {
+        throw new Error('Cursor tmux input window changed before automatic widening; no new draft was pasted');
+      }
+      await this.binding(paneId, sessionId, identity);
+      resizeAttempted = true;
+      await this.run(['resize-window', '-t', original.windowId, '-x', String(minimumColumns), '-y', String(original.height)]);
+      await this.binding(paneId, sessionId, identity);
+      const widened = await this.inputViewport(paneId);
+      if (widened.windowId !== original.windowId || widened.width !== minimumColumns || widened.height !== original.height || widened.paneWidth !== minimumColumns || widened.paneHeight !== original.height || widened.panes !== 1 || widened.zoomed || await this.localWindowSize(original.windowId) !== 'manual') {
+        throw new Error('Cursor tmux input window could not be safely widened; no new draft was pasted');
+      }
+      result = await operation();
+    } catch (error) { failure = error; }
+    finally {
+      try { if (resizeAttempted) await this.restoreInputViewport(paneId, original, minimumColumns, originalOption); }
+      catch (error) {
+        // Once Enter succeeds a cleanup failure must not be reported as failed
+        // delivery: retrying would submit the same user message twice.
+        if (result?.submitted) result.viewportRestoreError = error.message;
+        else if (failure instanceof Error) {
+          // Keep the guard's original error object and recovery proof. In
+          // particular, retry classification requires its exact message and
+          // afterPaste may attach unsubmittedDraft for exact retry.
+          failure.viewportRestoreError = error.message;
+        } else failure = new Error(`Cursor input was not submitted; ${error.message}`, { cause: failure || error });
+      }
+    }
+    if (failure) throw failure;
+    return result;
+  }
+
+  async paste(paneId, text, { sessionId, beforePaste, afterPaste, minimumColumns } = {}) {
+    inputColumns(minimumColumns);
     if (typeof text !== 'string' || !text.length) throw new Error('A nonempty text prompt is required');
     if ((beforePaste !== undefined && typeof beforePaste !== 'function') || (afterPaste !== undefined && typeof afterPaste !== 'function')) {
       throw new Error('Tmux paste guards must be functions');
@@ -278,32 +370,41 @@ export class TmuxClient {
       throw new Error('Cursor prompts cannot contain terminal control characters or malformed Unicode');
     }
     const identity = await this.binding(paneId, sessionId);
-    const buffer = `cursor_bridge_${randomUUID().replaceAll('-', '')}`;
-    try {
-      await this.run(['load-buffer', '-b', buffer, '-'], { input: text });
-      await this.binding(paneId, sessionId, identity);
-      // The caller can reject an active prompt, approval, or a concurrent draft
-      // immediately before any text reaches the TUI.
-      await beforePaste?.();
-      await this.run(['paste-buffer', '-p', '-d', '-b', buffer, '-t', paneId]);
-      await this.binding(paneId, sessionId, identity);
-      // Verify that the visible draft contains exactly this prompt before Enter.
-      // A rejection leaves the draft in place and never submits it.
-      await afterPaste?.();
-      await this.run(['send-keys', '-t', paneId, 'Enter']);
-    } finally {
-      // load-buffer can fail after creation; paste-buffer -d normally removes it.
-      try { await this.run(['delete-buffer', '-b', buffer]); } catch { /* Already absent, or the tmux server exited. */ }
-    }
+    return this.withInputViewport(paneId, sessionId, identity, minimumColumns, async () => {
+      const buffer = `cursor_bridge_${randomUUID().replaceAll('-', '')}`;
+      try {
+        await this.run(['load-buffer', '-b', buffer, '-'], { input: text });
+        await this.binding(paneId, sessionId, identity);
+        // The caller can reject an active prompt, approval, or a concurrent draft
+        // immediately before any text reaches the TUI.
+        await beforePaste?.();
+        await this.binding(paneId, sessionId, identity);
+        await this.run(['paste-buffer', '-p', '-d', '-b', buffer, '-t', paneId]);
+        await this.binding(paneId, sessionId, identity);
+        // Verify that the visible draft contains exactly this prompt before Enter.
+        // A rejection leaves the draft in place and never submits it.
+        await afterPaste?.();
+        await this.binding(paneId, sessionId, identity);
+        await this.run(['send-keys', '-t', paneId, 'Enter']);
+        return { submitted: true };
+      } finally {
+        // load-buffer can fail after creation; paste-buffer -d normally removes it.
+        try { await this.run(['delete-buffer', '-b', buffer]); } catch { /* Already absent, or the tmux server exited. */ }
+      }
+    });
   }
 
   /** Submits an existing draft only after the caller proves its exact contents. */
-  async submitDraft(paneId, { sessionId, beforeSubmit } = {}) {
+  async submitDraft(paneId, { sessionId, beforeSubmit, minimumColumns } = {}) {
+    inputColumns(minimumColumns);
     if (typeof beforeSubmit !== 'function') throw new Error('A Cursor draft submission guard is required');
     const identity = await this.binding(paneId, sessionId);
-    await beforeSubmit();
-    await this.binding(paneId, sessionId, identity);
-    await this.run(['send-keys', '-t', paneId, 'Enter']);
+    return this.withInputViewport(paneId, sessionId, identity, minimumColumns, async () => {
+      await beforeSubmit();
+      await this.binding(paneId, sessionId, identity);
+      await this.run(['send-keys', '-t', paneId, 'Enter']);
+      return { submitted: true };
+    });
   }
 
   async cancel(paneId, { sessionId, key = 'Escape' } = {}) {

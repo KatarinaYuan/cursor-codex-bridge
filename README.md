@@ -19,15 +19,15 @@ Use Cursor Agent and your Cursor account from the Codex desktop app's native SSH
 在 laptop 上执行，把 `my-dev` 换成你已有的 SSH 别名：
 
 ```sh
-npx --yes --package=https://github.com/KatarinaYuan/cursor-codex-bridge/releases/download/v0.1.2/cursor-codex-bridge-0.1.2.tgz cursor-codex install --ssh my-dev
+npx --yes --package=https://github.com/KatarinaYuan/cursor-codex-bridge/releases/download/v0.1.3/cursor-codex-bridge-0.1.3.tgz cursor-codex install --ssh my-dev
 ```
 
-这是 GitHub 预发布版本 `v0.1.2` 的安装包，不是 npm 同名包。`npx` 会下载该版本及其依赖，然后运行安装器。也可以从源码安装或修改：
+这是 GitHub 预发布版本 `v0.1.3` 的安装包，不是 npm 同名包。`npx` 会下载该版本及其依赖，然后运行安装器。也可以从源码安装或修改：
 
 ```sh
 git clone https://github.com/KatarinaYuan/cursor-codex-bridge.git
 cd cursor-codex-bridge
-git checkout v0.1.2
+git checkout v0.1.3
 npm ci --ignore-scripts
 node cli.mjs install --ssh my-dev
 ```
@@ -51,7 +51,7 @@ node cli.mjs install --ssh my-dev --alias my-cursor \
 以下命令在任意 laptop 目录运行，不需要克隆仓库。先为当前终端设置安装包地址：
 
 ```sh
-BRIDGE_PACKAGE_URL=https://github.com/KatarinaYuan/cursor-codex-bridge/releases/download/v0.1.2/cursor-codex-bridge-0.1.2.tgz
+BRIDGE_PACKAGE_URL=https://github.com/KatarinaYuan/cursor-codex-bridge/releases/download/v0.1.3/cursor-codex-bridge-0.1.3.tgz
 
 # 只读检查；不调用付费模型，也不向现有聊天发测试消息
 npx --yes --package="$BRIDGE_PACKAGE_URL" cursor-codex doctor --ssh my-dev
@@ -77,7 +77,7 @@ npx --yes --package="$BRIDGE_PACKAGE_URL" cursor-codex uninstall --ssh my-dev
 仓库附带一个安装 skill，可安装到 laptop 的 Codex skill 目录：
 
 ```sh
-npx --yes --package=https://github.com/KatarinaYuan/cursor-codex-bridge/releases/download/v0.1.2/cursor-codex-bridge-0.1.2.tgz cursor-codex install-skill
+npx --yes --package=https://github.com/KatarinaYuan/cursor-codex-bridge/releases/download/v0.1.3/cursor-codex-bridge-0.1.3.tgz cursor-codex install-skill
 ```
 
 也可指定目录：
@@ -105,6 +105,8 @@ npx --yes --package="$BRIDGE_PACKAGE_URL" cursor-codex install-skill --skill-dir
 
 旧 CLI 会话只支持文字。tmux 内的提问、审批和模型切换需在原 Cursor CLI 处理；已有草稿、忙碌状态或无法识别的界面会阻止代发。主题、Cursor 版本和模型显示格式变化可能需要适配。
 
+`v0.1.3` 会在独占、未缩放的 tmux 窗口中自动处理长消息软换行：提交前临时增加列宽，验证完整草稿，提交后立即恢复原尺寸及窗口选项，无需手动拉宽。多 pane 窗口、超出支持宽度，或短文本包含超过六个显式文本行时会在粘贴前拒绝；详见 [排障](docs/troubleshooting.md)。
+
 Codex 的部分功能（例如运行中追加消息、fork、compact 和 Codex 专有多代理流程）尚未兼容。历史导入不重建旧工具卡片，空会话在产生可读历史后出现。桥不能保证与今后的 Codex App 或 Cursor 版本兼容。
 
 了解 [架构与数据存储](docs/architecture.md)、[故障排查](docs/troubleshooting.md) 和 [隐私与问题反馈](docs/security.md)。
@@ -118,7 +120,7 @@ npm test
 
 测试使用模拟 Cursor 和隔离的临时数据，不发送付费模型请求。部分集成测试需要真实 Codex CLI；找不到该程序时会跳过，不能将跳过计为集成验证成功。可通过 `CURSOR_BRIDGE_TEST_REAL_CODEX` 指定可执行文件。
 
-附带尚未启用的 [GitHub Actions 模板](docs/github-actions-test.yml)，配置 Node.js 22/24、Linux/macOS。启用时将其保存为 `.github/workflows/test.yml`。真实 SSH、Codex App、Cursor 账号及现有 tmux 的组合需要单独验收。测试范围见 [v0.1.2 验证说明](docs/verification-v0.1.2.md)。欢迎附带脱敏诊断提交 issue 或 PR。
+附带尚未启用的 [GitHub Actions 模板](docs/github-actions-test.yml)，配置 Node.js 22/24、Linux/macOS。启用时将其保存为 `.github/workflows/test.yml`。真实 SSH、Codex App、Cursor 账号及现有 tmux 的组合需要单独验收。测试范围见 [v0.1.3 验证说明](docs/verification-v0.1.3.md)。欢迎附带脱敏诊断提交 issue 或 PR。
 
 ## 许可证
 

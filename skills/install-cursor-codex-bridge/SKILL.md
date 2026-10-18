@@ -11,13 +11,13 @@ Use the project's CLI to manage the bridge from the laptop. This is an experimen
 
 1. Reuse the user's specified checkout and SSH alias. If the alias is missing, inspect available SSH host names without exposing identities or credentials, and ask the user to choose when necessary. Do not guess a host from unrelated context.
 2. Check laptop Node.js 22+ and npm. If unavailable, discover the native Codex `load_workspace_dependencies` tool and use its bundled Node/npm when provided. Add that runtime directory to `PATH` only for the current command; do not modify shell profiles. If neither a suitable system runtime nor a bundled Node/npm is available, report the specific prerequisite and ask the user to install Node.js 22+ with npm. Do not claim the bridge is dependency-free on arbitrary laptops.
-3. Prefer the pinned GitHub Release package below when no checkout was requested. Use the same `npx` prefix for `install`, then `doctor`, replacing `ALIAS` with the user's SSH alias. Alternatively, clone `https://github.com/KatarinaYuan/cursor-codex-bridge.git`, check out `v0.1.2`, run `npm ci --ignore-scripts`, then use `node cli.mjs`. Read the README and CLI `--help` for version-specific options. Reuse an existing checkout only when its origin matches this project; do not discard local edits.
+3. Prefer the pinned GitHub Release package below when no checkout was requested. Use the same `npx` prefix for `install`, then `doctor`, replacing `ALIAS` with the user's SSH alias. Alternatively, clone `https://github.com/KatarinaYuan/cursor-codex-bridge.git`, check out `v0.1.3`, run `npm ci --ignore-scripts`, then use `node cli.mjs`. Read the README and CLI `--help` for version-specific options. Reuse an existing checkout only when its origin matches this project; do not discard local edits.
 4. Add `--alias BRIDGE_ALIAS` only when the user specified a bridge name or a collision needs resolving; pass that same option to every later management command. Remote binary overrides (`--node-path`, `--agent-path`, `--codex-path`) must be remote absolute paths.
 5. Report the actual diagnostic result and generated bridge alias. Direct the user to enable that alias in Codex App SSH settings if the CLI requires it. Do not claim an end-to-end chat works solely because installation passed.
 
 ```sh
-npx --yes --package=https://github.com/KatarinaYuan/cursor-codex-bridge/releases/download/v0.1.2/cursor-codex-bridge-0.1.2.tgz cursor-codex install --ssh ALIAS
-npx --yes --package=https://github.com/KatarinaYuan/cursor-codex-bridge/releases/download/v0.1.2/cursor-codex-bridge-0.1.2.tgz cursor-codex doctor --ssh ALIAS
+npx --yes --package=https://github.com/KatarinaYuan/cursor-codex-bridge/releases/download/v0.1.3/cursor-codex-bridge-0.1.3.tgz cursor-codex install --ssh ALIAS
+npx --yes --package=https://github.com/KatarinaYuan/cursor-codex-bridge/releases/download/v0.1.3/cursor-codex-bridge-0.1.3.tgz cursor-codex doctor --ssh ALIAS
 ```
 
 An explicit installation request authorizes the installer changes described by the CLI; do not add another approval step for those routine changes. It tests `CODEX_HOME` forwarding, then `LC_CURSOR_CODEX_BRIDGE`; a server rejecting both may need the user's administrator. Report that concrete blocker instead of changing the server's SSH policy.

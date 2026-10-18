@@ -683,7 +683,7 @@ export function createBridge({ send, log = () => {} }) {
         throw new Error('An existing Cursor CLI chat currently accepts text messages only');
       }
       const retryDraft = s.kind === 'tmux' ? retryDraftFor(r, s.binding, s.history, acpInput) : null;
-      if (s.kind === 'tmux') await s.assertReady({ retryDraft });
+      if (s.kind === 'tmux') await s.assertReady({ retryDraft, deferDraftCheck: Boolean(retryDraft) });
       const requestedModel = p.model || p.collaborationMode?.settings?.model;
       if (requestedModel && (s.kind === 'tmux' || requestedModel !== r.thread.model)) {
         await s.setModel(requestedModel); r.thread.model = s.model || requestedModel;
