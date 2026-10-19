@@ -672,7 +672,7 @@ test('install-skill routes locally and rejects a symlink destination', async t =
   assert.deepEqual(await fs.readdir(target), []);
 });
 
-async function releasedSkillInstallation(t, version = '0.1.3', { customParent = false, metadata = true } = {}) {
+async function releasedSkillInstallation(t, version = '0.1.4', { customParent = false, metadata = true } = {}) {
   const directory = await temporary(t);
   const root = path.join(directory, 'package');
   const source = path.join(root, 'skills', 'install-cursor-codex-bridge');
@@ -686,7 +686,9 @@ async function releasedSkillInstallation(t, version = '0.1.3', { customParent = 
     await fs.writeFile(path.join(source, 'agents', 'openai.yaml'), releasedSkillMetadata);
   }
   await fs.mkdir(path.join(destination, 'agents'), { recursive: true });
-  const original = releasedSkill.replaceAll('0.1.3', version);
+  const original = version === '0.1.4'
+    ? await fs.readFile(new URL('./fixtures/install-skill-v0.1.4.md', import.meta.url), 'utf8')
+    : releasedSkill.replaceAll('0.1.3', version);
   await fs.writeFile(path.join(destination, 'SKILL.md'), original);
   await fs.writeFile(path.join(destination, 'agents', 'openai.yaml'), releasedSkillMetadata);
   return { directory, source, parent, destination, original,
@@ -694,7 +696,7 @@ async function releasedSkillInstallation(t, version = '0.1.3', { customParent = 
 }
 
 test('install-skill safely upgrades each unmodified published release and retains its complete backup', async t => {
-  for (const version of ['0.1.1', '0.1.2', '0.1.3']) {
+  for (const version of ['0.1.1', '0.1.2', '0.1.3', '0.1.4']) {
     const f = await releasedSkillInstallation(t, version, { customParent: version === '0.1.2' });
     const result = await installSkill(f.settings);
     assert.equal(result.changed, true);

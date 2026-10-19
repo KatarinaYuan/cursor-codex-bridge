@@ -11,6 +11,58 @@ function userText(turn) {
 
 const displayText = text => text.replace(/\s+/gu, '');
 
+const nonempty = value => typeof value === 'string' && value.length > 0;
+const observerProofKeys = ['version', 'sourceTurnId', 'sessionId', 'paneId', 'agentPid', 'agentStartTime'];
+const sameObserverBinding = (proof, binding) => binding && proof.paneId === binding.paneId
+  && proof.agentPid === binding.agentPid && proof.agentStartTime === binding.agentStartTime;
+
+/** Validate persisted observer ownership without deriving it from rendered text. */
+export function observerTurnProof(record, turnId) {
+  const proof = record?.tmuxObserverTurns?.[turnId];
+  const turns = record?.thread?.turns;
+  if (record?.backend !== 'legacy' || !nonempty(turnId) || !Array.isArray(turns)
+    || !Object.hasOwn(record.tmuxObserverTurns || {}, turnId)
+    || !proof || typeof proof !== 'object' || Array.isArray(proof)
+    || Object.keys(proof).length !== observerProofKeys.length
+    || !observerProofKeys.every(key => Object.hasOwn(proof, key))
+    || proof.version !== 1 || !nonempty(proof.sourceTurnId) || !nonempty(proof.sessionId)
+    || proof.sessionId !== record.cursorSessionId || typeof proof.paneId !== 'string' || !/^%\d+$/u.test(proof.paneId)
+    || !Number.isSafeInteger(proof.agentPid) || proof.agentPid <= 0
+    || typeof proof.agentStartTime !== 'string' || !/^\d+$/u.test(proof.agentStartTime)
+    || !sameObserverBinding(proof, record.tmuxAffinity)) return null;
+  const matches = turns.filter(turn => turn.id === turnId);
+  const turn = matches[0];
+  if (matches.length !== 1 || turn.status !== 'inProgress' || !Array.isArray(turn.items)
+    || turn.items.some(item => !['userMessage', 'agentMessage'].includes(item?.type))) return null;
+  const users = turn.items.filter(item => item.type === 'userMessage');
+  if (users.length !== 1 || users[0].clientId != null || !Array.isArray(users[0].content)
+    || !users[0].content.length || users[0].content.some(block => block?.type !== 'text' || typeof block.text !== 'string')
+    || !displayText(userText(turn))) return null;
+  const mapping = record.historySync?.sourceTurns;
+  if (!mapping || !Object.hasOwn(mapping, proof.sourceTurnId) || mapping[proof.sourceTurnId] !== turnId
+    || Object.entries(mapping).some(([sourceId, nativeId]) => sourceId !== proof.sourceTurnId && nativeId === turnId)
+    || Object.entries(record.tmuxObserverTurns).some(([nativeId, other]) => nativeId !== turnId
+      && other?.sourceTurnId === proof.sourceTurnId)) return null;
+  return proof;
+}
+
+/** Adopt one proven observer only against its original process and exact source. */
+export function recoverableObserverTurn(record, binding, history) {
+  const active = record?.thread?.turns?.filter(turn => turn.status === 'inProgress');
+  if (active?.length !== 1) return null;
+  const turn = active[0];
+  const proof = observerTurnProof(record, turn.id);
+  if (!proof || binding?.sessionId !== proof.sessionId || history?.id !== proof.sessionId
+    || !sameObserverBinding(proof, binding) || !nonempty(record.thread.cwd)
+    || binding.cwd !== record.thread.cwd || history.cwd !== record.thread.cwd
+    || !Array.isArray(history.turns)) return null;
+  const sources = history.turns.filter(source => source?.id === proof.sourceTurnId);
+  const sourceTurn = sources[0];
+  if (sources.length !== 1 || !Array.isArray(sourceTurn.items) || sourceTurn.items.some(item => !item || typeof item !== 'object')
+    || displayText(userText(sourceTurn)) !== displayText(userText(turn))) return null;
+  return { turn, sourceTurn, proof };
+}
+
 /** Reuse only the exact native counterpart of the currently unfinished source turn. */
 export function findLiveSourceTurn(record, history, prompt) {
   if (history?.sourceComplete !== false || typeof prompt !== 'string'

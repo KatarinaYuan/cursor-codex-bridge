@@ -88,7 +88,7 @@ const sameIds = (left, right) => Array.isArray(left) && left.length === right.le
 
 /** Observes and submits to one existing Cursor TUI; never starts/kills an Agent. */
 export class TmuxSession extends EventEmitter {
-  constructor({ client, binding, model, models, modelDefinitions, history, sourceTurnIds = [], interval = 180, log = () => {} }) {
+  constructor({ client, binding, model, models, modelDefinitions, history, interval = 180, log = () => {} }) {
     super();
     this.kind = 'tmux';
     this.client = client;
@@ -100,7 +100,7 @@ export class TmuxSession extends EventEmitter {
     this.interval = interval;
     this.log = log;
     this.state = 'new';
-    this.knownSourceIds = new Set(sourceTurnIds);
+    this.knownSourceIds = new Set();
     this.history = history;
     this.pending = null;
     this.screen = null;
@@ -111,7 +111,6 @@ export class TmuxSession extends EventEmitter {
     this.verified = true;
     this.verificationEpoch = 0;
     this.committing = false;
-    this.completedTurn = null;
   }
 
   setVerified(verified) {
@@ -161,18 +160,16 @@ export class TmuxSession extends EventEmitter {
     this.screen = screen;
     this.observeModel(screen);
     const user = screenUser(screen);
-    const completed = this.completedTurn;
-    if (completed && screen.ready) completed.sawIdle = true;
     const latestSource = this.history?.turns.at(-1);
-    const newerSource = completed && latestSource && !sourceTurnComplete(this.history, latestSource)
-      && latestSource.id !== completed.sourceTurnId && displayText(userText(latestSource)) === user?.text;
-    // Same-prompt consecutive turns increase the user-frame count. A history
-    // identity also distinguishes them when terminal scrollback drops a frame.
-    const knownUsers = completed?.users.filter(previous => previous.text === user?.text) || [];
-    const changedUser = completed && user && (!knownUsers.length || user.count > Math.max(...knownUsers.map(previous => previous.count)));
-    if (!this.pending && !this.committing && user && screen.busy && (!completed || completed.sawIdle || changedUser || newerSource)) {
-      const pending = this.begin('external', user.prompt);
-      this.emit('externalTurn', { prompt: user.prompt, promise: pending.promise });
+    // A busy terminal can redraw an already completed question, including after
+    // an idle frame or observer restart. Only an unfinished canonical source ID
+    // establishes a new CLI turn. Waiting for its transcript also disambiguates
+    // genuine repeated prompts without relying on scrollback or frame counts.
+    if (!this.pending && !this.committing && user && screen.busy && latestSource
+      && !sourceTurnComplete(this.history, latestSource) && !this.knownSourceIds.has(latestSource.id)
+      && displayText(userText(latestSource)) === user.text) {
+      const pending = this.begin('external', user.prompt, latestSource.id);
+      this.emit('externalTurn', { prompt: user.prompt, sourceTurnId: latestSource.id, promise: pending.promise });
     }
     if (this.pending && !this.pending.user && user && user.text === displayText(this.pending.prompt)
       && (this.pending.origin === 'external' || user.key !== this.pending.baselineUser?.key)) this.pending.user = user;
@@ -185,19 +182,27 @@ export class TmuxSession extends EventEmitter {
     if (this.history) this.acceptHistory(this.history);
   }
 
-  begin(origin, prompt) {
+  begin(origin, prompt, sourceTurnId) {
     let resolve, reject;
     const promise = new Promise((yes, no) => { resolve = yes; reject = no; });
     // External turns can begin before their bridge listener has acquired its lock.
     promise.catch(() => {});
     const baseline = new Set([...this.knownSourceIds, ...(this.history?.turns || []).map(turn => turn.id)]);
-    const last = this.history?.turns.at(-1);
-    if (origin === 'external' && last && !sourceTurnComplete(this.history, last)
-      && !this.knownSourceIds.has(last.id) && displayText(userText(last)) === displayText(prompt)) baseline.delete(last.id);
+    if (origin === 'external') {
+      const source = this.history?.turns.find(turn => turn.id === sourceTurnId);
+      if (!source || displayText(userText(source)) !== displayText(prompt)) throw new Error('The external Cursor turn has no matching canonical source identity');
+      baseline.delete(source.id);
+    }
     const user = screenUser(this.screen);
-    this.pending = { origin, prompt, baseline, promise, resolve, reject, baselineUser: user, user: origin === 'external' ? user : null };
+    this.pending = { origin, prompt, sourceTurnId, baseline, promise, resolve, reject, baselineUser: user, user: origin === 'external' ? user : null };
     this.screenKey = null;
     return this.pending;
+  }
+
+  /** Reattach a separately validated persisted observer; never submit input. */
+  resumeObserver(sourceTurnId, prompt) {
+    if (this.pending || this.committing || !this.verified || !['new', 'ready'].includes(this.state)) throw new Error('The Cursor observer cannot be recovered in its current state');
+    return this.begin('external', prompt, sourceTurnId);
   }
 
   draftEvidence() {
@@ -424,30 +429,13 @@ export class TmuxSession extends EventEmitter {
     if (pending) {
       const candidates = history.turns.filter(turn => !pending.baseline.has(turn.id));
       const sourceTurn = candidates.find(turn => pending.origin === 'external'
-        ? displayText(userText(turn)) === displayText(pending.prompt)
+        ? turn.id === pending.sourceTurnId && displayText(userText(turn)) === displayText(pending.prompt)
         : canonicalPrompt(userText(turn)) === canonicalPrompt(pending.prompt));
       const completed = sourceTurn && sourceTurnComplete(history, sourceTurn);
       if (completed) {
         this.pending = null;
         this.committing = true;
-        const prompt = displayText(userText(sourceTurn));
-        const user = pending.user || {
-          text: prompt,
-          count: (pending.baselineUser?.count || 0) + (pending.origin === 'native' ? 1 : 0),
-        };
-        this.completedTurn = { sourceTurnId: sourceTurn.id, user, users: [user], sawIdle: false };
         pending.resolve({ stopReason: sourceTurn.status === 'failed' ? 'failed' : sourceTurn.status === 'interrupted' ? 'cancelled' : 'end_turn', history, sourceTurn, origin: pending.origin });
-      }
-    }
-    if (this.completedTurn) {
-      const index = history.turns.findIndex(turn => turn.id === this.completedTurn.sourceTurnId);
-      if (index >= 0) {
-        // A single scan can already contain several completed CLI turns. Their
-        // history is returned to the bridge together, so a delayed busy redraw
-        // for any of them must not create another unresolvable live turn.
-        this.completedTurn.users = history.turns.slice(index).filter(turn => sourceTurnComplete(history, turn)).map((turn, offset) => ({
-          text: displayText(userText(turn)), count: this.completedTurn.user.count + offset,
-        }));
       }
     }
     for (const turn of history.turns) if (sourceTurnComplete(history, turn)) this.knownSourceIds.add(turn.id);

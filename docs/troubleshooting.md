@@ -38,8 +38,8 @@ Cursor 登录属于远端用户环境。使用正确 SSH 用户并由账号拥�
 在 laptop 任意目录运行，把 `my-dev` 换成安装时的源 SSH 别名：
 
 ```sh
-npx --yes --package=https://github.com/KatarinaYuan/cursor-codex-bridge/releases/download/v0.1.4/cursor-codex-bridge-0.1.4.tgz cursor-codex upgrade --ssh my-dev
-npx --yes --package=https://github.com/KatarinaYuan/cursor-codex-bridge/releases/download/v0.1.4/cursor-codex-bridge-0.1.4.tgz cursor-codex doctor --ssh my-dev
+npx --yes --package=https://github.com/KatarinaYuan/cursor-codex-bridge/releases/download/v0.1.5/cursor-codex-bridge-0.1.5.tgz cursor-codex upgrade --ssh my-dev
+npx --yes --package=https://github.com/KatarinaYuan/cursor-codex-bridge/releases/download/v0.1.5/cursor-codex-bridge-0.1.5.tgz cursor-codex doctor --ssh my-dev
 ```
 
 原来使用自定义桥别名时，两条命令都补上相同的 `--alias my-cursor`。若升级和诊断通过而 App 仍显示旧列表，在 SSH 设置中断开桥连接后重新连接。全局最近列表有条数上限，较旧会话未进入当前列表不代表丢失；仍可在对应项目中查找。诊断和列表检查不会发送模型消息。
@@ -64,6 +64,14 @@ text remains as an unsubmitted draft in tmux. Review it in Cursor CLI
 扩宽不改消息、光标或 Cursor 进程，也不会只凭可见后半段放行。超过 800 个 UTF-16 字符的粘贴仍使用 Cursor 自己的折叠标记，并校验同一会话保存的完整内容。较短消息若本身含超过六个显式文本行、所需列宽超过 1007，或者窗口有多个 pane 或处于缩放状态，桥无法通过扩宽验证全文，会在粘贴前说明原因。此限制只适用于共享现有 tmux 的代发路径。
 
 错误在历史中保留不代表发生了新的发送请求；排查时区分旧失败记录、重新打开聊天和新的发送尝试。输入框布局、进程状态或模型格式不兼容时，代发会被拒绝。请提供 Agent/App 版本和脱敏诊断，保留草稿待检查。
+
+## Cursor 已结束，但 App 一直显示 thinking
+
+先区分真实任务与桥中的观察轮次。旧版桥可能在正式历史已完成后，根据终端残留的忙碌画面创建第二个运行轮次；回复正文可以同步到这个轮次，但它等不到属于自己的新来源完成事件，因而一直显示运行中。仅凭 `thinking` 或终端最后一段文字不能判定 Cursor 是否仍在执行。
+
+`v0.1.5` 按来源轮次 ID 检查正式历史，避免从已完成的来源创建重复观察。新建的观察同时持久化来源轮次与原生轮次的对应凭据；重连后继续观察原任务，或从正式完成记录收尾，不重发模型请求。升级命令见上文，普通安装器仍要求桥空闲。
+
+这一预防与恢复机制不会自动清除所有旧版异常轮次。若升级前已经卡住且缺少对应凭据，需要核对正式历史、映射关系及当前原进程状态后单独修复。请保留记录并提交脱敏诊断；不要通过结束 Cursor 进程、删除状态目录或给原聊天重复发消息来尝试清除状态。
 
 ## 升级或卸载提示忙碌
 

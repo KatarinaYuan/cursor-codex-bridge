@@ -148,6 +148,120 @@ async function start(t, { client = new MockTmuxClient(), source = history([turn(
   return { session, client, result };
 }
 
+function markSourceStarted(session, id, prompt) {
+  const unfinished = { ...turn(id, prompt, ''), status: 'inProgress' };
+  delete unfinished.completedAt;
+  session.acceptHistory(history([...(session.history?.turns || []).filter(source => source.id !== id), unfinished], false));
+  return unfinished;
+}
+
+for (const partialTail of [false, true]) {
+  test(`observer startup suppresses a stale busy completed source${partialTail ? ' with a partial transcript tail' : ''}`, async t => {
+    const completed = turn('startup-completed', 'Already done', 'Canonical answer');
+    const source = history([completed], !partialTail);
+    if (partialTail) source.completedTurnIds = [completed.id];
+    const client = new MockTmuxClient(frame({ prompt: 'Already done', answer: 'Canonical answer', busy: true }));
+    const session = new TmuxSession({ client, binding, model: 'composer-2.5[fast=true]', history: source, interval: 60_000 });
+    t.after(() => session.close());
+    const external = [];
+    session.on('externalTurn', event => external.push(event));
+    await session.start();
+    await session.poll();
+    assert.deepEqual(external, []);
+    assert.equal(session.pending, null);
+    assert.deepEqual(client.calls, []);
+  });
+}
+
+test('completion followed by idle and stale busy redraw cannot duplicate an external turn', async t => {
+  const { session, client } = await start(t);
+  const external = [];
+  session.on('externalTurn', event => external.push(event));
+  markSourceStarted(session, 'idle-redraw-source', 'External question');
+  client.raw = frame({ prompt: 'External question', answer: 'Streaming', busy: true });
+  await session.poll();
+  assert.equal(external.length, 1);
+  session.acceptHistory(history([turn('old', 'Earlier question'), turn('idle-redraw-source', 'External question', 'Canonical answer')]));
+  await external[0].promise;
+  session.turnCommitted();
+  client.raw = frame({ prompt: 'External question', answer: 'Canonical answer' });
+  await session.poll();
+  client.raw = frame({ prompt: 'External question', answer: 'Canonical answer', busy: true });
+  await session.poll();
+  await session.poll();
+  assert.equal(external.length, 1);
+  assert.equal(session.pending, null);
+  assert.deepEqual(client.calls, []);
+});
+
+test('a busy screen waits for a matching unfinished source identity before creating a pending turn', async t => {
+  const { session, client } = await start(t);
+  const external = [];
+  session.on('externalTurn', event => external.push(event));
+  client.raw = frame({ prompt: 'Not flushed yet', answer: 'Streaming', busy: true });
+  await session.poll();
+  assert.equal(external.length, 0);
+  assert.equal(session.pending, null);
+  markSourceStarted(session, 'different-source', 'Another prompt');
+  await session.poll();
+  assert.equal(external.length, 0);
+  assert.equal(session.pending, null);
+  markSourceStarted(session, 'eventual-source', 'Not flushed yet');
+  await session.poll();
+  assert.equal(external.length, 1);
+  assert.equal(external[0].sourceTurnId, 'eventual-source');
+  assert.equal(session.pending.sourceTurnId, 'eventual-source');
+  assert.deepEqual(client.calls, []);
+});
+
+test('external completion must match the observed source ID even when a later source repeats its prompt', async t => {
+  const { session, client } = await start(t);
+  const external = [];
+  session.on('externalTurn', event => external.push(event));
+  markSourceStarted(session, 'observed-source', 'Continue');
+  client.raw = frame({ prompt: 'Continue', answer: 'Streaming', busy: true });
+  await session.poll();
+  assert.equal(external.length, 1);
+  assert.equal(external[0].sourceTurnId, 'observed-source');
+  let resolved = false;
+  external[0].promise.then(() => { resolved = true; });
+  session.acceptHistory(history([turn('old', 'Earlier question'), turn('later-source', 'Continue', 'Later answer')]));
+  await Promise.resolve();
+  assert.equal(resolved, false);
+  assert.equal(session.pending.sourceTurnId, 'observed-source');
+  const exact = turn('observed-source', 'Continue', 'Exact answer');
+  session.acceptHistory(history([turn('old', 'Earlier question'), exact, turn('later-source', 'Continue', 'Later answer')]));
+  assert.equal((await external[0].promise).sourceTurn, exact);
+  assert.deepEqual(client.calls, []);
+});
+
+for (const alreadyComplete of [false, true]) {
+  test(`resumeObserver adopts its exact ${alreadyComplete ? 'completed' : 'unfinished'} source without terminal input`, async t => {
+    const current = turn('recovered-source', 'Continue', 'Canonical answer');
+    if (!alreadyComplete) { current.status = 'inProgress'; delete current.completedAt; }
+    const source = history([turn('old', 'Earlier question'), current], alreadyComplete);
+    const client = new MockTmuxClient(frame({ prompt: 'Continue', answer: 'Canonical answer', busy: !alreadyComplete }));
+    const session = new TmuxSession({ client, binding, model: 'composer-2.5[fast=true]', history: source, interval: 60_000 });
+    t.after(() => session.close());
+    const external = [];
+    session.on('externalTurn', event => external.push(event));
+    const pending = session.resumeObserver(current.id, 'Continue');
+    assert.equal(pending.sourceTurnId, current.id);
+    await session.start();
+    if (!alreadyComplete) {
+      let resolved = false;
+      pending.promise.then(() => { resolved = true; });
+      await Promise.resolve();
+      assert.equal(resolved, false);
+      const completed = { ...current, status: 'completed', completedAt: 102 };
+      session.acceptHistory(history([turn('old', 'Earlier question'), completed]));
+      assert.equal((await pending.promise).sourceTurn, completed);
+    } else assert.equal((await pending.promise).sourceTurn, current);
+    assert.deepEqual(external, []);
+    assert.deepEqual(client.calls, []);
+  });
+}
+
 test('a native message submits once to the original pane and streams before canonical completion', async t => {
   const { session, client } = await start(t);
   const updates = [];
@@ -568,6 +682,7 @@ test('an external busy turn publishes live snapshots and completes from that sam
   const external = []; const updates = [];
   session.on('externalTurn', event => external.push(event));
   session.on('update', event => updates.push(event));
+  markSourceStarted(session, 'external', 'From tmux');
   client.raw = frame({ prompt: 'From tmux', answer: 'First partial', busy: true });
   await session.poll();
   assert.equal(external.length, 1);
@@ -595,6 +710,7 @@ test('a checkpoint arriving before the busy frame clears cannot restart the comp
   const { session, client } = await start(t);
   const external = [];
   session.on('externalTurn', event => external.push(event));
+  markSourceStarted(session, 'external', 'From tmux');
   client.raw = frame({ prompt: 'From tmux', answer: 'Partial reply', busy: true });
   await session.poll();
   session.acceptHistory(history([turn('old', 'Earlier question'), turn('external', 'From tmux')]));
@@ -605,6 +721,7 @@ test('a checkpoint arriving before the busy frame clears cannot restart the comp
   assert.equal(external.length, 1);
   client.raw = frame({ prompt: 'From tmux', answer: 'Canonical reply' });
   await session.poll();
+  markSourceStarted(session, 'external-next', 'Next from tmux');
   client.raw = frame({ prompt: 'Next from tmux', answer: 'Next partial', busy: true });
   await session.poll();
   assert.equal(external.length, 2);
@@ -774,6 +891,7 @@ for (const secondComplete of [true, false]) {
     const { session, client } = await start(t);
     const external = [];
     session.on('externalTurn', event => external.push(event));
+    markSourceStarted(session, 'external-first', 'First from tmux');
     client.raw = frame({ prompt: 'First from tmux', answer: 'First partial', busy: true });
     await session.poll();
     assert.equal(external.length, 1);
@@ -800,6 +918,7 @@ for (const prompt of ['请帮我分析这段非常长的中文问题并解释结
     const external = [];
     session.on('externalTurn', event => external.push(event));
     const wrapped = `${prompt.slice(0, 10)}\n${prompt.slice(10)}`;
+    markSourceStarted(session, 'new-wrapped', prompt);
     client.raw = frame({ prompt: wrapped, answer: 'Streaming current reply', busy: true });
     await session.poll();
     assert.equal(external.length, 1);
@@ -827,6 +946,7 @@ test('an explicitly ended last turn with a partial transcript tail stays in the 
   const { session, client } = await start(t, { source: partialTail });
   const external = [];
   session.on('externalTurn', event => external.push(event));
+  markSourceStarted(session, 'current-identical', prompt);
   client.raw = frame({ prompt, answer: 'Current streaming reply', busy: true });
   await session.poll();
   assert.equal(external.length, 1);
@@ -847,6 +967,7 @@ test('an interrupted source turn resolves as cancelled without sending another c
   const { session, client } = await start(t);
   const external = [];
   session.on('externalTurn', event => external.push(event));
+  markSourceStarted(session, 'interrupted', 'Interrupt this turn');
   client.raw = frame({ prompt: 'Interrupt this turn', answer: 'Partial before interruption', busy: true });
   await session.poll();
   const interrupted = { ...turn('interrupted', 'Interrupt this turn', 'Partial before interruption'), status: 'interrupted' };
@@ -867,6 +988,7 @@ for (const scenario of ['changed prompt', 'repeated prompt with another user fra
     session.on('update', update => updates.push(update));
     const firstPrompt = scenario === 'changed prompt' ? 'First from tmux' : 'Continue';
     const nextPrompt = scenario === 'changed prompt' ? 'Next from tmux' : 'Continue';
+    markSourceStarted(session, 'fast-first', firstPrompt);
     client.raw = frame({ prompt: firstPrompt, answer: 'First partial', busy: true });
     await session.poll();
     const first = turn('fast-first', firstPrompt, 'First canonical reply');
@@ -883,6 +1005,8 @@ for (const scenario of ['changed prompt', 'repeated prompt with another user fra
     await session.poll();
     assert.equal(external.length, 2);
     assert.equal(external[1].prompt, nextPrompt);
+    assert.equal(external[0].sourceTurnId, first.id);
+    assert.equal(external[1].sourceTurnId, next.id);
     assert.equal(updates.at(-1).text, 'Next partial');
     assert.equal(updates.at(-1).text.includes(nextPrompt), false);
     await session.poll();
@@ -897,6 +1021,7 @@ test('later turns already completed in the same history scan do not restart from
   const { session, client } = await start(t);
   const external = [];
   session.on('externalTurn', event => external.push(event));
+  markSourceStarted(session, 'completed-first', 'First fast question');
   client.raw = frame({ prompt: 'First fast question', answer: 'First partial', busy: true });
   await session.poll();
   const first = turn('completed-first', 'First fast question', 'First canonical reply');
@@ -912,6 +1037,7 @@ test('later turns already completed in the same history scan do not restart from
   client.raw = frame({ prompt: 'Second fast question', answer: 'Second canonical reply', busy: true, prior: [{ prompt: first.items[0].content[0].text, answer: 'First canonical reply' }] });
   await session.poll();
   assert.equal(external.length, 1, 'both completed turns have already been published through canonical history');
+  markSourceStarted(session, 'completed-third', 'A genuinely new third question');
   client.raw = frame({ prompt: 'A genuinely new third question', answer: 'Third partial', busy: true });
   await session.poll();
   assert.equal(external.length, 2);
@@ -921,6 +1047,7 @@ test('a partial transcript tail cannot restart its explicitly completed last tur
   const { session, client } = await start(t);
   const external = [];
   session.on('externalTurn', event => external.push(event));
+  markSourceStarted(session, 'partial-tail-first', 'First question');
   client.raw = frame({ prompt: 'First question', answer: 'First partial', busy: true });
   await session.poll();
   const first = turn('partial-tail-first', 'First question', 'First canonical reply');
@@ -942,6 +1069,7 @@ test('verification pauses observations and submissions until the original pane i
   session.on('update', update => updates.push(update));
   const captures = client.captures;
   session.setVerified(false);
+  markSourceStarted(session, 'paused-source', 'From a paused pane');
   client.raw = frame({ prompt: 'From a paused pane', answer: 'Do not emit until verified', busy: true });
   await session.poll();
   await session.poll();
@@ -975,12 +1103,14 @@ test('a capture started before verification is revoked cannot publish a stale pa
   session.setVerified(false);
   // Even an immediate re-verification must not revive the old in-flight read.
   session.setVerified(true);
+  markSourceStarted(session, 'stale-source', 'Stale pane user');
   release(frame({ prompt: 'Stale pane user', answer: 'Stale pane reply', busy: true }));
   await polling;
   assert.equal(session.screen, originalScreen);
   assert.deepEqual(external, []);
   assert.deepEqual(updates, []);
   client.capture = capture;
+  markSourceStarted(session, 'verified-current', 'Verified current user');
   client.raw = frame({ prompt: 'Verified current user', answer: 'Verified current reply', busy: true });
   await session.poll();
   assert.equal(external.length, 1);
@@ -990,6 +1120,7 @@ test('a capture started before verification is revoked cannot publish a stale pa
 for (const [hint, key] of [['ctrl+c to stop', 'C-c'], ['esc to stop', 'Escape']]) {
   test(`cancel forwards only the verified Cursor stop key: ${key}`, async t => {
     const { session, client } = await start(t);
+    markSourceStarted(session, 'cancel-source', 'Running from tmux');
     client.raw = frame({ prompt: 'Running from tmux', answer: 'Working', input: `${placeholder('Add a follow-up')}    ${hint}` });
     await session.poll();
     await session.cancel();
@@ -1114,6 +1245,7 @@ test('an unsupported busy model can mirror and complete an external turn from ca
   const { session, client } = await start(t, { ...catalogOptions, client: new MockTmuxClient(modelFrame('Auto Balance')) });
   const external = [];
   session.on('externalTurn', event => external.push(event));
+  markSourceStarted(session, 'unsupported-model-turn', 'External question');
   client.raw = modelFrame('Auto Balance', { prompt: 'External question', answer: 'External streaming reply', busy: true });
   await session.poll();
   assert.equal(external.length, 1);

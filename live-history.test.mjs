@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { parseTranscript } from './history.mjs';
 import { reconcileHistory } from './sync.mjs';
-import { findLiveSourceTurn, finalizeLivePreview } from './live-history.mjs';
+import { findLiveSourceTurn, finalizeLivePreview, observerTurnProof, recoverableObserverTurn } from './live-history.mjs';
 
 function history(rows, sourceComplete = false) {
   return { ...parseTranscript(rows.map(([role, text]) => JSON.stringify({ role, message: { content: [{ type: 'text', text }] } })).join('\n'), {
@@ -25,6 +25,100 @@ function preview(record, turn, item, sourceOwned) {
 }
 
 const answers = turn => turn.items.filter(item => item.type === 'agentMessage');
+
+function observerFixture() {
+  const source = history([['user', 'Continue please'], ['assistant', 'Canonical partial']]);
+  source.cwd = '/home/testuser';
+  const native = record(source);
+  native.thread.cwd = source.cwd;
+  const turn = native.thread.turns[0];
+  const sourceTurnId = turn.id;
+  turn.id = 'observer-native';
+  turn.status = 'inProgress';
+  turn.items[0].clientId = null;
+  const binding = { sessionId: source.id, cwd: source.cwd, paneId: '%12', agentPid: 42, agentStartTime: '12345' };
+  native.tmuxAffinity = { paneId: binding.paneId, agentPid: binding.agentPid, agentStartTime: binding.agentStartTime };
+  native.historySync = { sourceTurns: { [sourceTurnId]: turn.id } };
+  native.tmuxObserverTurns = { [turn.id]: { version: 1, sourceTurnId, sessionId: binding.sessionId,
+    paneId: binding.paneId, agentPid: binding.agentPid, agentStartTime: binding.agentStartTime } };
+  return { native, source, binding, turn, proof: native.tmuxObserverTurns[turn.id] };
+}
+
+test('observer recovery retains exact ownership for both unfinished and completed source snapshots without mutation', () => {
+  for (const complete of [false, true]) {
+    const { native, source, binding, turn, proof } = observerFixture();
+    source.sourceComplete = complete;
+    source.completedTurnIds = complete ? [proof.sourceTurnId] : [];
+    const before = structuredClone({ native, source, binding });
+    assert.equal(observerTurnProof(native, turn.id), proof);
+    const recovered = recoverableObserverTurn(native, binding, source);
+    assert.equal(recovered.turn, turn);
+    assert.equal(recovered.sourceTurn, source.turns[0]);
+    assert.equal(recovered.proof, proof);
+    assert.deepEqual({ native, source, binding }, before);
+  }
+});
+
+test('observer proof refuses corrupt provenance, native client sends and competing source ownership', () => {
+  const corruptions = [
+    ({ native }) => { native.backend = 'acp'; },
+    ({ native }) => { delete native.tmuxObserverTurns; },
+    ({ proof }) => { proof.version = 2; },
+    ({ proof }) => { proof.extra = true; },
+    ({ proof }) => { delete proof.sourceTurnId; },
+    ({ proof }) => { proof.sessionId = 'another-session'; },
+    ({ proof }) => { proof.paneId = '%13'; },
+    ({ proof }) => { proof.agentPid = 43; },
+    ({ proof }) => { proof.agentStartTime = '54321'; },
+    ({ proof, native }) => { proof.agentPid = native.tmuxAffinity.agentPid = 0; },
+    ({ turn }) => { turn.status = 'completed'; },
+    ({ turn }) => { turn.items[0].clientId = 'native-client-id'; },
+    ({ turn }) => { turn.items[0].clientId = ''; },
+    ({ turn }) => { turn.items.push(structuredClone(turn.items[0])); },
+    ({ turn }) => { turn.items[0].content.push({ type: 'image', url: 'fixture' }); },
+    ({ turn }) => { turn.items[0].content = [{ type: 'text', text: '   ' }]; },
+    ({ turn }) => { turn.items.push({ type: 'dynamicToolCall', id: 'tool' }); },
+    ({ native, proof }) => { delete native.historySync.sourceTurns[proof.sourceTurnId]; },
+    ({ native, proof }) => { native.historySync.sourceTurns[proof.sourceTurnId] = 'other-native'; },
+    ({ native, turn }) => { native.historySync.sourceTurns['another-source'] = turn.id; },
+    ({ native, proof }) => { native.tmuxObserverTurns['other-native'] = { ...proof }; },
+  ];
+  for (const corrupt of corruptions) {
+    const fixture = observerFixture();
+    corrupt(fixture);
+    const before = structuredClone(fixture.native);
+    assert.equal(observerTurnProof(fixture.native, fixture.turn.id), null, String(corrupt));
+    assert.equal(recoverableObserverTurn(fixture.native, fixture.binding, fixture.source), null, String(corrupt));
+    assert.deepEqual(fixture.native, before);
+  }
+});
+
+test('observer recovery requires unique active turn, original binding, cwd and exact canonical source identity', () => {
+  const corruptions = [
+    ({ binding }) => { binding.sessionId = 'another-session'; },
+    ({ binding }) => { binding.paneId = '%99'; },
+    ({ binding }) => { binding.agentPid++; },
+    ({ binding }) => { binding.agentStartTime = '999'; },
+    ({ binding }) => { binding.cwd += '/other'; },
+    ({ source }) => { source.cwd += '/other'; },
+    ({ source }) => { source.id = 'another-session'; },
+    ({ source }) => { source.turns[0].id = 'same-prompt-different-source'; },
+    ({ source }) => { source.turns[0].items[0].content[0].text = 'Different prompt'; },
+    ({ source }) => { source.turns.push(structuredClone(source.turns[0])); },
+    ({ native }) => { native.thread.turns.push({ id: 'unproven-active', status: 'inProgress', items: [] }); },
+  ];
+  for (const corrupt of corruptions) {
+    const fixture = observerFixture();
+    corrupt(fixture);
+    const before = structuredClone(fixture);
+    assert.equal(recoverableObserverTurn(fixture.native, fixture.binding, fixture.source), null, String(corrupt));
+    assert.deepEqual(fixture, before);
+  }
+  const fixture = observerFixture();
+  fixture.turn.items[0].clientId = undefined;
+  fixture.source.turns[0].items[0].content[0].text = 'Con\ntinue please';
+  assert.equal(recoverableObserverTurn(fixture.native, fixture.binding, fixture.source).turn, fixture.turn);
+});
 
 test('finds the unfinished source turn with an existing assistant partial using its exact native mapping', () => {
   const partial = history([['user', '你好 继续'], ['assistant', 'First partial']]);

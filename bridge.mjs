@@ -5,7 +5,7 @@ import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { CursorSession } from './cursor.mjs';
-import { findLiveSourceTurn, finalizeLivePreview } from './live-history.mjs';
+import { findLiveSourceTurn, finalizeLivePreview, observerTurnProof, recoverableObserverTurn } from './live-history.mjs';
 import { queueList, queueAdd, queueUpdate, queueDelete, queueReorder, queuePeek, queueConsume } from './queue.mjs';
 import { expandModelVariants } from './model-labels.mjs';
 import { retryDraftFor, retainUnsubmittedDraft, pinLiveSourceTurn } from './draft-recovery.mjs';
@@ -26,6 +26,7 @@ const threadLocks = new Map();
 const saveLocks = new Map();
 const routes = new Map();
 const runningTurns = new Set();
+const finishingTurns = new Set();
 const maintenance = createMaintenanceGate({
   file: process.env.CURSOR_BRIDGE_MAINTENANCE_FILE,
   locks: () => threadLocks.values(),
@@ -54,7 +55,7 @@ async function loadStore() {
       const r = JSON.parse(await fs.readFile(path.join(dataDir, entry), 'utf8'));
       if (r.thread?.id) {
         for (const t of r.thread.turns || []) {
-          if (t.status === 'inProgress') {
+          if (t.status === 'inProgress' && !observerTurnProof(r, t.id)) {
             t.status = 'interrupted';
             t.completedAt = now();
           }
@@ -303,6 +304,11 @@ export function createBridge({ send, log = () => {} }) {
     if (r.backend === 'legacy') Session = (await import('./legacy.mjs')).LegacySession;
     if (shuttingDown) throw new Error('Cursor bridge is shutting down');
     const binding = r.backend === 'legacy' && tmuxSync ? await findTmuxBinding(r) : null;
+    const savedObserver = r.thread.turns.find(t => observerTurnProof(r, t.id));
+    const recovery = savedObserver && binding ? recoverableObserverTurn(r, binding, sourceHistories.get(r.cursorSessionId)) : null;
+    if (savedObserver && (!recovery || !tmuxSync.client.isVerified(binding))) {
+      throw new Error('The saved Cursor observer cannot be verified against its original process and source; no separate Agent was started');
+    }
     if (binding) {
       r.tmuxAffinity = { paneId: binding.paneId, agentPid: binding.agentPid, agentStartTime: binding.agentStartTime };
       // Remember a confirmed original process before starting its observer.
@@ -313,7 +319,6 @@ export function createBridge({ send, log = () => {} }) {
     const s = binding ? new (await import('./live.mjs')).TmuxSession({
       ...sessionOptions(r, log), client: tmuxSync.client, binding, history: sourceHistories.get(r.cursorSessionId),
       models, modelDefinitions,
-      sourceTurnIds: Object.entries(r.historySync?.sourceTurns || {}).filter(([, id]) => r.thread.turns.find(t => t.id === id)?.items.some(i => i.type === 'agentMessage')).map(([id]) => id),
     }) : new Session(sessionOptions(r, log));
     if (binding) s.setVerified?.(tmuxSync.client.isVerified(binding));
     openingSessionInstances.add(s);
@@ -326,27 +331,35 @@ export function createBridge({ send, log = () => {} }) {
     s.on('update', update => onUpdate(r, update));
     s.on('externalTurn', event => {
       withThreadLock(r.thread.id, async () => {
-        if (shuttingDown || r.archived || activeTurn(r)) return;
+        if (shuttingDown || r.archived) return;
         const user = event.prompt;
-        let t = findLiveSourceTurn(r, s.history, user);
+        const source = s.history?.turns.find(turn => turn.id === event.sourceTurnId);
+        if (!source) throw new Error('The observed Cursor source turn is no longer available');
+        const nativeId = r.historySync?.sourceTurns?.[source.id] || source.id;
+        let t = r.thread.turns.find(turn => turn.id === nativeId) || findLiveSourceTurn(r, s.history, user);
+        if (activeTurn(r) && activeTurn(r) !== t) throw new Error('Another native Cursor turn owns this observer');
         if (!t) {
           t = { id: uuid(), rootTurnId: null, items: [], itemsView: 'full', status: 'inProgress', error: null, startedAt: now(), completedAt: null, durationMs: null };
           t.rootTurnId = t.id; r.thread.turns.push(t);
-          t.items.push({ type: 'userMessage', id: uuid(), clientId: null, content: [{ type: 'text', text: user, text_elements: [] }] });
+          t.items.push({ type: 'userMessage', id: uuid(), clientId: null, content: structuredClone(source.items.find(item => item.type === 'userMessage').content) });
         } else {
           r.liveSourcePreviews ||= {}; r.liveSourcePreviews[t.id] = true;
           const assistant = t.items.findLast(item => item.type === 'agentMessage');
           if (assistant) { r.livePreviewIds ||= {}; r.livePreviewIds[t.id] = assistant.id; }
           t.status = 'inProgress'; t.startedAt ||= now(); t.completedAt = null;
         }
+        if (!pinLiveSourceTurn(r, t, source)) throw new Error('The observed Cursor source turn is already owned by another native turn');
+        r.tmuxObserverTurns ||= {};
+        r.tmuxObserverTurns[t.id] = { version: 1, sourceTurnId: source.id, sessionId: s.sessionId,
+          paneId: s.binding.paneId, agentPid: s.binding.agentPid, agentStartTime: s.binding.agentStartTime };
         runningTurns.add(r.thread.id);
         r.thread.updatedAt = now(); r.thread.recencyAt = now();
         status(r, 'active'); notify('turn/started', { threadId: r.thread.id, turn: { ...t, items: [] } });
         for (const item of t.items) completeItem(r, t, item);
         onUpdate(r, { sessionUpdate: 'terminal_snapshot', text: s.screen.currentReplyBody });
         await persist(r);
-        finishTurn(r, t, s, null, event.promise).catch(e => log(`Tmux turn persist failed: ${e.message}`));
-      }).catch(error => log(`Tmux external turn failed: ${error.message}`));
+        launchTurn(r, t, s, null, event.promise);
+      }).catch(error => { s.detach(error); log(`Tmux external turn failed: ${error.message}`); });
     });
     s.on('permission', request => {
       const t = activeTurn(r);
@@ -402,11 +415,25 @@ export function createBridge({ send, log = () => {} }) {
       });
     });
     try {
+      if (recovery) {
+        const sourceUser = recovery.sourceTurn.items.find(item => item.type === 'userMessage');
+        const prompt = sourceUser.content.filter(block => block.type === 'text').map(block => block.text).join('\n');
+        const pending = s.resumeObserver(recovery.sourceTurn.id, prompt);
+        runningTurns.add(r.thread.id);
+        status(r, 'active');
+        // This promise belongs to the saved native turn. It may resolve during
+        // start() if Cursor completed while the bridge was disconnected.
+        launchTurn(r, recovery.turn, s, null, pending.promise);
+      }
       const result = await s.start(r.cursorSessionId ? { sessionId: r.cursorSessionId } : {});
       if (shuttingDown) throw new Error('Cursor bridge is shutting down');
       r.cursorSessionId = s.sessionId;
       if (result?.models?.currentModelId) r.thread.model = result.models.currentModelId;
       sessions.set(r.thread.id, s);
+      // The scanner may have advanced while start() awaited its first capture.
+      // That opening instance was not in sessions yet, so replay the newest
+      // canonical snapshot before relying on any further transcript writes.
+      if (s.kind === 'tmux' && sourceHistories.has(s.sessionId)) s.acceptHistory(sourceHistories.get(s.sessionId));
       if (!activeTurn(r)) status(r, 'idle'); await persist(r); return s;
     } catch (e) { await s.close(); throw e; }
     finally { openingSessionInstances.delete(s); }
@@ -459,6 +486,7 @@ export function createBridge({ send, log = () => {} }) {
   }
 
   async function finishTurn(r, t, s, acpInput, externalPromise, expectedModel, retryDraft) {
+    let detachedObserver = false;
     try {
       const result = await (externalPromise || s.prompt(acpInput, { model: expectedModel, retryDraft }));
       if (result?.history) {
@@ -475,7 +503,12 @@ export function createBridge({ send, log = () => {} }) {
         // The session observed this exact source round. An older failed paste
         // with the same words must not claim the successful retry's history.
         if (!pinLiveSourceTurn(r, t, result.sourceTurn)) throw new Error('The completed Cursor source turn could not be linked to its native turn');
-        const merged = (await import('./sync.mjs')).reconcileHistory(r, result.history);
+        // A later CLI turn may already be running when this source completes.
+        // Let its own source-bound observer publish it, rather than announcing
+        // a terminal completion for a still-unfinished transcript tail.
+        const history = { ...result.history, turns: result.history.turns.filter((source, index, turns) =>
+          result.history.sourceComplete !== false || index < turns.length - 1 || result.history.completedTurnIds?.includes(source.id)) };
+        const merged = (await import('./sync.mjs')).reconcileHistory(r, history);
         Object.assign(r, merged.record);
         t = r.thread.turns.find(turn => turn.id === t.id);
         publishHistoryChanges(r, merged.turnsChanged.filter(change => change.after.id !== t.id), true);
@@ -484,26 +517,43 @@ export function createBridge({ send, log = () => {} }) {
       t.status = result?.stopReason === 'cancelled' ? 'interrupted' : result?.stopReason === 'failed' ? 'failed' : 'completed';
       if (t.status === 'failed') t.error = result.sourceTurn?.error || { message: 'Cursor CLI turn failed', codexErrorInfo: null, additionalDetails: null };
     } catch (e) {
-      t.status = 'failed';
-      t.error = { message: e.message, codexErrorInfo: null, additionalDetails: null };
-      if (s.kind === 'tmux') retainUnsubmittedDraft(r, t, e.unsubmittedDraft);
-      notify('error', { threadId: r.thread.id, turnId: t.id, error: t.error, willRetry: false });
-      log(`Cursor turn failed: ${e.message}`);
+      if (externalPromise && s.kind === 'tmux' && observerTurnProof(r, t.id)) {
+        // Losing a read-only observer cannot fail the original Cursor task.
+        // Keep its exact source ownership so another observer can adopt it.
+        detachedObserver = true;
+        log(`Cursor observer detached; preserving source-bound turn ${t.id}: ${e.message}`);
+      } else {
+        t.status = 'failed';
+        t.error = { message: e.message, codexErrorInfo: null, additionalDetails: null };
+        if (s.kind === 'tmux') retainUnsubmittedDraft(r, t, e.unsubmittedDraft);
+        notify('error', { threadId: r.thread.id, turnId: t.id, error: t.error, willRetry: false });
+        log(`Cursor turn failed: ${e.message}`);
+      }
     } finally {
       try {
-        for (const item of t.items) if (item.type !== 'userMessage') {
-          if (item.id === r.livePreviewIds?.[t.id]) item.phase = 'final_answer';
-          completeItem(r, t, item);
+        if (detachedObserver) await persist(r);
+        else {
+          for (const item of t.items) if (item.type !== 'userMessage') {
+            if (item.id === r.livePreviewIds?.[t.id]) item.phase = 'final_answer';
+            completeItem(r, t, item);
+          }
+          t.completedAt = now(); t.durationMs = Date.now() - t.startedAt * 1000;
+          r.thread.updatedAt = now(); r.thread.recencyAt = now();
+          if (r.tmuxObserverTurns) delete r.tmuxObserverTurns[t.id];
+          await persist(r); status(r, 'idle');
+          notify('turn/completed', { threadId: r.thread.id, turn: t });
         }
-        t.completedAt = now(); t.durationMs = Date.now() - t.startedAt * 1000;
-        r.thread.updatedAt = now(); r.thread.recencyAt = now();
-        await persist(r); status(r, 'idle');
-        notify('turn/completed', { threadId: r.thread.id, turn: t });
       } finally {
         runningTurns.delete(r.thread.id); s.turnCommitted?.();
-        if (t.status === 'completed') scheduleQueue(r.thread.id);
+        if (!detachedObserver && t.status === 'completed') scheduleQueue(r.thread.id);
       }
     }
+  }
+
+  function launchTurn(...args) {
+    const pending = finishTurn(...args);
+    finishingTurns.add(pending);
+    pending.catch(error => log(`Cursor turn persist failed: ${error.message}`)).finally(() => finishingTurns.delete(pending));
   }
 
   async function handle(method, p = {}) {
@@ -704,7 +754,7 @@ export function createBridge({ send, log = () => {} }) {
       startItem(r, t, message); completeItem(r, t, message); await persist(r);
       // Start inference only after the RPC caller has received its turn id.
       const expectedModel = s.kind === 'tmux' ? s.model : undefined;
-      setImmediate(() => finishTurn(r, t, s, acpInput, null, expectedModel, retryDraft).catch(e => log(`Persist failed: ${e.message}`)));
+      setImmediate(() => launchTurn(r, t, s, acpInput, null, expectedModel, retryDraft));
       return { turn: { ...t, items: [] } };
     }
     if (method === 'turn/interrupt') {
@@ -860,7 +910,8 @@ async function startHistorySync(log) {
         if (state.stopped || shuttingDown) break;
         const existing = [...records.values()].find(r => r.backend === 'legacy' && r.cursorSessionId === id);
         const threadId = existing?.thread.id || uuid();
-        if (threadLocks.has(threadId) || runningTurns.has(threadId)) continue;
+        if (threadLocks.has(threadId) || runningTurns.has(threadId)
+          || existing?.thread.turns.some(turn => observerTurnProof(existing, turn.id))) continue;
         await withThreadLock(threadId, async () => {
           if (state.stopped || shuttingDown || runningTurns.has(threadId)) return;
           if (!existing) {
@@ -943,6 +994,7 @@ export async function shutdownBridge() {
     if (tmuxSync) await tmuxSync.pending;
     await Promise.allSettled([...startingSessions.values(), ...(catalogPromise ? [catalogPromise] : [])]);
     await Promise.allSettled([...sessions.values()].map(s => s.close()));
+    await Promise.allSettled([...finishingTurns]);
     sessions.clear();
   })();
   return shutdownPromise;
