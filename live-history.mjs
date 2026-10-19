@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { unwrapUserEnvelope } from './source-identity.mjs';
 
 const textContent = content => typeof content === 'string' ? content
   : Array.isArray(content) ? content.filter(block => block?.type === 'text' && typeof block.text === 'string').map(block => block.text).join('\n') : '';
@@ -6,8 +7,7 @@ const textContent = content => typeof content === 'string' ? content
 function userText(turn) {
   return (turn?.items || []).filter(item => item.type === 'userMessage').map(item => {
     const text = textContent(item.content);
-    const query = text.match(/<user_query>\s*([\s\S]*?)\s*<\/user_query>/);
-    return query ? query[1] : text.replace(/^<timestamp>[\s\S]*?<\/timestamp>\s*/, '');
+    return unwrapUserEnvelope(text);
   }).join('\n');
 }
 
@@ -26,6 +26,40 @@ const canonicalSubmittedText = turn => userText(turn).replace(/\r\n/gu, '\n').tr
 export const submittedTurnTextSha256 = turn => sha256(canonicalSubmittedText(turn));
 export const nativeTurnTextSha256 = turn => sha256((turn?.items || [])
   .filter(item => item.type === 'userMessage').map(item => textContent(item.content)).join('\n'));
+
+/** Ambiguous display IDs must never establish ownership of a real submission. */
+export function sourceTurnOwnable(turn, history) {
+  const identity = turn?.sourceIdentity;
+  if (!identity) return !history?.sourceIdentityScheme;
+  if (identity.version !== 1 || identity.strength === 'ambiguous') return false;
+  if (identity.kind === 'legacy-position') return identity.strength === 'position';
+  return identity.kind === 'timestamped-user-envelope' && identity.strength === 'stable'
+    && /^[a-f0-9]{64}$/u.test(identity.sha256 || '')
+    && turn.id === `${history?.id}:turn:envelope:${identity.sha256}`;
+}
+
+export const stableSourceTurn = (turn, history) => sourceTurnOwnable(turn, history)
+  && turn.sourceIdentity?.strength === 'stable';
+
+/** Persist provenance only for a freshly observed native send, never a prompt-only restart. */
+export function retainSubmittedTurn(record, nativeTurn, sourceTurn, binding, history) {
+  if (!stableSourceTurn(sourceTurn, history) || history?.id !== record?.cursorSessionId
+    || binding?.sessionId !== history.id || binding?.cwd !== record?.thread?.cwd
+    || history.cwd !== record.thread.cwd || nativeTurn?.status !== 'inProgress'
+    || !record.thread.turns.includes(nativeTurn) || canonicalSubmittedText(sourceTurn) !== canonicalSubmittedText(nativeTurn)) return false;
+  const user = nativeTurn.items?.filter(item => item.type === 'userMessage');
+  if (user?.length !== 1 || !nonempty(user[0].clientId)) return false;
+  const proof = { version: 2, sourceTurnId: sourceTurn.id, sessionId: history.id,
+    paneId: binding.paneId, agentPid: binding.agentPid, agentStartTime: binding.agentStartTime,
+    origin: 'native', clientId: user[0].clientId, model: record.thread.model,
+    userTextSha256: submittedTurnTextSha256(sourceTurn), nativeUserTextSha256: nativeTurnTextSha256(nativeTurn) };
+  if (Object.hasOwn(record.tmuxObserverTurns || {}, nativeTurn.id)
+    && JSON.stringify(record.tmuxObserverTurns[nativeTurn.id]) !== JSON.stringify(proof)) return false;
+  const next = { ...record, tmuxObserverTurns: { ...record.tmuxObserverTurns, [nativeTurn.id]: proof } };
+  if (!observerTurnProof(next, nativeTurn.id)) return false;
+  record.tmuxObserverTurns = next.tmuxObserverTurns;
+  return true;
+}
 
 /** A malformed explicit native claim must remain blocked, never become a retry. */
 export function hasSubmittedTurnClaim(record, turnId) {
@@ -84,7 +118,7 @@ export function recoverableObserverTurn(record, binding, history) {
     || !Array.isArray(history.turns)) return null;
   const sources = history.turns.filter(source => source?.id === proof.sourceTurnId);
   const sourceTurn = sources[0];
-  if (sources.length !== 1 || !Array.isArray(sourceTurn.items) || sourceTurn.items.some(item => !item || typeof item !== 'object')
+  if (sources.length !== 1 || !sourceTurnOwnable(sourceTurn, history) || !Array.isArray(sourceTurn.items) || sourceTurn.items.some(item => !item || typeof item !== 'object')
     || displayText(userText(sourceTurn)) !== displayText(userText(turn))) return null;
   if (proof.version === 2) {
     const users = sourceTurn.items.filter(item => item.type === 'userMessage');
@@ -108,7 +142,7 @@ export function findLiveSourceTurn(record, history, prompt) {
   if (history?.sourceComplete !== false || typeof prompt !== 'string'
     || (record.cursorSessionId && record.cursorSessionId !== history.id)) return null;
   const source = history.turns?.at(-1);
-  if (!source?.id || history.completedTurnIds?.includes(source.id)
+  if (!source?.id || !sourceTurnOwnable(source, history) || history.completedTurnIds?.includes(source.id)
     || !displayText(prompt) || displayText(userText(source)) !== displayText(prompt)) return null;
   const mapping = record.historySync?.sourceTurns;
   const nativeId = mapping && Object.hasOwn(mapping, source.id) ? mapping[source.id] : source.id;

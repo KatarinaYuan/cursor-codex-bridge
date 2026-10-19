@@ -5,7 +5,7 @@ import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { CursorSession } from './cursor.mjs';
-import { findLiveSourceTurn, finalizeLivePreview, hasSubmittedTurnClaim, observerTurnProof, recoverableObserverTurn } from './live-history.mjs';
+import { findLiveSourceTurn, finalizeLivePreview, hasSubmittedTurnClaim, observerTurnProof, recoverableObserverTurn, retainSubmittedTurn } from './live-history.mjs';
 import { queueList, queueAdd, queueUpdate, queueDelete, queueReorder, queuePeek, queueConsume } from './queue.mjs';
 import { expandModelVariants } from './model-labels.mjs';
 import { retryDraftFor, retainUnsubmittedDraft, pinLiveSourceTurn } from './draft-recovery.mjs';
@@ -328,6 +328,17 @@ export function createBridge({ send, log = () => {} }) {
       models, modelDefinitions,
     }) : new Session(sessionOptions(r, log));
     if (binding) s.setVerified?.(tmuxSync.client.isVerified(binding));
+    if (binding) s.onSubmittedSource = async ({ sourceTurn, history, model, isCurrent }) => withThreadLock(r.thread.id, async () => {
+      const turn = activeTurn(r);
+      const clientId = turn?.items?.find(item => item.type === 'userMessage')?.clientId;
+      s.assertVerified();
+      if (!isCurrent() || !tmuxSync.client.isVerified(s.binding) || !turn || !runningTurns.has(r.thread.id) || s.model !== model || r.thread.model !== model
+        || !pinLiveSourceTurn(r, turn, sourceTurn)
+        || (clientId != null && !retainSubmittedTurn(r, turn, sourceTurn, s.binding, history))) {
+        throw new Error('The submitted Cursor source cannot be durably linked to its original native message');
+      }
+      await persist(r);
+    });
     openingSessionInstances.add(s);
     s.on('exit', () => { if (sessions.get(r.thread.id) === s) sessions.delete(r.thread.id); });
     s.on('model', model => {
@@ -346,8 +357,10 @@ export function createBridge({ send, log = () => {} }) {
         const user = event.prompt;
         const source = s.history?.turns.find(turn => turn.id === event.sourceTurnId);
         if (!source) throw new Error('The observed Cursor source turn is no longer available');
-        const nativeId = r.historySync?.sourceTurns?.[source.id] || source.id;
-        let t = r.thread.turns.find(turn => turn.id === nativeId) || findLiveSourceTurn(r, s.history, user);
+        let t = findLiveSourceTurn(r, s.history, user);
+        if (Object.hasOwn(r.historySync?.sourceTurns || {}, source.id) && !t) {
+          throw new Error('The observed Cursor source mapping disagrees with its native message');
+        }
         if (activeTurn(r) && activeTurn(r) !== t) throw new Error('Another native Cursor turn owns this observer');
         if (!t) {
           t = { id: uuid(), rootTurnId: null, items: [], itemsView: 'full', status: 'inProgress', error: null, startedAt: now(), completedAt: null, durationMs: null };
@@ -536,7 +549,7 @@ export function createBridge({ send, log = () => {} }) {
       t.status = result?.stopReason === 'cancelled' ? 'interrupted' : result?.stopReason === 'failed' ? 'failed' : 'completed';
       if (t.status === 'failed') t.error = result.sourceTurn?.error || { message: 'Cursor CLI turn failed', codexErrorInfo: null, additionalDetails: null };
     } catch (e) {
-      if (externalPromise && s.kind === 'tmux' && (nativeOrigin || observerTurnProof(r, t.id))) {
+      if (s.kind === 'tmux' && ((externalPromise && nativeOrigin) || observerTurnProof(r, t.id))) {
         // Losing a read-only observer cannot fail the original Cursor task.
         // Keep its exact source ownership so another observer can adopt it.
         detachedObserver = true;

@@ -38,8 +38,8 @@ Cursor 登录属于远端用户环境。使用正确 SSH 用户并由账号拥�
 在 laptop 任意目录运行，把 `my-dev` 换成安装时的源 SSH 别名：
 
 ```sh
-npx --yes --package=https://github.com/KatarinaYuan/cursor-codex-bridge/releases/download/v0.1.6/cursor-codex-bridge-0.1.6.tgz cursor-codex upgrade --ssh my-dev
-npx --yes --package=https://github.com/KatarinaYuan/cursor-codex-bridge/releases/download/v0.1.6/cursor-codex-bridge-0.1.6.tgz cursor-codex doctor --ssh my-dev
+npx --yes --package=https://github.com/KatarinaYuan/cursor-codex-bridge/releases/download/v0.1.7/cursor-codex-bridge-0.1.7.tgz cursor-codex upgrade --ssh my-dev
+npx --yes --package=https://github.com/KatarinaYuan/cursor-codex-bridge/releases/download/v0.1.7/cursor-codex-bridge-0.1.7.tgz cursor-codex doctor --ssh my-dev
 ```
 
 原来使用自定义桥别名时，两条命令都补上相同的 `--alias my-cursor`。若升级和诊断通过而 App 仍显示旧列表，在 SSH 设置中断开桥连接后重新连接。全局最近列表有条数上限，较旧会话未进入当前列表不代表丢失；仍可在对应项目中查找。诊断和列表检查不会发送模型消息。
@@ -59,7 +59,7 @@ text remains as an unsubmitted draft in tmux. Review it in Cursor CLI
 
 这表示桥未能确认粘贴后的输入，文本可能仍作为草稿留在 CLI 中。**不要盲目重复发送或再粘贴一遍。**先在 Cursor CLI 查看草稿及是否已产生回复。只有持久化恢复凭据、原进程、模型、历史和草稿原文全部一致时，桥才允许将相同原文作为已有草稿重试；它不会自动清空或提交普通草稿。
 
-`v0.1.6` 修复了短消息超过六个显式文本行时的发送限制。消息不超过 800 个 UTF-16 字符且含超过六行时，桥会临时独占原 pane 的输入，阻止普通 tmux 按键混入，原文只粘贴一次，再移动光标检查全文。临时随机标记帮助识别连续空行；核验完成后先删除标记，再发送一次 Enter。提交原文保留空行、内部换行及首尾换行，不补字符、不合并段落，也不打开外部编辑器。看到旧的 `more than six hard lines; no text was pasted` 错误时，先升级到 `v0.1.6` 并运行诊断。
+`v0.1.6` 修复了短消息超过六个显式文本行时的发送限制。消息不超过 800 个 UTF-16 字符且含超过六行时，桥会临时独占原 pane 的输入，阻止普通 tmux 按键混入，原文只粘贴一次，再移动光标检查全文。临时随机标记帮助识别连续空行；核验完成后先删除标记，再发送一次 Enter。提交原文保留空行、内部换行及首尾换行，不补字符、不合并段落，也不打开外部编辑器。看到旧的 `more than six hard lines; no text was pasted` 错误时，先升级到当前 `v0.1.7` 并运行诊断。
 
 核验期间请等待临时输入锁自动释放。输入锁最多保留 300 秒，并有独立看门狗负责清理。已有 `pipe-pane`、已经关闭的 pane 输入、草稿或无法确认的布局会使桥拒绝接管。核验失败时不发送 Enter，保留草稿；如果提交是否成功的确认不明确，桥不会自动重发。
 
@@ -74,6 +74,8 @@ text remains as an unsubmitted draft in tmux. Review it in Cursor CLI
 先区分真实任务与桥中的观察轮次。旧版桥可能在正式历史已完成后，根据终端残留的忙碌画面创建第二个运行轮次；回复正文可以同步到这个轮次，但它等不到属于自己的新来源完成事件，因而一直显示运行中。仅凭 `thinking` 或终端最后一段文字不能判定 Cursor 是否仍在执行。
 
 `v0.1.5` 按来源轮次 ID 检查正式历史，避免从已完成的来源创建重复观察。新建的观察同时持久化来源轮次与原生轮次的对应凭据；重连后继续观察原任务，或从正式完成记录收尾，不重发模型请求。升级命令见上文，普通安装器仍要求桥空闲。
+
+`v0.1.7` 进一步区分真人请求和 Cursor 注入的完整运行时工具目录。真人请求的完整时间戳封套提供稳定身份，避免 transcript 截取后的位置编号碰撞；运行时目录不再拆开同一次请求。相同正文的不同请求不应互相替代。旧格式缺少完整封套时仍兼容当前会话匹配，但不建立新的稳定提交恢复凭据；重复封套拒绝自动归属，不靠提示词相同猜测完成事件。
 
 这一预防与恢复机制不会自动清除所有旧版异常轮次。若升级前已经卡住且缺少对应凭据，需要核对正式历史、映射关系及当前原进程状态后单独修复。请保留记录并提交脱敏诊断；不要通过结束 Cursor 进程、删除状态目录或给原聊天重复发消息来尝试清除状态。
 

@@ -2,14 +2,12 @@ import { readdir, readFile, stat } from 'node:fs/promises';
 import { basename, dirname, join, resolve } from 'node:path';
 import { homedir } from 'node:os';
 import { createHash } from 'node:crypto';
+import { SOURCE_IDENTITY_SCHEME, timestampedUserEnvelope, isRuntimeContext, unwrapUserEnvelope } from './source-identity.mjs';
 
 const textBlocks = (content) => typeof content === 'string' ? content
   : Array.isArray(content) ? content.filter((block) => block?.type === 'text' && typeof block.text === 'string').map((block) => block.text).join('\n') : '';
 
-function userText(text) {
-  const query = text.match(/<user_query>\s*([\s\S]*?)\s*<\/user_query>/);
-  return query ? query[1] : text.replace(/^<timestamp>[\s\S]*?<\/timestamp>\s*/, '');
-}
+const userText = unwrapUserEnvelope;
 
 function seconds(value, fallback = 0) {
   if (typeof value === 'string' && !/^\d+(\.\d+)?$/.test(value)) {
@@ -26,25 +24,54 @@ export function parseTranscript(text, options = {}) {
   const id = options.id ?? (options.sourcePath ? basename(options.sourcePath, '.jsonl') : 'cursor-history');
   const turns = [];
   const completedTurnIds = [];
-  let current;
-  let firstUser = '';
-  let itemNumber = 0;
-  const ensureTurn = () => {
-    if (!current) {
-      const turnId = `${id}:turn:${turns.length}`;
-      current = {
-        id: turnId, rootTurnId: turnId, items: [], itemsView: 'full',
-        status: 'completed', error: null,
-        startedAt: null, completedAt: null, durationMs: null,
-      };
-      turns.push(current);
-    }
-    return current;
-  };
+  const rows = [];
+  const envelopeCounts = new Map();
+  // A CLI timestamp has minute precision. Inspect the whole snapshot before
+  // assigning identities so every member of a duplicate group is untrusted.
   for (const line of text.split(/\r?\n/)) {
     if (!line.trim()) continue;
     let row;
     try { row = JSON.parse(line); } catch { continue; } // A live append may leave a partial final row.
+    const role = row.role ?? row.message?.role;
+    const content = textBlocks(row.message?.content ?? row.content);
+    const envelope = row.type !== 'turn_ended' && role === 'user' && userText(content).trim()
+      ? timestampedUserEnvelope(content, id) : null;
+    if (envelope) envelopeCounts.set(envelope.sha256, (envelopeCounts.get(envelope.sha256) || 0) + 1);
+    rows.push({ row, role, content, envelope });
+  }
+  const envelopeOccurrences = new Map();
+  let current;
+  let firstUser = '';
+  let assistantNumber = 0;
+  const ensureTurn = envelope => {
+    if (!current) {
+      let turnId = `${id}:turn:${turns.length}`;
+      let sourceIdentity = { version: 1, kind: 'legacy-position', strength: 'position' };
+      if (envelope) {
+        const { sha256 } = envelope;
+        const ambiguous = envelopeCounts.get(sha256) > 1;
+        const occurrence = envelopeOccurrences.get(sha256) || 0;
+        envelopeOccurrences.set(sha256, occurrence + 1);
+        // The occurrence exists only to give ambiguous rows distinct display
+        // IDs. It is never presented as a stable event identity.
+        turnId = ambiguous ? `${id}:turn:ambiguous:${sha256}:display:${occurrence}`
+          : `${id}:turn:envelope:${sha256}`;
+        sourceIdentity = { version: 1, kind: 'timestamped-user-envelope', sha256,
+          strength: ambiguous ? 'ambiguous' : 'stable' };
+      }
+      current = {
+        id: turnId, rootTurnId: turnId, items: [], itemsView: 'full',
+        status: 'completed', error: null,
+        startedAt: null, completedAt: null, durationMs: null,
+        sourceIdentity,
+        ...(envelope ? { sourceTimestampMinute: envelope.timestampMinute } : {}),
+      };
+      turns.push(current);
+      assistantNumber = 0;
+    }
+    return current;
+  };
+  for (const { row, role, content: rawContent, envelope } of rows) {
     if (row.type === 'turn_ended') {
       if (current) completedTurnIds.push(current.id);
       if (current && ['aborted', 'cancelled', 'canceled', 'interrupted'].includes(row.status)) current.status = 'interrupted';
@@ -55,20 +82,24 @@ export function parseTranscript(text, options = {}) {
       current = undefined;
       continue;
     }
-    const role = row.role ?? row.message?.role;
     if (role !== 'user' && role !== 'assistant') continue;
-    let content = textBlocks(row.message?.content ?? row.content);
+    // This is context for the current inference, not a new human request. Do
+    // not end that inference or separate its subsequent assistant output.
+    if (role === 'user' && !envelope && isRuntimeContext(rawContent)) continue;
+    let content = rawContent;
     if (role === 'user') content = userText(content);
     if (!content.trim()) continue;
     if (role === 'user') {
-      if (current?.items.some((item) => item.type === 'userMessage')) {
+      if (current && (envelope || current.items.some((item) => item.type === 'userMessage'))) {
         completedTurnIds.push(current.id);
         current = undefined;
       }
       if (!firstUser) firstUser = content;
-      ensureTurn().items.push({ id: `${id}:item:${itemNumber++}`, type: 'userMessage', clientId: null, content: [{ type: 'text', text: content, text_elements: [] }] });
+      const turn = ensureTurn(envelope);
+      turn.items.push({ id: `${turn.id}:user`, type: 'userMessage', clientId: null, content: [{ type: 'text', text: content, text_elements: [] }] });
     } else {
-      ensureTurn().items.push({ id: `${id}:item:${itemNumber++}`, type: 'agentMessage', text: content, phase: 'final_answer', memoryCitation: null, delivery: null, questions: null });
+      const turn = ensureTurn();
+      turn.items.push({ id: `${turn.id}:assistant:${assistantNumber++}`, type: 'agentMessage', text: content, phase: 'final_answer', memoryCitation: null, delivery: null, questions: null });
     }
   }
   return {
@@ -79,6 +110,9 @@ export function parseTranscript(text, options = {}) {
     updatedAt: seconds(options.updatedAt, seconds(options.createdAt)),
     turns,
     completedTurnIds,
+    sourceIdentityScheme: SOURCE_IDENTITY_SCHEME,
+    sourceIdentityWarnings: [...envelopeCounts].filter(([, count]) => count > 1)
+      .map(([sha256, count]) => ({ code: 'EAMBIGUOUS', sha256, count })),
     sourcePath: options.sourcePath ?? null,
   };
 }

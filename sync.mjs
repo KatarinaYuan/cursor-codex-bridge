@@ -1,3 +1,6 @@
+import { sourceTurnOwnable, stableSourceTurn } from './live-history.mjs';
+import { unwrapUserEnvelope } from './source-identity.mjs';
+
 /**
  * Reconcile a read-only Cursor transcript with its native bridge record.
  *
@@ -11,8 +14,7 @@ const textContent = content => typeof content === 'string' ? content
   : Array.isArray(content) ? content.filter(block => block?.type === 'text' && typeof block.text === 'string').map(block => block.text).join('\n') : '';
 
 function userText(text) {
-  const query = text.match(/<user_query>\s*([\s\S]*?)\s*<\/user_query>/);
-  return (query ? query[1] : text.replace(/^<timestamp>[\s\S]*?<\/timestamp>\s*/, '')).replace(/\r\n/g, '\n').trim();
+  return unwrapUserEnvelope(text).replace(/\r\n/g, '\n').trim();
 }
 
 function turnUser(turn) {
@@ -88,10 +90,14 @@ export function reconcileHistory(record, history) {
     for (const sourceItem of source.items || []) {
       if (!['userMessage', 'agentMessage'].includes(sourceItem.type)) continue;
       if (sourceItem.type === 'agentMessage' && handledAgents) continue;
+      const compatibleItem = candidate => candidate && !claimed.has(candidate.id) && candidate.type === sourceItem.type
+        && (candidate.type === 'userMessage'
+          ? userText(textContent(candidate.content)) === userText(textContent(sourceItem.content))
+          : candidate.text === sourceItem.text || candidate.text?.startsWith(sourceItem.text) || sourceItem.text?.startsWith(candidate.text));
       let item = own(sync.sourceItems, sourceItem.id)
         ? native.items.find(candidate => candidate.id === sync.sourceItems[sourceItem.id]) : undefined;
-      if (item && (claimed.has(item.id) || item.type !== sourceItem.type)) item = undefined;
-      if (!item) item = native.items.find(candidate => candidate.id === sourceItem.id && !claimed.has(candidate.id) && candidate.type === sourceItem.type);
+      if (!compatibleItem(item)) item = undefined;
+      if (!item) item = native.items.find(candidate => candidate.id === sourceItem.id && compatibleItem(candidate));
       if (!item && sourceItem.type === 'userMessage') {
         // Native wrappers and timestamps are absent from the human transcript.
         item = native.items.find(candidate => candidate.type === 'userMessage' && !claimed.has(candidate.id)
@@ -133,23 +139,43 @@ export function reconcileHistory(record, history) {
   for (const source of history.turns || []) {
     if (!source?.id || !Array.isArray(source.items)) continue;
     const sourceUser = turnUser(source);
+    const ownable = sourceTurnOwnable(source, history);
+    const stable = stableSourceTurn(source, history);
+    const sourceCompleted = history.sourceComplete !== false || source !== history.turns.at(-1)
+      || history.completedTurnIds?.includes(source.id);
     const agrees = candidate => candidate && !claimedTurns.has(candidate.id)
       && turnUser(candidate) === sourceUser;
     let native = own(sync.sourceTurns, source.id)
       ? turns.find(turn => turn.id === sync.sourceTurns[source.id]) : undefined;
-    if (!agrees(native)) native = undefined;
-    if (!native) native = turns.find(turn => turn.id === source.id && agrees(turn));
-    if (!native && sourceUser) {
+    if (!ownable || !agrees(native)) native = undefined;
+    if (!native) native = turns.find(turn => turn.id === source.id && agrees(turn)
+      && (ownable || turn.sourceIdentity?.strength === 'ambiguous'));
+    if (!native && source.sourceIdentity?.strength === 'ambiguous') {
+      // Display reconciliation may retain an already completed card when its
+      // formerly unique envelope becomes duplicated. This grants no live
+      // ownership: ambiguous sources remain inadmissible to pending/proofs.
+      const exact = turns.filter(turn => agrees(turn) && turn.status !== 'inProgress'
+        && (turn.sourceIdentity?.sha256 === source.sourceIdentity.sha256
+          || sync.sourceTurns[`${history.id}:turn:envelope:${source.sourceIdentity.sha256}`] === turn.id)
+        && agentText(source) && agentText(turn) === agentText(source));
+      if (exact.length === 1) native = exact[0];
+    }
+    if (!native && sourceUser && ownable) {
       // Prompt text alone is ambiguous for common messages such as "Continue".
       // An unmapped echo must agree with the native answer too; otherwise it is
       // a distinct external turn that belongs before a later matching echo.
       const sourceAnswer = agentText(source);
       const candidates = turns.slice(cursor).filter(turn => agrees(turn));
-      native = candidates.find(turn => {
+      const compatible = candidates.filter(turn => {
         const nativeAnswer = agentText(turn);
+        // New envelope IDs must not inherit ordinal ownership. A historical
+        // migration requires a unique completed user-and-answer counterpart;
+        // active native submissions are bound by their live session instead.
+        if (stable && (!sourceCompleted || turn.status === 'inProgress' || !sourceAnswer || !nativeAnswer)) return false;
         if (!sourceAnswer && nativeAnswer) return false;
         return !sourceAnswer || !nativeAnswer || sourceAnswer.startsWith(nativeAnswer) || nativeAnswer.startsWith(sourceAnswer);
       });
+      native = stable ? (compatible.length === 1 ? compatible[0] : undefined) : compatible[0];
       // A user row may be visible before its answer has been flushed. Defer an
       // ambiguous binding until a later snapshot can distinguish it from an
       // already-completed native turn with the same prompt.
@@ -176,6 +202,15 @@ export function reconcileHistory(record, history) {
     } else {
       hasAnchor = true;
       bindItems(native, source, native.id === source.id);
+    }
+    if (stable) {
+      // Old positional aliases are evidence of the previous parser, not an
+      // authority over the new envelope. Retire only aliases of this proven
+      // counterpart; never redirect an ordinal to a different native turn.
+      for (const [id, nativeId] of Object.entries(sync.sourceTurns)) {
+        if (nativeId === native.id && /^\d+$/u.test(id.slice(`${history.id}:turn:`.length))
+          && id.startsWith(`${history.id}:turn:`)) delete sync.sourceTurns[id];
+      }
     }
     sync.sourceTurns[source.id] = native.id;
     claimedTurns.add(native.id);

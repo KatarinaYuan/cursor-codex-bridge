@@ -4,6 +4,7 @@ import wrapAnsi from 'wrap-ansi';
 import stringWidth from 'string-width';
 import { TmuxSession } from './live.mjs';
 import { parseCursorScreen } from './screen.mjs';
+import { parseTranscript } from './history.mjs';
 
 // These frames reproduce Cursor's default light-theme capture-pane -e output:
 // user messages use a grey background, while the prompt has an inverse caret.
@@ -248,7 +249,8 @@ class PagedTmuxClient extends NarrowTmuxClient {
 }
 
 async function start(t, { client = new MockTmuxClient(), source = history([turn('old', 'Earlier question', 'Earlier answer')]), sourceTurnIds = [], models, modelDefinitions } = {}) {
-  const session = new TmuxSession({ client, binding, model: 'composer-2.5[fast=true]', models, modelDefinitions, history: source, sourceTurnIds, interval: 60_000 });
+  const session = new TmuxSession({ client, binding, model: 'composer-2.5[fast=true]', models, modelDefinitions, history: source, sourceTurnIds, interval: 60_000,
+    now: () => Date.UTC(2026, 9, 19, 11, 0) });
   t.after(() => session.close());
   const result = await session.start();
   return { session, client, result };
@@ -880,6 +882,7 @@ test('native canonical completion tolerates a trailing LF and CRLF but preserves
   // The transcript wrapper strips exterior whitespace after submission. The
   // paste guard remains exact; this test isolates reconciliation of that turn.
   const pending = session.begin('native', 'Reply  READY\r\non this line\n');
+  pending.submitted = true;
   let resolved = false;
   pending.promise.then(() => { resolved = true; });
   const old = turn('old', 'Earlier question');
@@ -892,6 +895,138 @@ test('native canonical completion tolerates a trailing LF and CRLF but preserves
   assert.equal(result.sourceTurn.id, 'matching');
   assert.equal(result.history, completed);
   assert.equal(result.stopReason, 'end_turn');
+});
+
+const stampedHistory = (rows, complete = true) => ({ ...parseTranscript(rows.map(([role, text]) =>
+  JSON.stringify({ role, message: { content: [{ type: 'text', text }] } })).join('\n'),
+{ id: binding.sessionId, cwd: binding.cwd }), sourceComplete: complete });
+const stampedPrompt = (text, minute = '01') => `<timestamp>Monday, Oct 19, 2026, 11:${minute} AM (UTC)</timestamp>\n<user_query>${text}</user_query>`;
+
+test('old ambiguous same-prompt groups do not block a later unique submitted source', async t => {
+  const older = [['user', stampedPrompt('Continue')], ['assistant', 'One'], ['user', stampedPrompt('Continue')], ['assistant', 'Two']];
+  const { session, client } = await start(t, { source: stampedHistory(older) });
+  let claims = 0;
+  session.onSubmittedSource = async () => { claims++; };
+  const pending = session.begin('native', 'Continue\n'); pending.submitted = true;
+  const latest = stampedHistory([...older, ['user', stampedPrompt('Continue', '02')], ['assistant', 'Unique latest answer']]);
+  session.acceptHistory(latest);
+  assert.equal((await pending.promise).sourceTurn.id, latest.turns[2].id);
+  assert.equal(claims, 1);
+  assert.deepEqual(client.calls, []);
+});
+
+test('a fresh duplicate envelope and a previously unique envelope losing uniqueness refuse ownership', async t => {
+  for (const bindBeforeDuplicate of [false, true]) {
+    const { session, client } = await start(t, { source: stampedHistory([]) });
+    let claims = 0, resolved = false;
+    session.onSubmittedSource = async () => { claims++; };
+    const pending = session.begin('native', 'Continue'); pending.submitted = true;
+    pending.promise.then(() => { resolved = true; }, () => {});
+    const rows = [['user', stampedPrompt('Continue')], ['assistant', 'One']];
+    if (bindBeforeDuplicate) { session.acceptHistory(stampedHistory(rows, false)); await Promise.resolve(); }
+    session.acceptHistory(stampedHistory([...rows, ['user', stampedPrompt('Continue')], ['assistant', 'Two']]));
+    await Promise.resolve(); await Promise.resolve();
+    assert.equal(resolved, false);
+    assert.match(pending.identityError.message, /identity changed or is ambiguous/);
+    assert.equal(claims, bindBeforeDuplicate ? 1 : 0);
+    assert.deepEqual(client.calls, []);
+  }
+});
+
+test('a reused positional source ID cannot complete a different native submission', async t => {
+  const { session, client } = await start(t, { source: history([turn('source:turn:1', 'Old request', 'Old result')]) });
+  const pending = session.begin('native', 'New request'); pending.submitted = true;
+  let resolved = false; pending.promise.then(() => { resolved = true; }, () => {});
+  session.acceptHistory(history([turn('source:turn:1', 'New request', 'New result')]));
+  await Promise.resolve();
+  assert.equal(resolved, false);
+  assert.match(pending.identityError.message, /identity changed/);
+  assert.deepEqual(client.calls, []);
+});
+
+for (const fails of [false, true]) test(`canonical history before transport acknowledgement ${fails ? 'does not claim a failed paste' : 'waits for successful Enter'}`, async t => {
+  const { session, client } = await start(t, { source: stampedHistory([]) });
+  let claims = 0;
+  session.onSubmittedSource = async () => { claims++; };
+  const paste = client.paste.bind(client);
+  client.paste = async (...args) => {
+    session.acceptHistory(stampedHistory([['user', stampedPrompt('New question')], ['assistant', 'Fast canonical answer']]));
+    await Promise.resolve();
+    assert.equal(claims, 0);
+    if (fails) throw new Error('Fixture failed before Enter');
+    return paste(...args);
+  };
+  const response = session.prompt([{ type: 'text', text: 'New question' }]);
+  if (fails) {
+    await assert.rejects(response, /failed before Enter/);
+    assert.equal(claims, 0);
+    assert.equal(client.calls.some(call => call.type === 'Enter'), false);
+  } else {
+    assert.equal((await response).sourceTurn.items[1].text, 'Fast canonical answer');
+    assert.equal(claims, 1);
+    assert.equal(client.calls.filter(call => call.type === 'Enter').length, 1);
+  }
+});
+
+test('source revocation while durable submission binding waits cannot finish a stale canonical snapshot', async t => {
+  const { session } = await start(t, { source: stampedHistory([]) });
+  let release, claims = 0, resolved = false, current;
+  const held = new Promise(resolve => { release = resolve; });
+  session.onSubmittedSource = async event => { await held; current = event.isCurrent(); if (current) claims++; };
+  const pending = session.begin('native', 'Continue'); pending.submitted = true;
+  pending.promise.then(() => { resolved = true; }, () => {});
+  const rows = [['user', stampedPrompt('Continue')], ['assistant', 'One']];
+  session.acceptHistory(stampedHistory(rows));
+  await Promise.resolve();
+  session.acceptHistory(stampedHistory([...rows, ['user', stampedPrompt('Continue')], ['assistant', 'Two']]));
+  release(); await Promise.resolve(); await Promise.resolve(); await Promise.resolve();
+  assert.equal(current, false); assert.equal(claims, 0); assert.equal(resolved, false);
+  session.acceptHistory(stampedHistory(rows));
+  await Promise.resolve();
+  assert.equal(resolved, false, 'observed ambiguity cannot disappear merely because a rewrite removed its duplicate');
+});
+
+test('a recovered external source stays blocked after its observed envelope lost uniqueness', async t => {
+  const rows = [['user', stampedPrompt('Continue')], ['assistant', 'One']];
+  const { session } = await start(t, { source: stampedHistory(rows, false) });
+  const pending = session.resumeObserver(session.history.turns[0].id, 'Continue');
+  let resolved = false; pending.promise.then(() => { resolved = true; }, () => {});
+  session.acceptHistory(stampedHistory([...rows, ['user', stampedPrompt('Continue')], ['assistant', 'Two']]));
+  session.acceptHistory(stampedHistory(rows));
+  await Promise.resolve();
+  assert.equal(resolved, false);
+  assert.match(pending.identityError.message, /ambiguous/);
+});
+
+test('verification revoked after Enter prevents a new durable source claim', async t => {
+  const { session, client } = await start(t, { source: stampedHistory([]) });
+  let claims = 0;
+  session.onSubmittedSource = async () => { claims++; };
+  const response = session.prompt([{ type: 'text', text: 'New question' }]);
+  response.catch(() => {});
+  await client.submitted; await Promise.resolve();
+  session.setVerified(false);
+  session.acceptHistory(stampedHistory([['user', stampedPrompt('New question')], ['assistant', 'Reply']]));
+  await Promise.resolve(); await Promise.resolve();
+  assert.equal(claims, 0);
+  assert.equal(session.pending.bindingError instanceof Error, true);
+});
+
+test('a completed same-prompt envelope exported late from an older minute cannot claim a fresh native send', async t => {
+  const { session, client } = await start(t, { source: stampedHistory([]) });
+  session.now = () => Date.UTC(2026, 9, 19, 11, 2, 15);
+  let claims = 0, resolved = false;
+  session.onSubmittedSource = async () => { claims++; };
+  const pending = session.begin('native', 'Continue'); pending.submitted = true;
+  pending.promise.then(() => { resolved = true; }, () => {});
+  const older = [['user', stampedPrompt('Continue', '01')], ['assistant', 'Old late export']];
+  session.acceptHistory(stampedHistory(older));
+  await Promise.resolve();
+  assert.equal(claims, 0); assert.equal(resolved, false);
+  const fresh = stampedHistory([...older, ['user', stampedPrompt('Continue', '02')], ['assistant', 'Fresh answer']]);
+  session.acceptHistory(fresh);
+  assert.equal((await pending.promise).sourceTurn.id, fresh.turns[1].id);
+  assert.equal(claims, 1); assert.deepEqual(client.calls, []);
 });
 
 test('a newly submitted native turn cannot show the previous reply before its user frame appears', async t => {

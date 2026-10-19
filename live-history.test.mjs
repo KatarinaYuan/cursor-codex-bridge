@@ -4,6 +4,8 @@ import { parseTranscript } from './history.mjs';
 import { reconcileHistory } from './sync.mjs';
 import { findLiveSourceTurn, finalizeLivePreview, hasSubmittedTurnClaim, nativeTurnTextSha256, observerTurnProof,
   recoverableObserverTurn, submittedTurnTextSha256 } from './live-history.mjs';
+import { retainSubmittedTurn } from './live-history.mjs';
+import { pinLiveSourceTurn } from './draft-recovery.mjs';
 
 function history(rows, sourceComplete = false) {
   return { ...parseTranscript(rows.map(([role, text]) => JSON.stringify({ role, message: { content: [{ type: 'text', text }] } })).join('\n'), {
@@ -72,6 +74,29 @@ test('explicit submitted proof recovers the same native client, model, user byte
     assert.equal(recovered.sourceTurn, fixture.source.turns[0]);
     assert.deepEqual(fixture, before);
   }
+});
+
+test('only a unique stable source can create a fresh submitted proof after a real live binding', () => {
+  const { native, source, binding, turn } = submittedFixture();
+  const stamped = history([['user', '<timestamp>Monday, Oct 19, 2026, 11:01 AM (UTC)</timestamp>\n<user_query>Continue please</user_query>'], ['assistant', 'Canonical partial']]);
+  delete native.tmuxObserverTurns; native.historySync = { sourceTurns: {}, sourceItems: {} };
+  assert.equal(pinLiveSourceTurn(native, turn, stamped.turns[0]), true);
+  assert.equal(retainSubmittedTurn(native, turn, stamped.turns[0], binding, stamped), true);
+  assert.equal(recoverableObserverTurn(native, binding, stamped)?.turn.id, turn.id);
+  const before = structuredClone(native);
+  assert.equal(retainSubmittedTurn(native, turn, source.turns[0], binding, source), false);
+  assert.deepEqual(native, before);
+  const duplicate = history([['user', '<timestamp>Monday, Oct 19, 2026, 11:01 AM (UTC)</timestamp>\n<user_query>Continue please</user_query>'],
+    ['assistant', 'One'], ['user', '<timestamp>Monday, Oct 19, 2026, 11:01 AM (UTC)</timestamp>\n<user_query>Continue please</user_query>']]);
+  assert.equal(recoverableObserverTurn(native, binding, duplicate), null);
+  assert.equal(retainSubmittedTurn(native, turn, duplicate.turns[0], binding, duplicate), false);
+});
+
+test('an old ordinal submitted proof cannot jump to a new stable source with the same text', () => {
+  const { native, source, binding } = submittedFixture();
+  const stamped = history([['user', '<timestamp>Monday, Oct 19, 2026, 11:01 AM (UTC)</timestamp>\n<user_query>Continue please</user_query>']]);
+  assert.notEqual(stamped.turns[0].id, source.turns[0].id);
+  assert.equal(recoverableObserverTurn(native, binding, stamped), null);
 });
 
 test('submitted proofs reject client/model/raw-text/queue and exact canonical attribution conflicts', () => {

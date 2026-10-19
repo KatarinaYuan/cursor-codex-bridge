@@ -7,6 +7,7 @@ import { promisify } from 'node:util';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import test from 'node:test';
 import { nativeTurnTextSha256, submittedTurnTextSha256 } from './live-history.mjs';
+import { parseTranscript } from './history.mjs';
 
 const directory = dirname(fileURLToPath(import.meta.url));
 const binding = { paneId: '%8', panePid: 200, agentPid: 201, agentStartTime: '765432', sessionId: 'fixture-cursor-session', cwd: '/fixture/project' };
@@ -18,7 +19,7 @@ const sourceTurn = (id, text, reply) => ({
 const reset = '\x1b[0m';
 const dim = text => `\x1b[2m${text}${reset}`;
 const row = (text, rgb = '242;242;242') => ` \x1b[48;2;${rgb}m ${text}${' '.repeat(70)}\x1b[49m`;
-const frame = (prompt, busy) => `  Cursor Agent\n  ${dim('v2025.01.01-test')}\n\n${['', prompt, ''].map(text => row(text, '227;227;227')).join('\n')}\n\n  Rendered partial\n\n${row('')}\n${row(`\x1b[2m→ \x1b[0;7m\x1b[48;2;242;242;242mA\x1b[0;2m\x1b[48;2;242;242;242mdd a follow-up${busy ? '    ctrl+c to stop' : ''}`)}\n${row('')}\n\n  ${dim('Composer 2.5 · 5.1%')}\n  ${dim('/fixture/project')}\n`;
+const frame = (prompt, busy, draft) => `  Cursor Agent\n  ${dim('v2025.01.01-test')}\n\n${['', prompt, ''].map(text => row(text, '227;227;227')).join('\n')}\n\n  Rendered partial\n\n${row('')}\n${row(draft === undefined ? `\x1b[2m→ \x1b[0;7m\x1b[48;2;242;242;242mA\x1b[0;2m\x1b[48;2;242;242;242mdd a follow-up${busy ? '    ctrl+c to stop' : ''}` : `→ ${draft}\x1b[7m \x1b[27m`)}\n${row('')}\n\n  ${dim('Composer 2.5 · 5.1%')}\n  ${dim('/fixture/project')}\n`;
 
 async function runFixture(scenario) {
   const submitted = scenario.startsWith('native-');
@@ -27,9 +28,25 @@ async function runFixture(scenario) {
   const maintenanceFile = join(home, 'fixture-maintenance');
   process.env.CURSOR_BRIDGE_MAINTENANCE_FILE = maintenanceFile;
   const threadId = 'fixture-native-chat';
-  const old = sourceTurn('source-old', 'Earlier question', 'Earlier answer');
-  const current = sourceTurn('source-current', 'Continue', 'Canonical current answer');
-  const next = sourceTurn('source-next', 'Continue', 'Canonical next answer');
+  const rewrite = kind === 'envelope-rewrite';
+  const fresh = kind === 'fresh-submission' || kind === 'failed-submission';
+  const envelope = (text, minute) => `<timestamp>Monday, Oct 19, 2026, 11:${minute} AM (UTC)</timestamp>\n<user_query>${text}</user_query>`;
+  const catalog = '<available_subagent_types>\nAvailable subagent_types and a quick description of what they do:\n- helper: Helper\n</available_subagent_types>\n<available_subagent_models>\nIf the user explicitly asks for the model of a subagent/task, you may ONLY use model slugs from this list:\n- model-one\n</available_subagent_models>\n<dynamic_tool_catalog>\nThese dynamic tool namespaces were available when this conversation started. Availability may have changed, so use `GetDynamicTools` to check current state before calling `CallDynamicTool`.\n<dynamic_tool_namespaces>fixture tools</dynamic_tool_namespaces>\n</dynamic_tool_catalog>';
+  const completeCatalog = catalog.replace('fixture tools', '<namespace name="fixture" tools="Read" namespaceUseInstructions="Read fixture data" source="fixture" />');
+  const rewritten = rewrite ? parseTranscript([
+    ['user', envelope('Earlier question', '00')], ['assistant', 'Earlier answer'],
+    ['user', envelope('Do step five', '01')], ['assistant', 'Step five started'], ['user', completeCatalog],
+    ['assistant', 'Step five canonical final answer'], ['user', envelope('Do step six', '02')], ['assistant', 'Step six running'],
+  ].map(([role, text]) => JSON.stringify({ role, message: { content: [{ type: 'text', text }] } })).join('\n'),
+  { id: binding.sessionId, cwd: binding.cwd }) : null;
+  const old = sourceTurn(rewrite ? `${binding.sessionId}:turn:19` : 'source-old', 'Earlier question', 'Earlier answer');
+  if (fresh) old.sourceIdentity = { version: 1, kind: 'legacy-position', strength: 'position' };
+  const canonicalOld = rewritten?.turns[0] || old;
+  const freshSource = fresh ? parseTranscript(JSON.stringify({ role: 'user', message: { content: [{ type: 'text', text: envelope('Continue', '01') }] } }),
+    { id: binding.sessionId, cwd: binding.cwd }).turns[0] : null;
+  const current = rewritten?.turns[1] || freshSource || sourceTurn('source-current', 'Continue', 'Canonical current answer');
+  if (fresh) current.items.push({ id: `${current.id}:assistant:0`, type: 'agentMessage', text: 'Canonical current answer', phase: 'final_answer' });
+  const next = rewritten?.turns[2] || sourceTurn('source-next', 'Continue', 'Canonical next answer');
   const native = structuredClone(current);
   native.id = 'saved-native-turn'; native.rootTurnId = native.id;
   native.status = 'inProgress'; native.completedAt = null;
@@ -49,7 +66,7 @@ async function runFixture(scenario) {
   };
   if (submitted) {
     native.items[0].clientId = 'native-message-client';
-    native.items[0].content[0].text = 'Continue\n';
+    native.items[0].content[0].text = rewrite ? 'Do step five\n' : 'Continue\n';
     Object.assign(proof, { version: 2, origin: 'native', clientId: native.items[0].clientId, model: record.thread.model,
       userTextSha256: submittedTurnTextSha256(native), nativeUserTextSha256: nativeTurnTextSha256(native) });
   }
@@ -64,7 +81,7 @@ async function runFixture(scenario) {
     record.historySync.sourceItems = {};
     delete record.tmuxObserverTurns; delete record.livePreviewIds; delete record.liveSourcePreviews;
   }
-  if (kind === 'startup-stale') {
+  if (kind === 'startup-stale' || fresh) {
     record.thread.turns = [old]; record.historySync = { sourceTurns: { [old.id]: old.id }, sourceItems: {} };
     delete record.tmuxObserverTurns; delete record.livePreviewIds; delete record.liveSourcePreviews;
   }
@@ -97,19 +114,30 @@ async function runFixture(scenario) {
   const unfinished = { ...structuredClone(current), status: 'completed', completedAt: null };
   unfinished.items[1].text = 'Canonical partial';
   const completeBefore = ['finished-before-start', 'detached-finish'].includes(kind);
-  let initial = kind === 'startup-stale' ? history([old], true)
+  let initial = rewrite ? { ...rewritten, sourceComplete: false }
+    : kind === 'startup-stale' || fresh ? history([old], true)
     : kind === 'later-source' ? history([old, current, { ...next, completedAt: null }], false)
       : history([old, completeBefore ? current : unfinished], completeBefore);
   if (kind === 'source-mismatch') initial.turns[1].items[0].content[0].text = 'Different source user';
   const currentBinding = kind === 'process-mismatch' ? { ...binding, agentStartTime: '765433' } : binding;
-  const client = { raw: frame(kind === 'startup-stale' ? 'Earlier question' : 'Continue', !completeBefore && kind !== 'observed-model-mismatch'), calls: [],
+  const client = { raw: frame(rewrite ? 'Do step six' : kind === 'startup-stale' || fresh ? 'Earlier question' : 'Continue', !fresh && !completeBefore && kind !== 'observed-model-mismatch'), calls: [],
     async capture() {
       this.calls.push('capture');
       if (kind === 'scan-during-start' && this.calls.length === 1) fixtureHistory(history([old, current], true));
       return this.raw;
     },
     isVerified: () => true,
-    async paste() { throw new Error('Observer must not paste'); },
+    async paste(_pane, text, options) {
+      if (!fresh) throw new Error('Observer must not paste');
+      await options.beforePaste(); this.calls.push('paste'); this.raw = frame('Earlier question', false, text);
+      await options.afterPaste();
+      const snapshot = { ...history([old, current], false), sourceIdentityScheme: 'cursor-envelope-v1' };
+      // The source can flush before transport acknowledges Enter. Failed
+      // submission must never promote this read-only row into native proof.
+      fixtureHistory(snapshot);
+      if (kind === 'failed-submission') throw new Error('Fixture failed before Enter');
+      this.calls.push('Enter'); this.raw = frame('Continue', true);
+    },
     async cancel() { throw new Error('Observer must not cancel'); },
   };
   const messages = [];
@@ -132,10 +160,40 @@ async function runFixture(scenario) {
     const response = messages.find(message => message.id === 1);
     if (response.error) return { error: response.error, messages, calls: client.calls,
       saved: JSON.parse(await readFile(recordPath, 'utf8')) };
-    if (kind === 'startup-stale') {
+    if (fresh) {
+      fixtureSession(threadId).now = () => Date.UTC(2026, 9, 19, 11, 1, 15);
+      await bridge.receive({ id: 2, method: 'turn/start', params: { threadId,
+        clientUserMessageId: 'fresh-client', input: [{ type: 'text', text: 'Continue' }] } });
+      const started = messages.find(message => message.id === 2);
+      assert.equal(started.error, undefined);
+      const turnId = started.result.turn.id;
+      if (kind === 'failed-submission') await wait(message => message.method === 'turn/completed' && message.params.turn.id === turnId);
+      else {
+        let during;
+        for (let count = 0; count < 200; count++) {
+          during = JSON.parse(await readFile(recordPath, 'utf8'));
+          if (during.tmuxObserverTurns?.[turnId]?.version === 2) break;
+          await new Promise(resolve => setTimeout(resolve, 5));
+        }
+        assert.equal(during.tmuxObserverTurns[turnId].origin, 'native');
+        fixtureHistory({ ...history([old, current], true), sourceIdentityScheme: 'cursor-envelope-v1' });
+        await wait(message => message.method === 'turn/completed' && message.params.turn.id === turnId);
+      }
+    } else if (kind === 'startup-stale') {
       await fixtureSession(threadId).poll();
     } else if (kind === 'detached-first') {
       await shutdownBridge();
+    } else if (rewrite) {
+      await wait(message => message.method === 'turn/completed' && message.params.turn.id === native.id);
+      await fixtureSession(threadId).poll();
+      await wait(message => message.method === 'turn/started' && message.params.turn.id !== native.id);
+      let saved;
+      for (let count = 0; count < 200; count++) {
+        saved = JSON.parse(await readFile(recordPath, 'utf8'));
+        if (saved.thread.turns.some(turn => turn.status === 'inProgress' && turn.id !== native.id)) break;
+        await new Promise(resolve => setTimeout(resolve, 5));
+      }
+      return { response, saved, messages, calls: client.calls, sourceIds: { old: canonicalOld.id, current: current.id, next: next.id } };
     } else if (kind === 'later-source') {
       await wait(message => message.method === 'turn/completed' && message.params.turn.id === native.id);
       assert.equal(messages.some(message => message.method === 'turn/completed' && message.params.turn.id === next.id), false);
@@ -216,6 +274,38 @@ if (process.argv[2] === '--observer-fixture') {
     assert.equal(result.saved.thread.turns[2].status, 'completed');
     assert.notEqual(result.saved.historySync.sourceTurns['source-current'], result.saved.historySync.sourceTurns['source-next']);
     assert.equal(result.messages.filter(message => message.method === 'turn/completed').length, 2);
+  });
+
+  test('ordinal rewrite and runtime catalog preserve the completed native fifth step while the sixth stays active', async t => {
+    const result = await (await setup(t))('native-envelope-rewrite');
+    assert.equal(result.error, undefined);
+    assert.equal(result.saved.thread.turns.length, 3);
+    const completed = result.saved.thread.turns.find(turn => turn.id === 'saved-native-turn');
+    assert.equal(completed.status, 'completed');
+    assert.equal(completed.items[0].clientId, 'native-message-client');
+    assert.equal(completed.items[0].content[0].text, 'Do step five\n');
+    assert.match(completed.items.filter(item => item.type === 'agentMessage').map(item => item.text).join('\n'), /Step five canonical final answer/);
+    const next = result.saved.thread.turns.find(turn => turn.id === result.saved.historySync.sourceTurns[result.sourceIds.next]);
+    assert.equal(next.status, 'inProgress');
+    assert.equal(next.items[0].clientId, null);
+    assert.equal(next.items[0].content[0].text, 'Do step six');
+    assert.equal(result.messages.filter(message => message.method === 'turn/completed' && message.params.turn.id === completed.id).length, 1);
+    assert.equal(result.messages.some(message => message.method === 'turn/completed' && message.params.turn.id === next.id), false);
+    assert.ok(result.calls.every(call => call === 'capture'));
+    assert.equal(result.saved.thread.model, 'composer-2.5[fast=true]');
+    assert.equal(result.saved.historySync.sourceTurns[`${binding.sessionId}:turn:19`], undefined);
+  });
+
+  for (const fails of [false, true]) test(`real RPC fresh native source ${fails ? 'never records proof for a failed paste' : 'persists proof after Enter and completes the same turn'}`, async t => {
+    const result = await (await setup(t))(fails ? 'native-failed-submission' : 'native-fresh-submission');
+    const turn = result.saved.thread.turns.at(-1);
+    assert.equal(turn.items[0].clientId, 'fresh-client');
+    assert.equal(turn.items[0].content[0].text, 'Continue');
+    assert.equal(turn.status, fails ? 'failed' : 'completed');
+    assert.equal(result.messages.filter(message => message.method === 'turn/completed' && message.params.turn.id === turn.id).length, 1);
+    assert.equal(result.calls.filter(call => call === 'Enter').length, fails ? 0 : 1);
+    assert.equal(result.saved.tmuxObserverTurns?.[turn.id], undefined);
+    if (fails) assert.equal(Object.values(result.saved.historySync.sourceTurns).includes(turn.id), false);
   });
 
   test('a graceful observer shutdown preserves the running source and a later process recovers the same native ID', async t => {

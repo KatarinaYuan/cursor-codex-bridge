@@ -6,6 +6,125 @@ import { join } from 'node:path';
 import { parseTranscript, discoverHistory, createHistoryScanner } from './history.mjs';
 
 const row = (role, text, extra = []) => JSON.stringify({ role, message: { content: [{ type: 'text', text }, ...extra] } });
+const envelope = (query, minute = 38) => `<timestamp>Monday, Oct 19, 2026, 3:${minute} AM (UTC)</timestamp>\n<user_query>${query}</user_query>`;
+const runtimeCatalog = [
+  '<available_subagent_types>\nAvailable subagent_types and a quick description of what they do:\n- explore: Explore files.\n</available_subagent_types>',
+  '<available_subagent_models>\nIf the user explicitly asks for the model of a subagent/task, you may ONLY use model slugs from this list:\n- inherit (default)\n</available_subagent_models>',
+  '<dynamic_tool_catalog>\nThese dynamic tool namespaces were available when this conversation started. Availability may have changed, so use `GetDynamicTools` to check current state before calling `CallDynamicTool`.\n<dynamic_tool_namespaces>\n<namespace name="example" tools="Read" namespaceUseInstructions="Inspect the source." source="native" />\n</dynamic_tool_namespaces>\n</dynamic_tool_catalog>',
+].join('\n\n');
+
+test('timestamped identities and turn-local items survive preceding context and message rewrites', () => {
+  const target = [row('user', envelope('\n  Do the step\n')), row('assistant', '\nStarting.\n'), row('assistant', 'Done.\n')];
+  const original = parseTranscript([row('user', envelope('Earlier', 37)), row('assistant', 'Earlier answer'), ...target].join('\n'), { id: 'chat' });
+  const rewritten = parseTranscript([row('user', runtimeCatalog), ...target.slice(0, 2), row('user', runtimeCatalog), ...target.slice(2)].join('\n'), { id: 'chat' });
+  const before = original.turns.at(-1);
+  const after = rewritten.turns.at(-1);
+  assert.equal(rewritten.sourceIdentityScheme, 'cursor-envelope-v1');
+  assert.equal(after.id, before.id);
+  assert.deepEqual(after.items, before.items);
+  assert.match(after.id, /^chat:turn:envelope:[0-9a-f]{64}$/u);
+  assert.equal(after.sourceIdentity.strength, 'stable');
+  assert.equal(after.sourceTimestampMinute, Date.UTC(2026, 9, 19, 3, 38));
+  assert.equal(after.items[0].id, `${after.id}:user`);
+  assert.equal(after.items[1].id, `${after.id}:assistant:0`);
+  assert.equal(after.items[2].id, `${after.id}:assistant:1`);
+  assert.equal(after.items[0].content[0].text, 'Do the step'); // Existing wrapper display semantics.
+  assert.deepEqual(after.items.slice(1).map(item => item.text), ['\nStarting.\n', 'Done.\n']);
+});
+
+test('runtime catalogs never split or prematurely complete an ongoing human turn', () => {
+  const pending = [row('user', envelope('Do the step')), row('assistant', 'Starting'), row('user', runtimeCatalog), row('assistant', 'Still working')];
+  const history = parseTranscript(pending.join('\n'), { id: 'chat' });
+  assert.equal(history.turns.length, 1);
+  assert.deepEqual(history.completedTurnIds, []);
+  assert.deepEqual(history.turns[0].items.filter(item => item.type === 'agentMessage').map(item => item.text), ['Starting', 'Still working']);
+  const finished = parseTranscript([...pending, row('assistant', 'Final answer'), row('user', envelope('What next?', 39))].join('\n'), { id: 'chat' });
+  assert.deepEqual(finished.completedTurnIds, [history.turns[0].id]);
+  assert.equal(finished.turns.length, 2);
+  assert.equal(finished.turns[0].items.at(-1).text, 'Final answer');
+  assert.ok(!finished.completedTurnIds.includes(finished.turns[1].id));
+});
+
+test('same prompt with different timestamps has separate stable identities', () => {
+  const history = parseTranscript([row('user', envelope('Continue', 38)), row('assistant', 'First'), row('user', envelope('Continue', 39))].join('\n'), { id: 'chat' });
+  assert.notEqual(history.turns[0].id, history.turns[1].id);
+  assert.ok(history.turns.every(turn => turn.sourceIdentity.strength === 'stable'));
+  assert.deepEqual(history.completedTurnIds, [history.turns[0].id]);
+});
+
+test('duplicate envelopes downgrade the entire group without blocking later unique history', () => {
+  const repeated = row('user', envelope('Continue'));
+  const initial = parseTranscript(repeated, { id: 'chat' });
+  const history = parseTranscript([repeated, row('assistant', 'One'), repeated, row('assistant', 'Two'), row('user', envelope('New request', 40)), row('assistant', 'Three')].join('\n'), { id: 'chat' });
+  assert.equal(history.turns.length, 3);
+  assert.ok(history.turns.slice(0, 2).every(turn => turn.sourceIdentity.strength === 'ambiguous'));
+  assert.ok(history.turns.slice(0, 2).every(turn => turn.sourceTimestampMinute === Date.UTC(2026, 9, 19, 3, 38)));
+  assert.equal(history.turns[2].sourceIdentity.strength, 'stable');
+  assert.equal(new Set(history.turns.map(turn => turn.id)).size, 3);
+  assert.ok(history.turns.slice(0, 2).every(turn => turn.id.includes(':turn:ambiguous:') && turn.id.includes(':display:')));
+  assert.ok(!history.turns.some(turn => turn.id === initial.turns[0].id));
+  assert.equal(history.sourceIdentityWarnings.length, 1);
+  assert.deepEqual(history.sourceIdentityWarnings[0], { code: 'EAMBIGUOUS', sha256: initial.turns[0].sourceIdentity.sha256, count: 2 });
+  assert.ok(!JSON.stringify(history.sourceIdentityWarnings).includes('Continue'));
+});
+
+test('unwrapped histories retain positional identity with an explicit weaker contract', () => {
+  const history = parseTranscript([row('user', 'First'), row('assistant', 'One'), row('user', 'Second')].join('\n'), { id: 'chat' });
+  assert.deepEqual(history.turns.map(turn => turn.id), ['chat:turn:0', 'chat:turn:1']);
+  assert.ok(history.turns.every(turn => turn.sourceIdentity.kind === 'legacy-position' && turn.sourceIdentity.strength === 'position'));
+});
+
+test('a timestamped user starts its stable turn after any assistant-only preamble', () => {
+  const history = parseTranscript([row('assistant', 'Earlier assistant-only export'), row('user', envelope('New request')), row('assistant', 'Answer')].join('\n'), { id: 'chat' });
+  assert.equal(history.turns.length, 2);
+  assert.equal(history.turns[0].sourceIdentity.strength, 'position');
+  assert.equal(history.turns[1].sourceIdentity.strength, 'stable');
+  assert.equal(history.turns[1].items[0].type, 'userMessage');
+  assert.deepEqual(history.completedTurnIds, [history.turns[0].id]);
+});
+
+test('complete legacy wrappers remain readable without gaining timestamp identity', () => {
+  for (const text of ['<user_query>\n  Legacy query\n</user_query>',
+    '<timestamp>today</timestamp>\n<user_query>\n  Legacy query\n</user_query>']) {
+    const history = parseTranscript(row('user', text), { id: 'chat' });
+    assert.equal(history.turns[0].items[0].content[0].text, 'Legacy query');
+    assert.equal(history.turns[0].sourceIdentity.strength, 'position');
+  }
+});
+
+test('literal, partial, mixed, malformed and wrapped catalogs remain human text', () => {
+  for (const text of [
+    'Explain <available_subagent_types> literally',
+    runtimeCatalog.replace('</dynamic_tool_catalog>', ''),
+    runtimeCatalog + '\nPlease explain this.',
+    runtimeCatalog.replace('</available_subagent_models>', '</available_subagent_models> extra'),
+    runtimeCatalog.replace('<dynamic_tool_namespaces>', '<dynamic_tool_namespaces><dynamic_tool_namespaces>'),
+    envelope(runtimeCatalog, 39),
+  ]) {
+    const history = parseTranscript([row('user', envelope('First')), row('assistant', 'One'), row('user', text), row('assistant', 'Two')].join('\n'), { id: 'chat' });
+    assert.equal(history.turns.length, 2);
+    assert.equal(history.turns[1].items[0].content[0].text, text.startsWith('<timestamp>') ? runtimeCatalog : text);
+    assert.deepEqual(history.completedTurnIds, [history.turns[0].id]);
+  }
+});
+
+test('literal user-query tags and malformed envelopes never truncate a human message', () => {
+  const plain = [
+    'Explain <user_query>literal</user_query> then continue',
+    '<timestamp>not complete\n<user_query>Keep all text</user_query>',
+    'Before ' + envelope('inside') + ' after',
+    '<timestamp>literal timestamp only</timestamp>\nKeep the timestamp too',
+  ];
+  for (const text of plain) {
+    const history = parseTranscript(row('user', text), { id: 'chat' });
+    assert.equal(history.turns[0].items[0].content[0].text, text);
+    assert.equal(history.turns[0].sourceIdentity.strength, 'position');
+  }
+  const query = 'Explain </user_query> and <user_query> literally';
+  const wrapped = parseTranscript(row('user', envelope(query)), { id: 'chat' });
+  assert.equal(wrapped.turns[0].items[0].content[0].text, query);
+  assert.equal(wrapped.turns[0].sourceIdentity.strength, 'stable');
+});
 
 test('parses native messages, unwraps user query and retains assistant text without tools', () => {
   const history = parseTranscript([
@@ -108,6 +227,41 @@ async function fixture(t, options = {}) {
   await writeFile(sourcePath, [row('user', 'First'), row('assistant', 'Answer'), '{"type":"turn_ended","status":"success"}'].join('\n') + '\n');
   return { home, cwd, id, metadataPath, sourcePath, scanner: createHistoryScanner({ home }) };
 }
+
+test('scanner keeps source identities through catalog insertion and removal', async t => {
+  const { scanner, sourcePath } = await fixture(t);
+  const messages = [row('user', envelope('Work')), row('assistant', 'Starting'), row('assistant', 'Final')];
+  await writeFile(sourcePath, messages.join('\n') + '\n');
+  const first = await scanner.scan();
+  const original = first.histories[0].turns[0];
+  await writeFile(sourcePath, [messages[0], messages[1], row('user', runtimeCatalog), messages[2]].join('\n') + '\n');
+  const inserted = await scanner.scan();
+  assert.equal(inserted.changed.length, 1);
+  assert.deepEqual(inserted.errors, []);
+  assert.deepEqual(inserted.histories[0].turns[0], original);
+  assert.equal(inserted.histories[0].sourceComplete, false);
+  assert.deepEqual(inserted.histories[0].completedTurnIds, []);
+  await writeFile(sourcePath, messages.join('\n') + '\n');
+  const removed = await scanner.scan();
+  assert.equal(removed.changed.length, 1);
+  assert.deepEqual(removed.errors, []);
+  assert.deepEqual(removed.histories[0].turns[0], original);
+});
+
+test('scanner publishes later unique turns after an ambiguous timestamp group', async t => {
+  const { scanner, sourcePath } = await fixture(t);
+  const repeat = row('user', envelope('Continue'));
+  await writeFile(sourcePath, [repeat, row('assistant', 'One')].join('\n') + '\n');
+  const first = await scanner.scan();
+  assert.equal(first.histories[0].turns[0].sourceIdentity.strength, 'stable');
+  await appendFile(sourcePath, [repeat, row('assistant', 'Two'), row('user', envelope('Distinct request', 40)), row('assistant', 'Three')].join('\n') + '\n');
+  const next = await scanner.scan();
+  assert.equal(next.changed.length, 1);
+  assert.deepEqual(next.errors, []);
+  assert.deepEqual(next.histories[0].turns.map(turn => turn.sourceIdentity.strength), ['ambiguous', 'ambiguous', 'stable']);
+  assert.equal(next.histories[0].turns.at(-1).items.at(-1).text, 'Three');
+  assert.equal(next.histories[0].sourceIdentityWarnings[0].count, 2);
+});
 
 test('scanner caches unchanged bodies, discovers new chats and detects metadata-only changes', async (t) => {
   const { home, scanner, sourcePath, metadataPath, cwd } = await fixture(t);

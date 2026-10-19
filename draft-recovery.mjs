@@ -1,3 +1,5 @@
+import { sourceTurnOwnable } from './live-history.mjs';
+
 export const UNSUBMITTED_DRAFT_ERROR = 'Cursor input changed or could not be verified after paste; text remains as an unsubmitted draft in tmux. Review it in Cursor CLI';
 export const UNSUBMITTED_ANCHORED_DRAFT_ERROR = 'Cursor multiline draft verification did not finish; its unsubmitted draft may contain a temporary verification marker. Send the same message again to verify and remove it before submission';
 
@@ -93,7 +95,8 @@ const canonicalText = blocks => textBlocks(blocks)?.replace(/\r\n/gu, '\n').trim
 /** Pin a completed native send before the history matcher can choose an older failure. */
 export function pinLiveSourceTurn(record, nativeTurn, sourceTurn) {
   if (record?.backend !== 'legacy' || !record.thread?.turns?.includes(nativeTurn)
-    || !nonempty(nativeTurn?.id) || !nonempty(sourceTurn?.id)) return false;
+    || !nonempty(nativeTurn?.id) || !nonempty(sourceTurn?.id)
+    || !sourceTurnOwnable(sourceTurn, { id: record.cursorSessionId })) return false;
   const nativeUsers = nativeTurn.items?.filter(item => item.type === 'userMessage') || [];
   const sourceUsers = sourceTurn.items?.filter(item => item.type === 'userMessage') || [];
   if (nativeUsers.length !== 1 || sourceUsers.length !== 1 || !nonempty(nativeUsers[0].id)

@@ -46,7 +46,7 @@ test('binds a bridge continuation echoed by CLI without duplicating cards or IDs
   assert.deepEqual(result.record.thread.turns[1], native.thread.turns[1]);
   assert.equal(result.turnsChanged.length, 0);
   assert.equal(result.record.historySync.sourceTurns['cursor-chat:turn:1'], 'native-turn');
-  assert.equal(result.record.historySync.sourceItems['cursor-chat:item:3'], 'native-answer');
+  assert.equal(result.record.historySync.sourceItems[incoming.turns[1].items[1].id], 'native-answer');
   assert.equal(reconcileHistory(result.record, incoming).changed, false);
 });
 
@@ -276,4 +276,101 @@ test('an unrelated or ACP-backed record is left untouched', () => {
   const native = record(source);
   assert.equal(reconcileHistory({ ...native, backend: 'acp' }, source).changed, false);
   assert.equal(reconcileHistory(native, { ...source, id: 'other-chat' }).changed, false);
+});
+
+const envelope = (text, minute) => `<timestamp>Monday, Oct 19, 2026, 11:${minute} AM (UTC)</timestamp>\n<user_query>${text}</user_query>`;
+
+test('stable envelopes migrate old ordinal history by unique complete content without changing native identity', () => {
+  const prior = history([['user', 'First question'], ['assistant', 'First answer'],
+    ['user', 'Briefly report'], ['assistant', 'Old complete report']]);
+  const native = record(prior);
+  native.thread.turns[1].items[0].clientId = 'original-client';
+  native.thread.turns[1].items[0].content[0].text = 'Briefly report\n';
+  native.historySync = { sourceTurns: Object.fromEntries(prior.turns.map(turn => [turn.id, turn.id])), sourceItems: {} };
+  const incoming = history([['user', envelope('First question', '00')], ['assistant', 'First answer'],
+    ['user', envelope('Briefly report', '01')], ['assistant', 'Old complete report'],
+    ['user', envelope('New request', '02')], ['assistant', 'New result']]);
+  const result = reconcileHistory(native, incoming);
+  assert.equal(result.record.thread.turns.length, 3);
+  assert.deepEqual(result.record.thread.turns.slice(0, 2), native.thread.turns);
+  for (let index = 0; index < 2; index++) {
+    assert.equal(result.record.historySync.sourceTurns[incoming.turns[index].id], native.thread.turns[index].id);
+    assert.equal(result.record.historySync.sourceTurns[prior.turns[index].id], undefined);
+  }
+  assert.equal(result.record.thread.model, native.thread.model);
+  assert.equal(reconcileHistory(result.record, incoming).changed, false);
+});
+
+test('new stable IDs cannot claim a running native turn merely because its prompt or ordinal matches', () => {
+  const prior = history([['user', 'Old request'], ['assistant', 'Old answer']]);
+  const native = record(prior);
+  native.thread.turns.push({ id: 'pending-native', status: 'inProgress', items: [{ id: 'pending-user', type: 'userMessage',
+    clientId: 'pending-client', content: [{ type: 'text', text: 'New request\n' }] }] });
+  native.historySync = { sourceTurns: { 'cursor-chat:turn:0': prior.turns[0].id }, sourceItems: {} };
+  const incoming = history([['user', envelope('New request', '01')], ['assistant', 'New answer']]);
+  const result = reconcileHistory(native, incoming);
+  assert.equal(result.record.thread.turns.find(turn => turn.id === 'pending-native').status, 'inProgress');
+  assert.notEqual(result.record.historySync.sourceTurns[incoming.turns[0].id], 'pending-native');
+  assert.equal(result.record.thread.turns[0].items[0].content[0].text, 'Old request');
+});
+
+test('multiple compatible historical answers never guess which native ID owns a new envelope', () => {
+  const source = history([['user', envelope('Continue', '01')], ['assistant', 'Same answer']]);
+  const native = record(source);
+  native.thread.turns[0].id = 'native-one';
+  native.thread.turns[0].items[0].id = 'native-one-user';
+  const second = structuredClone(native.thread.turns[0]); second.id = 'native-two'; second.items[0].id = 'native-two-user';
+  native.thread.turns.push(second);
+  const result = reconcileHistory(native, source);
+  assert.notEqual(result.record.historySync.sourceTurns[source.turns[0].id], 'native-one');
+  assert.notEqual(result.record.historySync.sourceTurns[source.turns[0].id], 'native-two');
+});
+
+test('a completed unique envelope becomes two display cards without duplicating its exact historical answer', () => {
+  const unique = history([['user', envelope('Continue', '01')], ['assistant', 'First answer']]);
+  const native = reconcileHistory(record(unique), unique).record;
+  const originalId = native.thread.turns[0].id;
+  const ambiguous = history([['user', envelope('Continue', '01')], ['assistant', 'First answer'],
+    ['user', envelope('Continue', '01')], ['assistant', 'Second answer']]);
+  const result = reconcileHistory(native, ambiguous);
+  assert.equal(result.record.thread.turns.length, 2);
+  assert.equal(result.record.historySync.sourceTurns[ambiguous.turns[0].id], originalId);
+  assert.notEqual(result.record.historySync.sourceTurns[ambiguous.turns[1].id], originalId);
+  assert.equal(reconcileHistory(result.record, ambiguous).changed, false);
+});
+
+test('a completed native UUID retains its display identity when a proven envelope later duplicates', () => {
+  const unique = history([['user', envelope('Continue', '01')], ['assistant', 'First answer']]);
+  const native = record(unique);
+  native.thread.turns[0].id = 'completed-native';
+  native.thread.turns[0].items[0].clientId = 'original-client';
+  delete native.thread.turns[0].sourceIdentity;
+  native.historySync = { sourceTurns: { [unique.turns[0].id]: 'completed-native' }, sourceItems: {} };
+  const ambiguous = history([['user', envelope('Continue', '01')], ['assistant', 'First answer'],
+    ['user', envelope('Continue', '01')], ['assistant', 'Second answer']]);
+  const result = reconcileHistory(native, ambiguous);
+  assert.equal(result.record.thread.turns.length, 2);
+  assert.equal(result.record.thread.turns[0].id, 'completed-native');
+  assert.equal(result.record.thread.turns[0].items[0].clientId, 'original-client');
+});
+
+test('a reused assistant item ID cannot hide incompatible rewritten source text', () => {
+  const prior = history([['user', 'A question'], ['assistant', 'Original answer']]);
+  const native = reconcileHistory(record(prior), prior).record;
+  const rewritten = history([['user', 'A question'], ['assistant', 'Different rewritten answer']]);
+  const result = reconcileHistory(native, rewritten);
+  const agents = result.record.thread.turns[0].items.filter(item => item.type === 'agentMessage');
+  assert.deepEqual(agents.map(item => item.text), ['Original answer', 'Different rewritten answer']);
+  assert.notEqual(agents[0].id, agents[1].id);
+  assert.equal(reconcileHistory(result.record, rewritten).changed, false);
+});
+
+test('an unfinished new envelope cannot reuse an earlier completed same-prompt answer prefix', () => {
+  const prior = history([['user', envelope('Continue', '01')], ['assistant', 'Hello world']]);
+  const native = reconcileHistory(record(prior), prior).record;
+  const incoming = { ...history([['user', envelope('Continue', '02')], ['assistant', 'Hello']]), sourceComplete: false };
+  const result = reconcileHistory(native, incoming);
+  assert.equal(result.record.thread.turns.length, 2);
+  assert.notEqual(result.record.historySync.sourceTurns[incoming.turns[0].id], native.thread.turns[0].id);
+  assert.equal(result.record.thread.turns[0].items[1].text, 'Hello world');
 });

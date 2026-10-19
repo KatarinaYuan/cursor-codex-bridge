@@ -5,6 +5,7 @@ import { parseCursorScreen } from './screen.mjs';
 import { createModelCatalog } from './model-labels.mjs';
 import { draftViewportColumns, draftViewportPlan, draftViewportSnapshot } from './draft-viewport.mjs';
 import { UNSUBMITTED_DRAFT_ERROR, UNSUBMITTED_ANCHORED_DRAFT_ERROR } from './draft-recovery.mjs';
+import { sourceTurnOwnable, stableSourceTurn } from './live-history.mjs';
 
 const userText = turn => (turn?.items || []).filter(item => item.type === 'userMessage')
   .flatMap(item => item.content || []).filter(item => item.type === 'text').map(item => item.text).join('\n');
@@ -107,7 +108,7 @@ const sameIds = (left, right) => Array.isArray(left) && left.length === right.le
 
 /** Observes and submits to one existing Cursor TUI; never starts/kills an Agent. */
 export class TmuxSession extends EventEmitter {
-  constructor({ client, binding, model, models, modelDefinitions, history, interval = 180, log = () => {} }) {
+  constructor({ client, binding, model, models, modelDefinitions, history, interval = 180, log = () => {}, now = Date.now }) {
     super();
     this.kind = 'tmux';
     this.client = client;
@@ -118,8 +119,10 @@ export class TmuxSession extends EventEmitter {
     this.sessionId = binding.sessionId;
     this.interval = interval;
     this.log = log;
+    this.now = now;
     this.state = 'new';
     this.knownSourceIds = new Set();
+    this.knownSourceUsers = new Map();
     this.history = history;
     this.pending = null;
     this.screen = null;
@@ -151,7 +154,9 @@ export class TmuxSession extends EventEmitter {
 
   async start() {
     this.state = 'ready';
-    if (this.history) for (const turn of this.history.turns) if (sourceTurnComplete(this.history, turn)) this.knownSourceIds.add(turn.id);
+    if (this.history) for (const turn of this.history.turns) if (sourceTurnComplete(this.history, turn)) {
+      this.knownSourceIds.add(turn.id); this.knownSourceUsers.set(turn.id, canonicalPrompt(userText(turn)));
+    }
     await this.poll(true);
     this.schedule();
     return { sessionId: this.sessionId, ...(this.model && !this.modelError ? { models: { currentModelId: this.model } } : {}) };
@@ -185,6 +190,7 @@ export class TmuxSession extends EventEmitter {
     // establishes a new CLI turn. Waiting for its transcript also disambiguates
     // genuine repeated prompts without relying on scrollback or frame counts.
     if (!this.pending && !this.committing && user && screen.busy && latestSource
+      && sourceTurnOwnable(latestSource, this.history)
       && !sourceTurnComplete(this.history, latestSource) && !this.knownSourceIds.has(latestSource.id)
       && displayText(userText(latestSource)) === user.text) {
       const pending = this.begin('external', user.prompt, latestSource.id);
@@ -207,13 +213,20 @@ export class TmuxSession extends EventEmitter {
     // External turns can begin before their bridge listener has acquired its lock.
     promise.catch(() => {});
     const baseline = new Set([...this.knownSourceIds, ...(this.history?.turns || []).map(turn => turn.id)]);
+    const baselineUsers = new Map(this.knownSourceUsers);
+    for (const turn of this.history?.turns || []) baselineUsers.set(turn.id, canonicalPrompt(userText(turn)));
     if (origin === 'external') {
       const source = this.history?.turns.find(turn => turn.id === sourceTurnId);
-      if (!source || displayText(userText(source)) !== displayText(prompt)) throw new Error('The external Cursor turn has no matching canonical source identity');
+      if (!source || !sourceTurnOwnable(source, this.history)
+        || displayText(userText(source)) !== displayText(prompt)) throw new Error('The external Cursor turn has no matching canonical source identity');
       baseline.delete(source.id);
     }
     const user = screenUser(this.screen);
-    this.pending = { origin, prompt, sourceTurnId, baseline, promise, resolve, reject, baselineUser: user, user: origin === 'external' ? user : null };
+    this.pending = { origin, prompt, sourceTurnId, baseline, baselineUsers, baselineScheme: this.history?.sourceIdentityScheme,
+      sourceIdentitySha256: this.history?.turns.find(turn => turn.id === sourceTurnId)?.sourceIdentity?.sha256,
+      submitted: origin === 'external',
+      startedAtMinute: Math.floor(this.now() / 60_000) * 60_000,
+      promise, resolve, reject, baselineUser: user, user: origin === 'external' ? user : null };
     this.screenKey = null;
     return this.pending;
   }
@@ -488,6 +501,8 @@ export class TmuxSession extends EventEmitter {
       if (prompt.includes('[Pasted text')) throw new Error('An inline multiline message containing a Cursor paste-token spelling cannot be verified without expansion; no text was pasted');
     }
     const pending = this.begin('native', prompt);
+    pending.model = expectedModel;
+    pending.verificationEpoch = epoch;
     try {
       let submitted;
       if (retryDraft) {
@@ -559,6 +574,10 @@ export class TmuxSession extends EventEmitter {
       if (submitted?.inputLeaseRestoreError) {
         try { this.log(`Cursor message submitted; input lease restoration needs attention: ${submitted.inputLeaseRestoreError}`); } catch { /* A delivered message remains delivered. */ }
       }
+      // A matching transcript can arrive while transport is still verifying
+      // the draft. It becomes submission evidence only after Enter succeeds.
+      pending.submitted = true;
+      if (this.history) this.acceptHistory(this.history);
       return await pending.promise;
     } catch (error) {
       if (error.viewportRestoreError) {
@@ -574,18 +593,79 @@ export class TmuxSession extends EventEmitter {
     this.history = history;
     const pending = this.pending;
     if (pending) {
-      const candidates = history.turns.filter(turn => !pending.baseline.has(turn.id));
-      const sourceTurn = candidates.find(turn => pending.origin === 'external'
-        ? turn.id === pending.sourceTurnId && displayText(userText(turn)) === displayText(pending.prompt)
+      const matching = history.turns.filter(turn => pending.origin === 'external'
+        ? (turn.id === pending.sourceTurnId || pending.sourceIdentitySha256
+          && turn.sourceIdentity?.sha256 === pending.sourceIdentitySha256)
+          && displayText(userText(turn)) === displayText(pending.prompt)
         : canonicalPrompt(userText(turn)) === canonicalPrompt(pending.prompt));
-      const completed = sourceTurn && sourceTurnComplete(history, sourceTurn);
+      const drift = history.turns.some(turn => pending.baselineUsers.has(turn.id)
+        && pending.baselineUsers.get(turn.id) !== canonicalPrompt(userText(turn)));
+      const schemeChanged = history.sourceIdentityScheme !== pending.baselineScheme;
+      const plausible = matching.filter(turn => pending.sourceTurnId
+        ? turn.id === pending.sourceTurnId || pending.sourceIdentitySha256
+          && turn.sourceIdentity?.sha256 === pending.sourceIdentitySha256
+        : !pending.baseline.has(turn.id) && (!schemeChanged
+          || ![...pending.baselineUsers.values()].includes(canonicalPrompt(userText(turn)))));
+      const candidates = plausible.filter(turn => sourceTurnOwnable(turn, history)
+        && (pending.origin === 'external' || !stableSourceTurn(turn, history)
+          || Number.isSafeInteger(turn.sourceTimestampMinute)
+            && turn.sourceTimestampMinute >= pending.startedAtMinute));
+      pending.ambiguousSourceHashes ||= new Set();
+      for (const turn of plausible) if (turn.sourceIdentity?.strength === 'ambiguous') {
+        pending.ambiguousSourceHashes.add(turn.sourceIdentity.sha256);
+      }
+      const blocked = plausible.some(turn => !sourceTurnOwnable(turn, history)
+        || pending.ambiguousSourceHashes.has(turn.sourceIdentity?.sha256)) || drift;
+      if (blocked && !pending.identityError) {
+        pending.identityError = new Error('Cursor source identity changed or is ambiguous; the submitted turn is waiting for verified source ownership and will not be resent');
+        this.log(pending.identityError.message);
+      }
+      const sourceTurn = !blocked && (pending.sourceTurnId
+        ? candidates.find(turn => turn.id === pending.sourceTurnId)
+        : candidates.length === 1 ? candidates[0] : undefined);
+      const currentSource = () => {
+        const current = this.history?.turns.find(turn => turn.id === pending.sourceTurnId);
+        return current && sourceTurnOwnable(current, this.history)
+          && !pending.ambiguousSourceHashes.has(current.sourceIdentity?.sha256)
+          && (pending.origin === 'external'
+            ? displayText(userText(current)) === displayText(pending.prompt)
+            : canonicalPrompt(userText(current)) === canonicalPrompt(pending.prompt)) ? current : null;
+      };
+      if (sourceTurn && pending.submitted && pending.origin === 'native' && !pending.sourceTurnId) {
+        pending.sourceTurnId = sourceTurn.id;
+        pending.sourceIdentitySha256 = sourceTurn.sourceIdentity?.sha256;
+        // Source ownership is durable before a fast reply can complete. This
+        // callback is installed by the bridge only for a send begun here.
+        if (stableSourceTurn(sourceTurn, history) && this.onSubmittedSource) {
+          pending.bindingPromise = Promise.resolve().then(() => {
+            this.assertVerified(pending.verificationEpoch);
+            if (!currentSource()) throw new Error('The submitted Cursor source identity was revoked before persistence');
+            return this.onSubmittedSource({ sourceTurn, history, prompt: pending.prompt, model: pending.model,
+              isCurrent: () => this.pending === pending && Boolean(currentSource()) });
+          });
+          pending.bindingPromise.catch(error => {
+            pending.bindingError = error;
+            this.log(`Cursor submitted source could not be persisted: ${error.message}`);
+          });
+        }
+      }
+      const completed = pending.submitted && sourceTurn && sourceTurnComplete(history, sourceTurn);
       if (completed) {
-        this.pending = null;
-        this.committing = true;
-        pending.resolve({ stopReason: sourceTurn.status === 'failed' ? 'failed' : sourceTurn.status === 'interrupted' ? 'cancelled' : 'end_turn', history, sourceTurn, origin: pending.origin });
+        const finish = () => {
+          if (this.pending !== pending || pending.bindingError) return;
+          const current = currentSource();
+          if (!current || !sourceTurnComplete(this.history, current)) return;
+          this.pending = null; this.committing = true;
+          pending.resolve({ stopReason: current.status === 'failed' ? 'failed' : current.status === 'interrupted' ? 'cancelled' : 'end_turn',
+            history: this.history, sourceTurn: current, origin: pending.origin });
+        };
+        if (pending.bindingPromise) pending.bindingPromise.then(finish, () => {});
+        else finish();
       }
     }
-    for (const turn of history.turns) if (sourceTurnComplete(history, turn)) this.knownSourceIds.add(turn.id);
+    for (const turn of history.turns) if (sourceTurnComplete(history, turn)) {
+      this.knownSourceIds.add(turn.id); this.knownSourceUsers.set(turn.id, canonicalPrompt(userText(turn)));
+    }
   }
 
   async cancel() {
