@@ -1,7 +1,9 @@
 export const UNSUBMITTED_DRAFT_ERROR = 'Cursor input changed or could not be verified after paste; text remains as an unsubmitted draft in tmux. Review it in Cursor CLI';
+export const UNSUBMITTED_ANCHORED_DRAFT_ERROR = 'Cursor multiline draft verification did not finish; its unsubmitted draft may contain a temporary verification marker. Send the same message again to verify and remove it before submission';
 
 const evidenceKeys = ['sessionId', 'paneId', 'agentPid', 'agentStartTime', 'model', 'sourceTurnIds'];
 const markerKeys = ['version', 'turnId', ...evidenceKeys];
+const anchoredMarkerKeys = [...markerKeys, 'verificationAnchor'];
 const nonempty = value => typeof value === 'string' && value.length > 0;
 const sameKeys = (value, keys) => value !== null && typeof value === 'object' && !Array.isArray(value)
   && Object.keys(value).length === keys.length && keys.every(key => Object.hasOwn(value, key));
@@ -39,14 +41,29 @@ function soleUser(turn) {
 function failedDraftTurn(record, turn) {
   return record?.backend === 'legacy' && record.thread?.turns?.at(-1) === turn
     && nonempty(turn?.id) && turn.status === 'failed'
-    && turn.error?.message === UNSUBMITTED_DRAFT_ERROR && soleUser(turn) !== null;
+    && [UNSUBMITTED_DRAFT_ERROR, UNSUBMITTED_ANCHORED_DRAFT_ERROR].includes(turn.error?.message) && soleUser(turn) !== null;
+}
+
+function validAnchor(anchor, text) {
+  return sameKeys(anchor, ['version', 'suffix', 'state']) && anchor.version === 1
+    && anchor.state === 'injected' && typeof anchor.suffix === 'string'
+    && /^[A-Za-z0-9_]{16,96}$/u.test(anchor.suffix)
+    && typeof text === 'string' && text.length <= 800 && text.split('\n').length > 6
+    && !text.includes(anchor.suffix);
 }
 
 /** Retain only a structured proof emitted after paste failed before Enter. */
-export function retainUnsubmittedDraft(record, turn, evidence) {
+export function retainUnsubmittedDraft(record, turn, evidence, verificationAnchor) {
   if (!failedDraftTurn(record, turn) || !validEvidence(evidence)
     || evidence.sessionId !== record.cursorSessionId
     || evidence.model !== record.thread.model || !sameBinding(evidence, record.tmuxAffinity)) return false;
+  if (verificationAnchor !== undefined) {
+    if (turn.error.message !== UNSUBMITTED_ANCHORED_DRAFT_ERROR
+      || !validAnchor(verificationAnchor, textBlocks(soleUser(turn).content))) return false;
+    turn.unsubmittedDraft = { version: 2, turnId: turn.id, ...structuredClone(evidence), verificationAnchor: structuredClone(verificationAnchor) };
+    return true;
+  }
+  if (turn.error.message !== UNSUBMITTED_DRAFT_ERROR) return false;
   turn.unsubmittedDraft = { version: 1, turnId: turn.id, ...structuredClone(evidence) };
   return true;
 }
@@ -55,8 +72,11 @@ export function retainUnsubmittedDraft(record, turn, evidence) {
 export function retryDraftFor(record, binding, history, acpInput) {
   const turn = record?.thread?.turns?.at(-1);
   const proof = turn?.unsubmittedDraft;
-  if (!failedDraftTurn(record, turn) || !validEvidence(proof, markerKeys)
-    || proof.version !== 1 || proof.turnId !== turn.id
+  const anchored = proof?.version === 2;
+  if (!failedDraftTurn(record, turn) || !validEvidence(proof, anchored ? anchoredMarkerKeys : markerKeys)
+    || ![1, 2].includes(proof.version) || proof.turnId !== turn.id
+    || (anchored ? turn.error.message !== UNSUBMITTED_ANCHORED_DRAFT_ERROR
+      || !validAnchor(proof.verificationAnchor, textBlocks(soleUser(turn).content)) : turn.error.message !== UNSUBMITTED_DRAFT_ERROR)
     || proof.sessionId !== record.cursorSessionId || binding?.sessionId !== proof.sessionId
     || !sameBinding(proof, binding) || !sameBinding(proof, record.tmuxAffinity)
     || proof.model !== record.thread.model

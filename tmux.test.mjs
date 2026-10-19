@@ -22,6 +22,12 @@ async function fixture(t) {
   const f = { root, procRoot, calls: [], paneLines: '%1|10|0|0|/work\n' };
   f.process = async (pid, ppid, stores = [], options) => {
     await mkdir(join(procRoot, String(pid), 'fd'), { recursive: true });
+    await mkdir(join(procRoot, String(pid), 'task', String(pid)), { recursive: true });
+    await writeFile(join(procRoot, String(pid), 'task', String(pid), 'children'), '');
+    try {
+      const children = join(procRoot, String(ppid), 'task', String(ppid), 'children');
+      await writeFile(children, `${await readFile(children, 'utf8')}${pid} `);
+    } catch (error) { if (error.code !== 'ENOENT') throw error; }
     await writeFile(join(procRoot, String(pid), 'stat'), stat(pid, ppid, options));
     await symlink('/work', join(procRoot, String(pid), 'cwd'));
     for (const [index, path] of stores.entries()) await symlink(path, join(procRoot, String(pid), 'fd', String(index + 3)));
@@ -86,6 +92,37 @@ test('does not guess a session from cwd or accept deleted, partial or ambiguous 
   assert.deepEqual(await f.client.discover(), []);
 });
 
+test('pinned lease checks revalidate the exact process chain, foreground, store, and directory without scanning unrelated processes', async t => {
+  const changes = {
+    'agent PID reuse': f => writeFile(join(f.procRoot, '20', 'stat'), stat(20, 10, { start: '101' })),
+    'pane PID reuse': f => writeFile(join(f.procRoot, '10', 'stat'), stat(10, 1, { start: '101', pgrp: 10, foreground: 20 })),
+    reparenting: f => writeFile(join(f.procRoot, '20', 'stat'), stat(20, 1)),
+    'background process': f => writeFile(join(f.procRoot, '20', 'stat'), stat(20, 10, { foreground: 30 })),
+    'closed database': f => unlink(join(f.procRoot, '20', 'fd', '3')),
+    'ambiguous database': f => symlink(database(OTHER), join(f.procRoot, '20', 'fd', '4')),
+    'changed directory': async f => { await unlink(join(f.procRoot, '20', 'cwd')); await symlink('/elsewhere', join(f.procRoot, '20', 'cwd')); },
+  };
+  for (const [name, change] of Object.entries(changes)) await t.test(name, async t => {
+    const f = await fixture(t); const [binding] = await f.client.discover();
+    f.calls.length = 0;
+    assert.equal(await f.client.verifyPinnedProcess(binding), binding);
+    assert.equal(f.calls.length, 0);
+    await assert.rejects(f.client.verifyPinnedProcess({ ...binding }), /verified Cursor/);
+    await change(f);
+    await assert.rejects(f.client.verifyPinnedProcess(binding), /changed|foreground/);
+  });
+});
+
+test('pinned RPC checks scan only the original pane subtree and reject a new Cursor database', async t => {
+  const f = await fixture(t); const [binding] = await f.client.discover(); f.calls.length = 0;
+  await f.process(30, 1, [database(OTHER)]);
+  await f.process(21, 20, [database()]);
+  assert.equal(await f.client.verifyPinnedProcess(binding, { descendants: true }), binding);
+  assert.equal(f.calls.length, 0);
+  await f.process(22, 21, [database(OTHER)]);
+  await assert.rejects(f.client.verifyPinnedProcess(binding, { descendants: true }), /database binding changed/);
+});
+
 test('captures ANSI by default and optionally plain text without interpreting pane arguments', async (t) => {
   const f = await fixture(t);
   assert.match(await f.client.capture('%1'), /\u001b\[48/);
@@ -122,6 +159,49 @@ test('cleans its private buffer after load or paste failure and never presses En
     assert.equal(f.calls.filter(({ args }) => args[0] === 'delete-buffer').length, 1);
     assert.equal(f.calls.some(({ args }) => args[0] === 'send-keys'), false);
   }
+});
+
+test('exclusive multiline input keeps the same lease through both guards, paste, navigation, and the only Enter', async (t) => {
+  const f = await fixture(t); const steps = [];
+  const lease = {
+    assertActive: async () => { steps.push('assert'); },
+    paste: async text => { steps.push(['paste', text]); },
+    moveCursor: async (...args) => { steps.push(['move', ...args]); },
+    submit: async () => { steps.push('Enter'); },
+    release: async () => { steps.push('release'); },
+  };
+  f.client.inputLeaseFactory = async options => { await options.verify(); await options.verifyPinned(); assert.equal(options.binding.sessionId, CHAT); steps.push('acquire'); return lease; };
+  const text = 'one\n\ntwo\nthree\nfour\nfive\nsix\nseven';
+  assert.deepEqual(await f.client.paste('%1', text, { sessionId: CHAT, exclusiveInput: true,
+    beforePaste: async received => { assert.equal(received, lease); steps.push('before'); },
+    afterPaste: async received => { await received.moveCursor('left', 8); await received.moveCursor('right', 8); steps.push('verified'); },
+  }), { submitted: true });
+  assert.deepEqual(steps, ['acquire', 'assert', 'before', 'assert', ['paste', text], 'assert', ['move', 'left', 8], ['move', 'right', 8], 'verified', 'assert', 'Enter', 'release']);
+  assert.ok(f.calls.every(({ args }) => args[0] === 'list-panes'), 'Exclusive input must not fall back to tmux keyboard or paste-buffer');
+});
+
+test('exclusive verification failure leaves the draft unsubmitted and releases its input lease', async (t) => {
+  const f = await fixture(t); const steps = [];
+  f.client.inputLeaseFactory = async () => ({ assertActive: async () => {}, paste: async () => steps.push('paste'), submit: async () => steps.push('Enter'), release: async () => steps.push('release') });
+  await assert.rejects(f.client.paste('%1', 'one\ntwo', { sessionId: CHAT, exclusiveInput: true, afterPaste: async () => { throw new Error('different full draft'); } }), /different full draft/);
+  assert.deepEqual(steps, ['paste', 'release']);
+});
+
+test('exclusive draft retry does not paste again and preserves successful delivery if restoration fails', async (t) => {
+  const f = await fixture(t); const steps = [];
+  const lease = { assertActive: async () => {}, paste: async () => steps.push('paste'), submit: async () => steps.push('Enter'), release: async () => { throw new Error('concurrent pipe'); } };
+  f.client.inputLeaseFactory = async () => lease;
+  const result = await f.client.submitDraft('%1', { sessionId: CHAT, exclusiveInput: true, beforeSubmit: async received => { assert.equal(received, lease); steps.push('verify'); } });
+  assert.deepEqual(steps, ['verify', 'Enter']);
+  assert.equal(result.submitted, true);
+  assert.match(result.inputLeaseRestoreError, /concurrent pipe/);
+});
+
+test('exclusive input preserves uncertain Enter classification and the original verification failure', async (t) => {
+  const f = await fixture(t);
+  const uncertain = Object.assign(new Error('Enter acknowledgement lost'), { inputSubmissionUnknown: true });
+  f.client.inputLeaseFactory = async () => ({ assertActive: async () => {}, submit: async () => { throw uncertain; }, release: async () => { throw new Error('restore failed'); } });
+  await assert.rejects(f.client.submitDraft('%1', { sessionId: CHAT, exclusiveInput: true, beforeSubmit: async () => {} }), error => error === uncertain && error.inputSubmissionUnknown && /restore failed/.test(error.inputLeaseRestoreError));
 });
 
 test('runs asynchronous guards next to paste and Enter and stops after guard rejection', async (t) => {

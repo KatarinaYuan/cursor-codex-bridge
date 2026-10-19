@@ -1,7 +1,10 @@
 import { EventEmitter } from 'node:events';
+import { randomBytes } from 'node:crypto';
 import wrapAnsi from 'wrap-ansi';
 import { parseCursorScreen } from './screen.mjs';
 import { createModelCatalog } from './model-labels.mjs';
+import { draftViewportColumns, draftViewportPlan, draftViewportSnapshot } from './draft-viewport.mjs';
+import { UNSUBMITTED_DRAFT_ERROR, UNSUBMITTED_ANCHORED_DRAFT_ERROR } from './draft-recovery.mjs';
 
 const userText = turn => (turn?.items || []).filter(item => item.type === 'userMessage')
   .flatMap(item => item.content || []).filter(item => item.type === 'text').map(item => item.text).join('\n');
@@ -16,6 +19,13 @@ const screenUser = screen => {
 };
 
 const pastedText = /\[Pasted text #(\d+)(?: \+\d+(?: lines)?)?\]/gu;
+function completeDraftPlan(text, width) {
+  const plan = draftViewportPlan(text, width, { maxLength: 1024 });
+  if (plan.pages.some(page => !page.capture)) {
+    throw new Error('Cursor cannot safely display every cursor position in this multiline message; no text was pasted or Enter sent');
+  }
+  return plan;
+}
 function renderDraft(text, width) {
   if (!Number.isInteger(width) || width < 1) return null;
   // This is Cursor's Ink wrap branch: preserve hard-newline indentation, strip
@@ -56,6 +66,15 @@ function matchesRenderedDraft(screen, text) {
     && /^ *$/u.test(row.slice(expected.rows[index].length)));
 }
 
+function matchesViewport(screen, expected) {
+  const actual = screen.inputDraft;
+  return Boolean(screen.inputAvailable && !screen.inputEmpty && actual?.caret
+    && actual.rows.length === expected.rows.length
+    && actual.caret.row === expected.caret.row && actual.caret.offset === expected.caret.offset
+    && actual.rows.every((row, index) => row.startsWith(expected.rows[index])
+      && /^ *$/u.test(row.slice(expected.rows[index].length))));
+}
+
 function minimumInputColumns(text, width) {
   // Cursor folds pastes longer than 800 UTF-16 code units into a saved token.
   // Smaller pastes stay inline, in a viewport capped at six visual rows.
@@ -63,7 +82,7 @@ function minimumInputColumns(text, width) {
   if (!Number.isSafeInteger(width) || width < 1) throw new Error('The Cursor input width could not be verified; no text was pasted');
   if (renderDraft(text, width)?.rows.length <= 6) return undefined;
   if (text.split('\n').length > 6) {
-    throw new Error('This inline Cursor message cannot fit its six visible input rows because it has more than six hard lines; no text was pasted');
+    return Math.max(width + 7, draftViewportColumns(text));
   }
   for (let candidate = width + 1; candidate <= 1000; candidate++) {
     if (renderDraft(text, candidate)?.rows.length <= 6) return candidate + 7;
@@ -214,7 +233,11 @@ export class TmuxSession extends EventEmitter {
   assertRetryProof(retryDraft) {
     const proof = retryDraft?.proof;
     const current = this.draftEvidence();
-    if (typeof retryDraft?.text !== 'string' || !retryDraft.text.trim() || proof?.version !== 1
+    const anchor = proof?.verificationAnchor;
+    const validVersion = proof?.version === 1 || proof?.version === 2 && anchor?.version === 1
+      && anchor.state === 'injected' && /^[0-9a-f]{32}$/u.test(anchor.suffix || '')
+      && typeof retryDraft?.text === 'string' && !retryDraft.text.includes(anchor.suffix);
+    if (typeof retryDraft?.text !== 'string' || !retryDraft.text.trim() || !validVersion
       || typeof proof.turnId !== 'string' || !proof.turnId
       || ['sessionId', 'paneId', 'agentPid', 'agentStartTime', 'model'].some(key => proof[key] !== current[key])
       || !this.history || this.history.id !== this.sessionId || !sameIds(proof.sourceTurnIds, current.sourceTurnIds)) {
@@ -270,6 +293,106 @@ export class TmuxSession extends EventEmitter {
       await new Promise(resolve => setTimeout(resolve, 40));
     }
     throw new Error(`Cursor input width did not become verifiable after terminal resize (${reason}); no Enter was sent`);
+  }
+
+  async verifyPagedDraft(text, { lease, minimumColumns, expectedModel, evidence, pending, epoch, retryDraft, suffix }) {
+    if (['assertActive', 'moveCursor', 'typeAscii', 'backspace'].some(key => typeof lease?.[key] !== 'function')) {
+      throw new Error('Full multiline draft verification requires an exclusive Cursor input lease; no Enter was sent');
+    }
+    const anchoredRetry = retryDraft?.proof?.version === 2;
+    const journal = { version: 1, suffix, state: anchoredRetry ? 'injected' : 'notInserted' };
+    const assertContext = async (checkLease = true, full = false) => {
+      this.assertVerified(epoch);
+      if (checkLease) await lease.assertActive(full ? { full: true } : undefined);
+      this.assertVerified(epoch);
+      const current = this.draftEvidence();
+      if (this.pending !== pending || this.committing || this.history?.id !== this.sessionId
+        || ['sessionId', 'paneId', 'agentPid', 'agentStartTime', 'model'].some(key => current[key] !== evidence[key])
+        || !sameIds(evidence.sourceTurnIds, current.sourceTurnIds)) {
+        throw new Error('The Cursor session, model or source history changed during draft verification; no Enter was sent');
+      }
+      if (retryDraft) this.assertRetryProof(retryDraft);
+    };
+    try {
+      const widthScreen = await this.captureInputWidth(minimumColumns);
+      await assertContext(true, true);
+      const width = widthScreen.inputWidth;
+      const enriched = text + suffix;
+      const plan = completeDraftPlan(enriched, width);
+      const first = plan.pages[0];
+      const tail = draftViewportSnapshot(enriched, width, { offset: enriched.length, scrollOffset: Math.max(0, enriched.split('\n').length - 6), maxLength: 1024 });
+      const observe = async expected => {
+        for (let attempt = 0; attempt < 15; attempt++) {
+          await assertContext();
+          const screen = parseCursorScreen(await this.client.capture(this.binding.paneId), { knownCursor: true });
+          await assertContext();
+          if (screen.inputAvailable) {
+            this.observeModel(screen, true);
+            this.requireModel(expectedModel);
+          } else if (screen.busy || screen.reason === 'unrecognized-footer-or-overlay') {
+            throw new Error(`Cursor input changed during multiline verification (${screen.reason}); no Enter was sent`);
+          }
+          if (screen.inputWidth === width && matchesViewport(screen, expected)) return;
+          await new Promise(resolve => setTimeout(resolve, 40));
+        }
+        throw new Error('The complete multiline Cursor draft or its cursor position could not be verified; no Enter was sent');
+      };
+      const move = async (direction, count) => {
+        // moveCursor itself verifies lease ownership and the original process
+        // before each raw key. Keep the local source/model checks around it
+        // without duplicating two full transport inventories for every offset.
+        await assertContext(false);
+        await lease.moveCursor(direction, count);
+        await assertContext(false);
+      };
+      // Empty-line scrolling is not an injective view of Cursor's buffer. A
+      // unique temporary suffix makes EOF observable even after many blank
+      // lines. It is typed, not pasted, so the original <=800-unit paste keeps
+      // its exact inline spelling instead of becoming a folded paste token.
+      await move('right', 800);
+      if (anchoredRetry) await move('right', 800);
+      if (!anchoredRetry) {
+        journal.state = 'unknown';
+        await lease.typeAscii(suffix);
+        journal.state = 'injected';
+      }
+      await observe(tail);
+      await move('right', 1);
+      await observe(tail);
+      // Enhanced buffers may exceed 800; two bounded moves saturate the start.
+      await move('left', 800);
+      await move('left', 800);
+      await observe(first);
+      await move('left', 1);
+      await observe(first);
+      for (const page of plan.pages.slice(1)) {
+        await move(page.movement.direction, page.movement.count);
+        if (page.capture) await observe(page);
+      }
+      await move('right', 1);
+      await observe(tail);
+      // The full enhanced text and its unique EOF were just observed under
+      // this same lease. Delete exactly the acknowledged suffix once. A failed
+      // or uncertain edit leaves a diagnostic draft; it never authorizes CR.
+      await assertContext(true, true);
+      if (anchoredRetry) {
+        if (typeof lease.adoptAsciiMarker !== 'function') throw new Error('The Cursor input lease cannot safely recover its existing verification marker');
+        await lease.adoptAsciiMarker(suffix);
+      }
+      journal.state = 'unknown';
+      await lease.backspace(suffix.length);
+      journal.state = 'removed';
+      await observe(draftViewportSnapshot(text, width, { offset: text.length,
+        scrollOffset: tail.scrollOffset, maxLength: 1024 }));
+      await assertContext(true, true);
+      this.requireModel(expectedModel);
+    } catch (error) {
+      if (journal.state !== 'removed') error.verificationAnchor = journal;
+      if (journal.state === 'injected') error.message = UNSUBMITTED_ANCHORED_DRAFT_ERROR;
+      else if (journal.state === 'removed') error.message = UNSUBMITTED_DRAFT_ERROR;
+      else if (journal.state === 'unknown') error.message += '; a temporary verification suffix may remain in the unsubmitted Cursor draft; review it in Cursor CLI before retrying';
+      throw error;
+    }
   }
 
   async assertReady({ retryDraft, deferDraftCheck = false } = {}) {
@@ -350,9 +473,20 @@ export class TmuxSession extends EventEmitter {
       throw error;
     }
     if (model !== undefined) this.requireModel(model);
-    const minimumColumns = minimumInputColumns(prompt, this.screen.inputWidth);
+    let minimumColumns = minimumInputColumns(prompt, this.screen.inputWidth);
     const expectedModel = this.model;
     const evidence = this.draftEvidence();
+    const epoch = this.verificationEpoch;
+    const paged = prompt.length <= 800 && prompt.split('\n').length > 6;
+    let suffix;
+    if (paged) {
+      if (retryDraft?.proof?.version === 2) suffix = retryDraft.proof.verificationAnchor.suffix;
+      else do { suffix = randomBytes(16).toString('hex'); } while (prompt.includes(suffix));
+      minimumColumns = Math.max(minimumColumns, 2 * Math.max(...(prompt + suffix).split('\n').map(line => line.length)) + 8);
+      // Plan before mutating a draft, including unsupported renderer states.
+      completeDraftPlan(prompt + suffix, minimumColumns - 7);
+      if (prompt.includes('[Pasted text')) throw new Error('An inline multiline message containing a Cursor paste-token spelling cannot be verified without expansion; no text was pasted');
+    }
     const pending = this.begin('native', prompt);
     try {
       let submitted;
@@ -360,8 +494,10 @@ export class TmuxSession extends EventEmitter {
         submitted = await this.client.submitDraft(this.binding.paneId, {
           sessionId: this.sessionId,
           minimumColumns,
-          beforeSubmit: async () => {
+          exclusiveInput: paged,
+          beforeSubmit: async lease => {
             try {
+              if (paged) return await this.verifyPagedDraft(prompt, { lease, minimumColumns, expectedModel, evidence, pending, epoch, retryDraft, suffix });
               const screen = await this.captureInputWidth(minimumColumns);
               await this.assertDraft(screen, expectedModel, retryDraft);
             } catch (error) {
@@ -374,16 +510,24 @@ export class TmuxSession extends EventEmitter {
       } else submitted = await this.client.paste(this.binding.paneId, prompt, {
         sessionId: this.sessionId,
         minimumColumns,
-        beforePaste: async () => {
+        exclusiveInput: paged,
+        beforePaste: async lease => {
+          if (paged) {
+            if (typeof lease?.assertActive !== 'function' || typeof lease?.moveCursor !== 'function') throw new Error('Full multiline draft verification requires an exclusive Cursor input lease; no text was pasted');
+            await lease.assertActive();
+            this.assertVerified(epoch);
+            if (!sameIds(evidence.sourceTurnIds, this.draftEvidence().sourceTurnIds)) throw new Error('The Cursor source history changed before paste; no text was pasted');
+          }
           const screen = await this.captureInputWidth(minimumColumns);
           if (!screen.ready) throw new Error(`Cursor input changed before paste (${screen.reason}); no message was pasted`);
           this.observeModel(screen, true);
           this.requireModel(expectedModel);
         },
-        afterPaste: async () => {
+        afterPaste: async lease => {
           // Give the TUI a render opportunity before deciding whether Enter can
           // submit exactly this text. Never clear a person's concurrent input.
           try {
+            if (paged) return await this.verifyPagedDraft(prompt, { lease, minimumColumns, expectedModel, evidence, pending, epoch, suffix });
             let lastError;
             for (let attempt = 0; attempt < 10; attempt++) {
               this.assertVerified();
@@ -411,6 +555,9 @@ export class TmuxSession extends EventEmitter {
         // Enter already succeeded. A restore conflict must not turn a delivered
         // message into a failed send that the caller might duplicate by retrying.
         try { this.log(`Cursor message submitted; terminal viewport restoration needs attention: ${submitted.viewportRestoreError}`); } catch { /* Logging cannot undo a send. */ }
+      }
+      if (submitted?.inputLeaseRestoreError) {
+        try { this.log(`Cursor message submitted; input lease restoration needs attention: ${submitted.inputLeaseRestoreError}`); } catch { /* A delivered message remains delivered. */ }
       }
       return await pending.promise;
     } catch (error) {

@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { retainUnsubmittedDraft, retryDraftFor, pinLiveSourceTurn, UNSUBMITTED_DRAFT_ERROR } from './draft-recovery.mjs';
+import { retainUnsubmittedDraft, retryDraftFor, pinLiveSourceTurn, UNSUBMITTED_DRAFT_ERROR, UNSUBMITTED_ANCHORED_DRAFT_ERROR } from './draft-recovery.mjs';
 import { reconcileHistory } from './sync.mjs';
 
 const sessionId = '11111111-2222-4333-8444-555555555555';
@@ -36,6 +36,73 @@ test('an old error string alone cannot bootstrap draft ownership', () => {
   const f = fixture();
   assert.equal(retryDraftFor(f.record, f.binding, f.history, input('试验\n')), null);
   assert.equal(Object.hasOwn(f.failed, 'unsubmittedDraft'), false);
+});
+
+function anchoredFixture() {
+  const f = fixture();
+  f.text = '\n\n\n\n\n\n保留\n  缩进 🐦\n\n\n\n\n\n';
+  f.failed.items[0].content = input(f.text);
+  f.failed.error.message = UNSUBMITTED_ANCHORED_DRAFT_ERROR;
+  f.anchor = { version: 1, suffix: 'CURSOR_VERIFY_0123456789abcdef', state: 'injected' };
+  return f;
+}
+
+test('an acknowledged temporary anchor survives persistence while original input stays exact', () => {
+  const f = anchoredFixture();
+  assert.equal(retainUnsubmittedDraft(f.record, f.failed, f.evidence, f.anchor), true);
+  assert.equal(f.failed.unsubmittedDraft.version, 2);
+  const saved = JSON.parse(JSON.stringify(f.record));
+  assert.deepEqual(retryDraftFor(saved, f.binding, f.history, input(f.text)), {
+    text: f.text, proof: f.failed.unsubmittedDraft,
+  });
+  assert.equal(retryDraftFor(saved, f.binding, f.history, input(f.text + f.anchor.suffix)), null);
+  assert.equal(retryDraftFor(saved, f.binding, f.history, input(f.text.trim())), null);
+  f.anchor.suffix = 'MUTATED_0123456789abcdef';
+  assert.equal(saved.thread.turns.at(-1).unsubmittedDraft.verificationAnchor.suffix, 'CURSOR_VERIFY_0123456789abcdef');
+});
+
+test('unknown delivery, removed anchors, unsafe suffixes and mismatched diagnostic cannot authorize draft recovery', () => {
+  const cases = [
+    f => { f.anchor.state = 'unknown'; },
+    f => { f.anchor.state = 'removed'; },
+    f => { f.anchor.version = 2; },
+    f => { f.anchor.extra = true; },
+    f => { f.anchor.suffix = '\rEnter_0123456789abcdef'; },
+    f => { f.anchor.suffix = '[Pasted text #1 +9 lines]'; },
+    f => { f.anchor.suffix = 'short'; },
+    f => { f.anchor.suffix = 'a'.repeat(97); },
+    f => { f.failed.items[0].content = input(f.text + f.anchor.suffix); },
+    f => { f.failed.items[0].content = input('a'.repeat(801) + '\n'.repeat(7)); },
+    f => { f.failed.items[0].content = input('one line'); },
+    f => { f.failed.error.message = UNSUBMITTED_DRAFT_ERROR; },
+  ];
+  for (const mutate of cases) {
+    const f = anchoredFixture(); mutate(f);
+    const before = structuredClone(f.record);
+    assert.equal(retainUnsubmittedDraft(f.record, f.failed, f.evidence, f.anchor), false);
+    assert.deepEqual(f.record, before);
+  }
+  const f = anchoredFixture();
+  assert.equal(retainUnsubmittedDraft(f.record, f.failed, f.evidence), false);
+  assert.equal(retryDraftFor(f.record, f.binding, f.history, input(f.text)), null);
+});
+
+test('persisted anchor recovery rejects altered ownership and marker state without modifying the draft', () => {
+  for (const mutate of [
+    f => { f.failed.unsubmittedDraft.verificationAnchor.state = 'unknown'; },
+    f => { f.failed.unsubmittedDraft.verificationAnchor.suffix = 'bad\nmarker'; },
+    f => { f.failed.unsubmittedDraft.extra = true; },
+    f => { f.binding.agentStartTime = '457'; },
+    f => { f.history.turns.push({ id: 'source-1' }); },
+    f => { f.failed.error.message = UNSUBMITTED_DRAFT_ERROR; },
+  ]) {
+    const f = anchoredFixture();
+    assert.equal(retainUnsubmittedDraft(f.record, f.failed, f.evidence, f.anchor), true);
+    mutate(f);
+    const before = structuredClone(f.record);
+    assert.equal(retryDraftFor(f.record, f.binding, f.history, input(f.text)), null);
+    assert.deepEqual(f.record, before);
+  }
 });
 
 test('proof retention rejects malformed, unknown or mismatched evidence without mutation', () => {

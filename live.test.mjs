@@ -141,6 +141,112 @@ class NarrowTmuxClient extends MockTmuxClient {
   }
 }
 
+// Independent no-soft-wrap transcription of Cursor's observed layout: LF and
+// empty-line offsets miss its half-open line lookup and fall back to line zero.
+// This fake transports exact cursor keys and edits; it never calls the planner.
+class PagedTmuxClient extends NarrowTmuxClient {
+  constructor(draft = null) {
+    super(draft);
+    this.offset = draft?.length || 0;
+    this.scroll = 0;
+    this.leaseChecks = 0;
+    this.fullLeaseChecks = 0;
+    this.marker = null;
+    this.leaseActive = true;
+    this.footer = 'Composer 2.5 · 5.1%';
+  }
+
+  async capture(paneId) {
+    if (this.draft === null) return super.capture(paneId);
+    const lines = [];
+    let start = 0;
+    for (const text of this.draft.split('\n')) {
+      lines.push({ text, start, end: start + text.length });
+      start += text.length + 1;
+    }
+    const selected = this.offset >= this.draft.length ? lines.length - 1
+      : Math.max(0, lines.findIndex(line => this.offset >= line.start && this.offset < line.end));
+    if (selected < this.scroll) this.scroll = selected;
+    else if (selected >= this.scroll + 6) this.scroll = selected - 5;
+    this.scroll = Math.max(0, Math.min(this.scroll, lines.length - 6));
+    const visible = lines.slice(this.scroll, this.scroll + 6);
+    const text = visible.map(line => line.text).join('\n');
+    const caret = Math.max(0, Math.min(this.offset - visible[0].start, text.length));
+    let output = '', index = 0, inverse = false;
+    const cursor = value => `\x1b[7m${value}\x1b[27m`;
+    for (const character of text) {
+      if (character === '\n') {
+        if (!inverse && caret === index && (index === 0 || text[index - 1] !== '\n')) { output += cursor(' '); inverse = true; }
+        output += '\n'; index++;
+        if (!inverse && caret === index && (text[index] === '\n' || text[index] === undefined)) { output += cursor(' '); inverse = true; }
+      } else {
+        if (index === caret) { output += cursor(character); inverse = true; } else output += character;
+        index += character.length;
+      }
+    }
+    if (!inverse && caret === text.length) output += cursor(' ');
+    const paint = value => ` \x1b[48;2;242;242;242m${value}${' '.repeat(Math.max(0, this.columns - 2 - stringWidth(value)))}\x1b[49m`;
+    this.raw = `  Cursor Agent\n  ${dim('v2025.01.01-test')}\n\n${userBox('Earlier question')}\n  Earlier answer\n\n${paint('')}\n${output.normalize().split('\n').map((value, i) => paint(` ${i ? '  ' : '→ '}${value}`)).join('\n')}\n${paint('')}\n\n  ${dim(this.footer)}\n  ${dim('/fixture/project')}\n${this.overlay}\n`;
+    return MockTmuxClient.prototype.capture.call(this, paneId);
+  }
+
+  lease() {
+    return {
+      assertActive: async options => { this.leaseChecks++; if (options?.full) this.fullLeaseChecks++; await this.onLeaseCheck?.(); if (!this.leaseActive) throw new Error('Input lease ownership changed'); },
+      moveCursor: async (direction, count) => {
+        assert.ok(Number.isSafeInteger(count) && count > 0 && count <= 800);
+        this.offset = Math.max(0, Math.min(this.draft.length, this.offset + (direction === 'left' ? -count : count)));
+        this.calls.push({ type: 'move', direction, count });
+        await this.onMove?.();
+      },
+      typeAscii: async suffix => {
+        assert.match(suffix, /^[0-9a-f]{32}$/u);
+        assert.equal(this.marker, null);
+        this.marker = suffix;
+        this.draft = this.draft.slice(0, this.offset) + suffix + this.draft.slice(this.offset);
+        this.offset += suffix.length;
+        this.calls.push({ type: 'marker' });
+        await this.onMarker?.();
+      },
+      adoptAsciiMarker: async suffix => { assert.equal(this.marker, null); this.marker = suffix; this.calls.push({ type: 'adopt' }); },
+      backspace: async count => {
+        assert.equal(count, this.marker?.length);
+        assert.equal(this.draft.slice(this.offset - count, this.offset), this.marker);
+        this.draft = this.draft.slice(0, this.offset - count) + this.draft.slice(this.offset);
+        this.offset -= count;
+        this.marker = null;
+        this.calls.push({ type: 'remove-marker' });
+        await this.onRemoveMarker?.();
+      },
+    };
+  }
+
+  async paste(paneId, text, options) {
+    assert.equal(options.exclusiveInput, true);
+    this.calls.push({ type: 'paste-request' });
+    return this.withColumns(options.minimumColumns, async () => {
+      const lease = this.lease();
+      await options.beforePaste(lease);
+      this.draft = this.alterPastedText?.(text) ?? text;
+      this.offset = this.draft.length;
+      this.calls.push({ type: 'paste', text });
+      await options.afterPaste(lease);
+      assert.equal(this.marker, null);
+      this.calls.push({ type: 'Enter' }); this.didSubmit();
+    });
+  }
+
+  async submitDraft(paneId, options) {
+    assert.equal(options.exclusiveInput, true);
+    this.calls.push({ type: 'submit-draft-request' });
+    return this.withColumns(options.minimumColumns, async () => {
+      await options.beforeSubmit(this.lease());
+      assert.equal(this.marker, null);
+      this.calls.push({ type: 'Enter' }); this.didSubmit();
+    });
+  }
+}
+
 async function start(t, { client = new MockTmuxClient(), source = history([turn('old', 'Earlier question', 'Earlier answer')]), sourceTurnIds = [], models, modelDefinitions } = {}) {
   const session = new TmuxSession({ client, binding, model: 'composer-2.5[fast=true]', models, modelDefinitions, history: source, sourceTurnIds, interval: 60_000 });
   t.after(() => session.close());
@@ -586,12 +692,140 @@ test('automatic widening still rejects an altered message instead of sending Ent
   assert.equal(client.draft.startsWith('<other_delegation>'), true);
 });
 
-test('a short seven-hard-line input is rejected before paste because width cannot expose it', async t => {
+test('a short seven-hard-line input requires an exclusive lease before paste', async t => {
   const { session, client } = await start(t, { client: new NarrowTmuxClient() });
   const prompt = 'first\nsecond\nthird\nfourth\nfifth\nsixth\nseventh';
-  await assert.rejects(session.prompt([{ type: 'text', text: prompt }]), /six|6|visible.*lines|cannot.*(?:verify|fit)/i);
-  assert.deepEqual(client.calls, []);
+  await assert.rejects(session.prompt([{ type: 'text', text: prompt }]), /exclusive.*lease/i);
+  assert.deepEqual(client.calls.map(call => call.type), ['paste-request']);
   assert.equal(client.draft, null);
+});
+
+test('a multiline saved-paste reference is rejected before it can expand a different Cursor buffer', async t => {
+  const { session, client } = await start(t, { client: new PagedTmuxClient() });
+  const prompt = 'first\nsecond\n[Pasted text #1 +9 lines]\nfourth\nfifth\nsixth\nseventh';
+  await assert.rejects(session.prompt([{ type: 'text', text: prompt }]), /paste-token spelling.*no text was pasted/);
+  assert.equal(client.calls.some(call => ['paste', 'Enter', 'marker'].includes(call.type)), false);
+  assert.equal(client.draft, null);
+});
+
+test('a multiline NFD caret ambiguity is rejected before paste instead of skipping its unobservable positions', async t => {
+  const { session, client } = await start(t, { client: new PagedTmuxClient() });
+  const prompt = 'A\ne\u0301\u0323\nB\nC\nD\nE\nF';
+  await assert.rejects(session.prompt([{ type: 'text', text: prompt }]), /cannot safely display every cursor position/);
+  assert.equal(client.calls.some(call => ['paste', 'Enter', 'marker'].includes(call.type)), false);
+  assert.equal(client.draft, null);
+});
+
+for (const [name, prompt] of [
+  ['seven lines', 'first\nsecond\nthird\nfourth\nfifth\nsixth\nseventh'],
+  ['twelve repeated lines', Array(12).fill('same  ').join('\n')],
+  ['leading and trailing blank lines', '\n'.repeat(6) + 'a' + '\n'.repeat(6)],
+  ['indentation and Unicode', '\n  中文 😀\n\n    indented  \nrepeat\nrepeat\n\n\nemoji 👩‍💻\né\nend\n'],
+  ['long hard line', `first\n${'长'.repeat(120)}\nthird\nfourth\nfifth\nsixth\nseventh\n`],
+  ['800 UTF-16 units', 'a\n'.repeat(6) + 'z'.repeat(788)],
+]) {
+  test(`exclusive multiline verification preserves ${name} and removes its suffix before one Enter`, async t => {
+    const { session, client } = await start(t, { client: new PagedTmuxClient() });
+    const response = session.prompt([{ type: 'text', text: prompt }]);
+    await client.submitted;
+    assert.equal(client.draft, prompt);
+    assert.equal(client.calls.filter(call => call.type === 'paste').length, 1);
+    assert.equal(client.calls.filter(call => call.type === 'Enter').length, 1);
+    assert.equal(client.calls.filter(call => call.type === 'marker').length, 1);
+    assert.equal(client.calls.filter(call => call.type === 'remove-marker').length, 1);
+    assert.ok(client.fullLeaseChecks >= 3);
+    session.acceptHistory(history([turn('old', 'Earlier question'), turn('multiline-completed', prompt)]));
+    assert.equal((await response).sourceTurn.id, 'multiline-completed');
+    assert.equal(client.columns, 93);
+  });
+}
+
+test('a hidden extra LF cannot pass multiline verification even when the unmarked viewport trace collides', async t => {
+  const prompt = '\n'.repeat(6) + 'a' + '\n'.repeat(6);
+  const { session, client } = await start(t, { client: new PagedTmuxClient() });
+  client.alterPastedText = text => text + '\n';
+  const error = await session.prompt([{ type: 'text', text: prompt }]).catch(error => error);
+  assert.equal(error.verificationAnchor.state, 'injected');
+  assert.equal(client.calls.some(call => call.type === 'Enter'), false);
+  assert.equal(client.draft, prompt + '\n' + error.verificationAnchor.suffix);
+});
+
+for (const change of ['overlay', 'model', 'verification', 'source', 'lease']) {
+  test(`multiline ${change} change after marker insertion sends no Enter and retains a recoverable draft`, async t => {
+    const prompt = 'a\nb\nc\nd\ne\nf\ng\nh';
+    const { session, client } = await start(t, { client: new PagedTmuxClient(), ...catalogOptions });
+    client.onMarker = () => {
+      if (change === 'overlay') client.overlay = '  Allow this command? [y/n]';
+      if (change === 'model') client.footer = 'Unrecognized Model · 5.1%';
+      if (change === 'verification') session.setVerified(false);
+      if (change === 'source') session.history = history([turn('old', 'Earlier question'), turn('unexpected', 'Elsewhere')]);
+      if (change === 'lease') client.leaseActive = false;
+    };
+    const error = await session.prompt([{ type: 'text', text: prompt }]).catch(error => error);
+    assert.equal(error.verificationAnchor.state, 'injected');
+    assert.equal(client.calls.some(call => call.type === 'Enter'), false);
+    assert.equal(client.draft, prompt + error.verificationAnchor.suffix);
+  });
+}
+
+test('an exact multiline retry validates an arbitrary caret without a second paste', async t => {
+  const prompt = '\nfirst\n  second\nthird\nfourth\nfifth\nsixth\nseventh\n';
+  const client = new PagedTmuxClient(prompt);
+  client.offset = 5;
+  const { session } = await start(t, { client });
+  const response = session.prompt([{ type: 'text', text: prompt }], { retryDraft: retryFor(prompt) });
+  await client.submitted;
+  assert.equal(client.draft, prompt);
+  assert.equal(client.calls.some(call => call.type === 'paste'), false);
+  assert.equal(client.calls.filter(call => call.type === 'Enter').length, 1);
+  session.acceptHistory(history([turn('old', 'Earlier question'), turn('retry-multiline', prompt)]));
+  assert.equal((await response).sourceTurn.id, 'retry-multiline');
+});
+
+test('an anchored multiline retry verifies and deletes the existing suffix without typing another', async t => {
+  const prompt = 'a\n'.repeat(6) + 'z'.repeat(788);
+  const suffix = 'c'.repeat(32);
+  const client = new PagedTmuxClient(prompt + suffix);
+  client.offset = 0;
+  const { session } = await start(t, { client });
+  const retryDraft = retryFor(prompt);
+  retryDraft.proof.version = 2;
+  retryDraft.proof.verificationAnchor = { version: 1, suffix, state: 'injected' };
+  const response = session.prompt([{ type: 'text', text: prompt }], { retryDraft });
+  await client.submitted;
+  assert.equal(client.draft, prompt);
+  assert.equal(client.calls.some(call => ['paste', 'marker'].includes(call.type)), false);
+  assert.equal(client.calls.filter(call => call.type === 'adopt').length, 1);
+  session.acceptHistory(history([turn('old', 'Earlier question'), turn('retry-anchored', prompt)]));
+  assert.equal((await response).sourceTurn.id, 'retry-anchored');
+});
+
+test('an anchored retry preserves its existing-marker journal if lease verification fails before navigation', async t => {
+  const prompt = 'a\nb\nc\nd\ne\nf\ng\n';
+  const suffix = 'd'.repeat(32);
+  const client = new PagedTmuxClient(prompt + suffix);
+  const { session } = await start(t, { client });
+  client.onLeaseCheck = () => { throw new Error('The lease owner changed'); };
+  const retryDraft = retryFor(prompt);
+  retryDraft.proof.version = 2;
+  retryDraft.proof.verificationAnchor = { version: 1, suffix, state: 'injected' };
+  const error = await session.prompt([{ type: 'text', text: prompt }], { retryDraft }).catch(error => error);
+  assert.equal(error.verificationAnchor?.state, 'injected');
+  assert.equal(error.verificationAnchor.suffix, suffix);
+  assert.equal(client.calls.some(call => ['paste', 'marker', 'Enter'].includes(call.type)), false);
+  assert.equal(client.draft, prompt + suffix);
+});
+
+test('a failure after exact marker removal retains an ordinary unsubmitted draft without an injected-anchor proof', async t => {
+  const prompt = 'a\nb\nc\nd\ne\nf\ng\n';
+  const { session, client } = await start(t, { client: new PagedTmuxClient() });
+  client.onRemoveMarker = () => { client.overlay = '  Allow this command? [y/n]'; };
+  const error = await session.prompt([{ type: 'text', text: prompt }]).catch(error => error);
+  assert.match(error.message, /^Cursor input changed or could not be verified after paste;/);
+  assert.equal(error.verificationAnchor, undefined);
+  assert.ok(error.unsubmittedDraft);
+  assert.equal(client.draft, prompt);
+  assert.equal(client.calls.some(call => call.type === 'Enter'), false);
 });
 
 test('an eligible failed trailing-LF draft retries with a guarded Enter and no second paste', async t => {

@@ -1,3 +1,5 @@
+import { createHash } from 'node:crypto';
+
 const textContent = content => typeof content === 'string' ? content
   : Array.isArray(content) ? content.filter(block => block?.type === 'text' && typeof block.text === 'string').map(block => block.text).join('\n') : '';
 
@@ -13,19 +15,37 @@ const displayText = text => text.replace(/\s+/gu, '');
 
 const nonempty = value => typeof value === 'string' && value.length > 0;
 const observerProofKeys = ['version', 'sourceTurnId', 'sessionId', 'paneId', 'agentPid', 'agentStartTime'];
+const submittedProofKeys = [...observerProofKeys, 'origin', 'clientId', 'model', 'userTextSha256', 'nativeUserTextSha256'];
 const sameObserverBinding = (proof, binding) => binding && proof.paneId === binding.paneId
   && proof.agentPid === binding.agentPid && proof.agentStartTime === binding.agentStartTime;
+const sha256 = text => createHash('sha256').update(text).digest('hex');
+const canonicalSubmittedText = turn => userText(turn).replace(/\r\n/gu, '\n').trim();
+
+// Match the existing native tmux send contract: Cursor may trim the outer
+// whitespace, but all interior whitespace and hard newlines remain significant.
+export const submittedTurnTextSha256 = turn => sha256(canonicalSubmittedText(turn));
+export const nativeTurnTextSha256 = turn => sha256((turn?.items || [])
+  .filter(item => item.type === 'userMessage').map(item => textContent(item.content)).join('\n'));
+
+/** A malformed explicit native claim must remain blocked, never become a retry. */
+export function hasSubmittedTurnClaim(record, turnId) {
+  const proof = record?.tmuxObserverTurns?.[turnId];
+  return Object.hasOwn(record?.tmuxObserverTurns || {}, turnId)
+    && proof && typeof proof === 'object' && (proof.version === 2 || proof.origin === 'native');
+}
 
 /** Validate persisted observer ownership without deriving it from rendered text. */
 export function observerTurnProof(record, turnId) {
   const proof = record?.tmuxObserverTurns?.[turnId];
   const turns = record?.thread?.turns;
+  const submitted = proof?.version === 2;
+  const keys = submitted ? submittedProofKeys : observerProofKeys;
   if (record?.backend !== 'legacy' || !nonempty(turnId) || !Array.isArray(turns)
     || !Object.hasOwn(record.tmuxObserverTurns || {}, turnId)
     || !proof || typeof proof !== 'object' || Array.isArray(proof)
-    || Object.keys(proof).length !== observerProofKeys.length
-    || !observerProofKeys.every(key => Object.hasOwn(proof, key))
-    || proof.version !== 1 || !nonempty(proof.sourceTurnId) || !nonempty(proof.sessionId)
+    || Object.keys(proof).length !== keys.length
+    || !keys.every(key => Object.hasOwn(proof, key))
+    || (!submitted && proof.version !== 1) || !nonempty(proof.sourceTurnId) || !nonempty(proof.sessionId)
     || proof.sessionId !== record.cursorSessionId || typeof proof.paneId !== 'string' || !/^%\d+$/u.test(proof.paneId)
     || !Number.isSafeInteger(proof.agentPid) || proof.agentPid <= 0
     || typeof proof.agentStartTime !== 'string' || !/^\d+$/u.test(proof.agentStartTime)
@@ -35,9 +55,15 @@ export function observerTurnProof(record, turnId) {
   if (matches.length !== 1 || turn.status !== 'inProgress' || !Array.isArray(turn.items)
     || turn.items.some(item => !['userMessage', 'agentMessage'].includes(item?.type))) return null;
   const users = turn.items.filter(item => item.type === 'userMessage');
-  if (users.length !== 1 || users[0].clientId != null || !Array.isArray(users[0].content)
+  if (users.length !== 1 || (!submitted && users[0].clientId != null) || !Array.isArray(users[0].content)
     || !users[0].content.length || users[0].content.some(block => block?.type !== 'text' || typeof block.text !== 'string')
     || !displayText(userText(turn))) return null;
+  if (submitted && (proof.origin !== 'native' || !nonempty(proof.clientId) || !proof.clientId.trim()
+    || proof.clientId !== users[0].clientId || !nonempty(proof.model) || proof.model !== record.thread.model
+    || !/^[a-f0-9]{64}$/u.test(proof.userTextSha256) || proof.userTextSha256 !== submittedTurnTextSha256(turn)
+    || !/^[a-f0-9]{64}$/u.test(proof.nativeUserTextSha256) || proof.nativeUserTextSha256 !== nativeTurnTextSha256(turn)
+    || turns.filter(candidate => candidate.status === 'inProgress').length !== 1
+    || turns.some(candidate => candidate !== turn && candidate.items?.some(item => item.type === 'userMessage' && item.clientId === proof.clientId)))) return null;
   const mapping = record.historySync?.sourceTurns;
   if (!mapping || !Object.hasOwn(mapping, proof.sourceTurnId) || mapping[proof.sourceTurnId] !== turnId
     || Object.entries(mapping).some(([sourceId, nativeId]) => sourceId !== proof.sourceTurnId && nativeId === turnId)
@@ -60,6 +86,20 @@ export function recoverableObserverTurn(record, binding, history) {
   const sourceTurn = sources[0];
   if (sources.length !== 1 || !Array.isArray(sourceTurn.items) || sourceTurn.items.some(item => !item || typeof item !== 'object')
     || displayText(userText(sourceTurn)) !== displayText(userText(turn))) return null;
+  if (proof.version === 2) {
+    const users = sourceTurn.items.filter(item => item.type === 'userMessage');
+    const nativeUser = turn.items.find(item => item.type === 'userMessage');
+    const mapping = record.historySync?.sourceItems;
+    if ((record.queuedSubmissions !== undefined && (!Array.isArray(record.queuedSubmissions) || record.queuedSubmissions.length))
+      || typeof history.sourceComplete !== 'boolean' || !Array.isArray(history.completedTurnIds)
+      || users.length !== 1 || users[0].clientId != null || !nonempty(users[0].id) || !nonempty(nativeUser.id)
+      || !Array.isArray(users[0].content) || !users[0].content.length
+      || users[0].content.some(block => block?.type !== 'text' || typeof block.text !== 'string')
+      || canonicalSubmittedText(sourceTurn) !== canonicalSubmittedText(turn)
+      || submittedTurnTextSha256(sourceTurn) !== proof.userTextSha256
+      || !mapping || !Object.hasOwn(mapping, users[0].id) || mapping[users[0].id] !== nativeUser.id
+      || Object.entries(mapping).some(([sourceId, nativeId]) => sourceId !== users[0].id && nativeId === nativeUser.id)) return null;
+  }
   return { turn, sourceTurn, proof };
 }
 

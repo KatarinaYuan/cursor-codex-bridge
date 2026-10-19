@@ -5,7 +5,7 @@ import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { CursorSession } from './cursor.mjs';
-import { findLiveSourceTurn, finalizeLivePreview, observerTurnProof, recoverableObserverTurn } from './live-history.mjs';
+import { findLiveSourceTurn, finalizeLivePreview, hasSubmittedTurnClaim, observerTurnProof, recoverableObserverTurn } from './live-history.mjs';
 import { queueList, queueAdd, queueUpdate, queueDelete, queueReorder, queuePeek, queueConsume } from './queue.mjs';
 import { expandModelVariants } from './model-labels.mjs';
 import { retryDraftFor, retainUnsubmittedDraft, pinLiveSourceTurn } from './draft-recovery.mjs';
@@ -55,7 +55,7 @@ async function loadStore() {
       const r = JSON.parse(await fs.readFile(path.join(dataDir, entry), 'utf8'));
       if (r.thread?.id) {
         for (const t of r.thread.turns || []) {
-          if (t.status === 'inProgress' && !observerTurnProof(r, t.id)) {
+          if (t.status === 'inProgress' && !observerTurnProof(r, t.id) && !hasSubmittedTurnClaim(r, t.id)) {
             t.status = 'interrupted';
             t.completedAt = now();
           }
@@ -304,11 +304,18 @@ export function createBridge({ send, log = () => {} }) {
     if (r.backend === 'legacy') Session = (await import('./legacy.mjs')).LegacySession;
     if (shuttingDown) throw new Error('Cursor bridge is shutting down');
     const binding = r.backend === 'legacy' && tmuxSync ? await findTmuxBinding(r) : null;
-    const savedObserver = r.thread.turns.find(t => observerTurnProof(r, t.id));
+    const savedObserver = r.thread.turns.find(t => t.status === 'inProgress'
+      && (observerTurnProof(r, t.id) || hasSubmittedTurnClaim(r, t.id)));
     const recovery = savedObserver && binding ? recoverableObserverTurn(r, binding, sourceHistories.get(r.cursorSessionId)) : null;
     if (savedObserver && (!recovery || !tmuxSync.client.isVerified(binding))) {
       throw new Error('The saved Cursor observer cannot be verified against its original process and source; no separate Agent was started');
     }
+    // Admission validated this native-origin ownership against the original
+    // process and canonical source. Later queue/model UI state is not allowed
+    // to turn its read-only observer into an external user preview or a retry.
+    const nativeObserver = recovery?.proof.version === 2 ? Object.freeze({
+      turnId: recovery.turn.id, proof: Object.freeze(structuredClone(recovery.proof)),
+    }) : null;
     if (binding) {
       r.tmuxAffinity = { paneId: binding.paneId, agentPid: binding.agentPid, agentStartTime: binding.agentStartTime };
       // Remember a confirmed original process before starting its observer.
@@ -324,6 +331,10 @@ export function createBridge({ send, log = () => {} }) {
     openingSessionInstances.add(s);
     s.on('exit', () => { if (sessions.get(r.thread.id) === s) sessions.delete(r.thread.id); });
     s.on('model', model => {
+      if (recovery?.proof.version === 2 && r.tmuxObserverTurns?.[recovery.turn.id]
+        && model !== recovery.proof.model) {
+        throw new Error('The saved native Cursor turn model differs from its original process; no input was submitted');
+      }
       if (r.thread.model === model) return;
       r.thread.model = model;
       persist(r).catch(error => log(`Cursor model persist failed threadId=${r.thread.id}: ${error.message}`));
@@ -415,18 +426,25 @@ export function createBridge({ send, log = () => {} }) {
       });
     });
     try {
+      let recoveredPending;
       if (recovery) {
         const sourceUser = recovery.sourceTurn.items.find(item => item.type === 'userMessage');
         const prompt = sourceUser.content.filter(block => block.type === 'text').map(block => block.text).join('\n');
-        const pending = s.resumeObserver(recovery.sourceTurn.id, prompt);
-        runningTurns.add(r.thread.id);
+        recoveredPending = s.resumeObserver(recovery.sourceTurn.id, prompt);
         status(r, 'active');
-        // This promise belongs to the saved native turn. It may resolve during
-        // start() if Cursor completed while the bridge was disconnected.
-        launchTurn(r, recovery.turn, s, null, pending.promise);
       }
       const result = await s.start(r.cursorSessionId ? { sessionId: r.cursorSessionId } : {});
       if (shuttingDown) throw new Error('Cursor bridge is shutting down');
+      if (recovery?.proof.version === 2 && result?.models?.currentModelId
+        && result.models.currentModelId !== recovery.proof.model) {
+        throw new Error('The saved native Cursor turn model could not be verified; no input was submitted');
+      }
+      if (recoveredPending) {
+        // The promise may already have resolved during the first capture. Do
+        // not finish its native turn until startup/model checks have passed.
+        runningTurns.add(r.thread.id);
+        launchTurn(r, recovery.turn, s, null, recoveredPending.promise, undefined, undefined, nativeObserver);
+      }
       r.cursorSessionId = s.sessionId;
       if (result?.models?.currentModelId) r.thread.model = result.models.currentModelId;
       sessions.set(r.thread.id, s);
@@ -485,8 +503,9 @@ export function createBridge({ send, log = () => {} }) {
     }
   }
 
-  async function finishTurn(r, t, s, acpInput, externalPromise, expectedModel, retryDraft) {
+  async function finishTurn(r, t, s, acpInput, externalPromise, expectedModel, retryDraft, nativeObserver) {
     let detachedObserver = false;
+    const nativeOrigin = nativeObserver?.turnId === t.id && nativeObserver.proof.origin === 'native';
     try {
       const result = await (externalPromise || s.prompt(acpInput, { model: expectedModel, retryDraft }));
       if (result?.history) {
@@ -495,7 +514,7 @@ export function createBridge({ send, log = () => {} }) {
         finalizeLivePreview(r, t, result.sourceTurn);
         // The screen wraps prose for display. Replace an external turn's user
         // preview with the exact transcript text before binding stable IDs.
-        if (result.origin === 'external') {
+        if (result.origin === 'external' && !nativeOrigin) {
           const user = t.items.find(i => i.type === 'userMessage');
           const sourceUser = result.sourceTurn.items.find(i => i.type === 'userMessage');
           if (user && sourceUser) user.content = structuredClone(sourceUser.content);
@@ -517,7 +536,7 @@ export function createBridge({ send, log = () => {} }) {
       t.status = result?.stopReason === 'cancelled' ? 'interrupted' : result?.stopReason === 'failed' ? 'failed' : 'completed';
       if (t.status === 'failed') t.error = result.sourceTurn?.error || { message: 'Cursor CLI turn failed', codexErrorInfo: null, additionalDetails: null };
     } catch (e) {
-      if (externalPromise && s.kind === 'tmux' && observerTurnProof(r, t.id)) {
+      if (externalPromise && s.kind === 'tmux' && (nativeOrigin || observerTurnProof(r, t.id))) {
         // Losing a read-only observer cannot fail the original Cursor task.
         // Keep its exact source ownership so another observer can adopt it.
         detachedObserver = true;
@@ -525,7 +544,7 @@ export function createBridge({ send, log = () => {} }) {
       } else {
         t.status = 'failed';
         t.error = { message: e.message, codexErrorInfo: null, additionalDetails: null };
-        if (s.kind === 'tmux') retainUnsubmittedDraft(r, t, e.unsubmittedDraft);
+        if (s.kind === 'tmux') retainUnsubmittedDraft(r, t, e.unsubmittedDraft, e.verificationAnchor);
         notify('error', { threadId: r.thread.id, turnId: t.id, error: t.error, willRetry: false });
         log(`Cursor turn failed: ${e.message}`);
       }
@@ -911,7 +930,8 @@ async function startHistorySync(log) {
         const existing = [...records.values()].find(r => r.backend === 'legacy' && r.cursorSessionId === id);
         const threadId = existing?.thread.id || uuid();
         if (threadLocks.has(threadId) || runningTurns.has(threadId)
-          || existing?.thread.turns.some(turn => observerTurnProof(existing, turn.id))) continue;
+          || existing?.thread.turns.some(turn => observerTurnProof(existing, turn.id)
+            || (turn.status === 'inProgress' && hasSubmittedTurnClaim(existing, turn.id)))) continue;
         await withThreadLock(threadId, async () => {
           if (state.stopped || shuttingDown || runningTurns.has(threadId)) return;
           if (!existing) {

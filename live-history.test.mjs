@@ -2,7 +2,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { parseTranscript } from './history.mjs';
 import { reconcileHistory } from './sync.mjs';
-import { findLiveSourceTurn, finalizeLivePreview, observerTurnProof, recoverableObserverTurn } from './live-history.mjs';
+import { findLiveSourceTurn, finalizeLivePreview, hasSubmittedTurnClaim, nativeTurnTextSha256, observerTurnProof,
+  recoverableObserverTurn, submittedTurnTextSha256 } from './live-history.mjs';
 
 function history(rows, sourceComplete = false) {
   return { ...parseTranscript(rows.map(([role, text]) => JSON.stringify({ role, message: { content: [{ type: 'text', text }] } })).join('\n'), {
@@ -43,6 +44,84 @@ function observerFixture() {
     paneId: binding.paneId, agentPid: binding.agentPid, agentStartTime: binding.agentStartTime } };
   return { native, source, binding, turn, proof: native.tmuxObserverTurns[turn.id] };
 }
+
+function submittedFixture() {
+  const fixture = observerFixture();
+  const { native, source, turn } = fixture;
+  native.thread.model = 'composer-2.5[fast=true]';
+  turn.items[0].clientId = 'native-client-message';
+  turn.items[0].id = 'native-user-item';
+  // Keep the raw native input intact even when Cursor drops an outer newline.
+  turn.items[0].content[0].text = 'Continue please\n';
+  native.historySync.sourceItems = { [source.turns[0].items[0].id]: turn.items[0].id };
+  const proof = { ...fixture.proof, version: 2, origin: 'native', clientId: turn.items[0].clientId,
+    model: native.thread.model, userTextSha256: submittedTurnTextSha256(turn), nativeUserTextSha256: nativeTurnTextSha256(turn) };
+  native.tmuxObserverTurns[turn.id] = proof;
+  return { ...fixture, proof };
+}
+
+test('explicit submitted proof recovers the same native client, model, user bytes and exact source without mutation', () => {
+  for (const complete of [false, true]) {
+    const fixture = submittedFixture();
+    fixture.source.sourceComplete = complete;
+    fixture.source.completedTurnIds = complete ? [fixture.proof.sourceTurnId] : [];
+    const before = structuredClone(fixture);
+    assert.equal(observerTurnProof(fixture.native, fixture.turn.id), fixture.proof);
+    const recovered = recoverableObserverTurn(fixture.native, fixture.binding, fixture.source);
+    assert.equal(recovered.turn, fixture.turn);
+    assert.equal(recovered.sourceTurn, fixture.source.turns[0]);
+    assert.deepEqual(fixture, before);
+  }
+});
+
+test('submitted proofs reject client/model/raw-text/queue and exact canonical attribution conflicts', () => {
+  const corruptions = [
+    ({ proof }) => { delete proof.origin; },
+    ({ proof }) => { proof.origin = 'external'; },
+    ({ proof }) => { proof.version = 1; },
+    ({ proof }) => { proof.extra = true; },
+    ({ proof }) => { proof.clientId = ''; },
+    ({ proof }) => { proof.clientId = 'other-native-client'; },
+    ({ proof }) => { proof.model = 'different-model'; },
+    ({ proof }) => { proof.userTextSha256 = '0'.repeat(64); },
+    ({ proof }) => { proof.nativeUserTextSha256 = '0'.repeat(64); },
+    ({ turn }) => { turn.items[0].clientId = null; },
+    ({ turn }) => { turn.items[0].content[0].text = 'Continue please'; },
+    ({ native }) => { native.queuedSubmissions = [{ clientUserMessageId: 'queued' }]; },
+    ({ native }) => { native.queuedSubmissions = null; },
+    ({ native, turn }) => { native.thread.turns.push({ id: 'duplicate-client', status: 'completed', items: [structuredClone(turn.items[0])] }); },
+    ({ native, source }) => { delete native.historySync.sourceItems[source.turns[0].items[0].id]; },
+    ({ native }) => { native.historySync.sourceItems['competing-source-user'] = 'native-user-item'; },
+    ({ source }) => { source.turns[0].items.push(structuredClone(source.turns[0].items[0])); },
+    ({ source }) => { source.turns[0].items[0].clientId = 'other-native-client'; },
+    ({ source }) => { source.turns[0].items[0].content[0].text = 'Continue\nplease'; },
+    ({ source }) => { delete source.sourceComplete; },
+    ({ source }) => { delete source.completedTurnIds; },
+  ];
+  for (const corrupt of corruptions) {
+    const fixture = submittedFixture();
+    corrupt(fixture);
+    const before = structuredClone(fixture);
+    assert.equal(recoverableObserverTurn(fixture.native, fixture.binding, fixture.source), null, String(corrupt));
+    assert.deepEqual(fixture, before);
+  }
+});
+
+test('a malformed explicit submitted claim stays recognizable for fail-closed startup', () => {
+  const fixture = submittedFixture();
+  fixture.proof.clientId = 'wrong-client';
+  assert.equal(observerTurnProof(fixture.native, fixture.turn.id), null);
+  assert.equal(hasSubmittedTurnClaim(fixture.native, fixture.turn.id), true);
+  fixture.proof.version = 99;
+  assert.equal(hasSubmittedTurnClaim(fixture.native, fixture.turn.id), true);
+});
+
+test('queueing later preserves native ownership but blocks a fresh observer adoption', () => {
+  const fixture = submittedFixture();
+  fixture.native.queuedSubmissions = [{ id: 'queued-later', clientUserMessageId: 'future-client', input: [] }];
+  assert.equal(observerTurnProof(fixture.native, fixture.turn.id), fixture.proof);
+  assert.equal(recoverableObserverTurn(fixture.native, fixture.binding, fixture.source), null);
+});
 
 test('observer recovery retains exact ownership for both unfinished and completed source snapshots without mutation', () => {
   for (const complete of [false, true]) {

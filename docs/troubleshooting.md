@@ -38,8 +38,8 @@ Cursor 登录属于远端用户环境。使用正确 SSH 用户并由账号拥�
 在 laptop 任意目录运行，把 `my-dev` 换成安装时的源 SSH 别名：
 
 ```sh
-npx --yes --package=https://github.com/KatarinaYuan/cursor-codex-bridge/releases/download/v0.1.5/cursor-codex-bridge-0.1.5.tgz cursor-codex upgrade --ssh my-dev
-npx --yes --package=https://github.com/KatarinaYuan/cursor-codex-bridge/releases/download/v0.1.5/cursor-codex-bridge-0.1.5.tgz cursor-codex doctor --ssh my-dev
+npx --yes --package=https://github.com/KatarinaYuan/cursor-codex-bridge/releases/download/v0.1.6/cursor-codex-bridge-0.1.6.tgz cursor-codex upgrade --ssh my-dev
+npx --yes --package=https://github.com/KatarinaYuan/cursor-codex-bridge/releases/download/v0.1.6/cursor-codex-bridge-0.1.6.tgz cursor-codex doctor --ssh my-dev
 ```
 
 原来使用自定义桥别名时，两条命令都补上相同的 `--alias my-cursor`。若升级和诊断通过而 App 仍显示旧列表，在 SSH 设置中断开桥连接后重新连接。全局最近列表有条数上限，较旧会话未进入当前列表不代表丢失；仍可在对应项目中查找。诊断和列表检查不会发送模型消息。
@@ -59,9 +59,13 @@ text remains as an unsubmitted draft in tmux. Review it in Cursor CLI
 
 这表示桥未能确认粘贴后的输入，文本可能仍作为草稿留在 CLI 中。**不要盲目重复发送或再粘贴一遍。**先在 Cursor CLI 查看草稿及是否已产生回复。只有持久化恢复凭据、原进程、模型、历史和草稿原文全部一致时，桥才允许将相同原文作为已有草稿重试；它不会自动清空或提交普通草稿。
 
-`v0.1.3` 修复了窄窗口下较长消息软换行后被输入框裁剪的问题。受支持的 Cursor 输入框最多显示六个视觉行；桥会计算所需列宽，在独占、未缩放的 tmux 窗口中自动临时扩宽，等待终端重绘，再校验完整原文。提交或失败后恢复原尺寸，并保留 `window-size` 原有的显式配置或继承关系。若有人同时调整布局或选项，桥会保留对方的改动；已经提交的消息不会因恢复窗口失败而被误记为发送失败。
+`v0.1.6` 修复了短消息超过六个显式文本行时的发送限制。消息不超过 800 个 UTF-16 字符且含超过六行时，桥会临时独占原 pane 的输入，阻止普通 tmux 按键混入，原文只粘贴一次，再移动光标检查全文。临时随机标记帮助识别连续空行；核验完成后先删除标记，再发送一次 Enter。提交原文保留空行、内部换行及首尾换行，不补字符、不合并段落，也不打开外部编辑器。看到旧的 `more than six hard lines; no text was pasted` 错误时，先升级到 `v0.1.6` 并运行诊断。
 
-扩宽不改消息、光标或 Cursor 进程，也不会只凭可见后半段放行。超过 800 个 UTF-16 字符的粘贴仍使用 Cursor 自己的折叠标记，并校验同一会话保存的完整内容。较短消息若本身含超过六个显式文本行、所需列宽超过 1007，或者窗口有多个 pane 或处于缩放状态，桥无法通过扩宽验证全文，会在粘贴前说明原因。此限制只适用于共享现有 tmux 的代发路径。
+核验期间请等待临时输入锁自动释放。输入锁最多保留 300 秒，并有独立看门狗负责清理。已有 `pipe-pane`、已经关闭的 pane 输入、草稿或无法确认的布局会使桥拒绝接管。核验失败时不发送 Enter，保留草稿；如果提交是否成功的确认不明确，桥不会自动重发。
+
+若错误明确提示 `temporary verification marker`，同一消息的显式重试只有在完整草稿、标记、进程、模型和来源历史均验证一致时才会删除标记并提交；不会再次粘贴正文。若标记输入或删除的确认不明确，则拒绝自动恢复。不要手工提交带有校验标记的草稿。
+
+窄窗口的软换行仍通过临时增加列宽处理，仅支持独占、未缩放且所需列宽不超过 1007 的 tmux 窗口。提交或失败后恢复原尺寸，并保留 `window-size` 原有的显式配置或继承关系；若有人同时调整布局或选项，桥会保留对方改动。超过 800 个 UTF-16 字符的粘贴继续使用 Cursor 自己的折叠标记，并核验同一会话保存的完整内容。这些检查只适用于共享现有 tmux 的代发路径。
 
 错误在历史中保留不代表发生了新的发送请求；排查时区分旧失败记录、重新打开聊天和新的发送尝试。输入框布局、进程状态或模型格式不兼容时，代发会被拒绝。请提供 Agent/App 版本和脱敏诊断，保留草稿待检查。
 

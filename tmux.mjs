@@ -3,6 +3,7 @@ import { randomUUID } from 'node:crypto';
 import { constants } from 'node:fs';
 import { open, readFile, readdir, readlink } from 'node:fs/promises';
 import { dirname, isAbsolute, join } from 'node:path';
+import { createInputLease } from './input-lease.mjs';
 
 const UUID = '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}';
 const STORE = new RegExp(`^/(?:[^/]+/)*\\.cursor/chats/[^/]+/(${UUID})/store\\.db$`, 'i');
@@ -10,9 +11,10 @@ const SESSION = new RegExp(`^${UUID}$`, 'i');
 const MAX_PASTED_TEXT_BYTES = 8 * 1024 * 1024;
 const MAX_INPUT_COLUMNS = 1007;
 
-function inputColumns(value) {
-  if (value !== undefined && (!Number.isSafeInteger(value) || value < 1 || value > MAX_INPUT_COLUMNS)) {
-    throw new Error(`Cursor input minimumColumns must be an integer from 1 to ${MAX_INPUT_COLUMNS}`);
+function inputColumns(value, exclusive = false) {
+  const maximum = exclusive ? 2007 : MAX_INPUT_COLUMNS;
+  if (value !== undefined && (!Number.isSafeInteger(value) || value < 1 || value > maximum)) {
+    throw new Error(`Cursor input minimumColumns must be an integer from 1 to ${maximum}`);
   }
   return value;
 }
@@ -112,6 +114,32 @@ async function cursorStores(procRoot, pid) {
   return [...new Set(paths.filter((path) => typeof path === 'string' && STORE.test(path)))];
 }
 
+async function paneDescendants(procRoot, rootPid) {
+  const pending = [rootPid]; const visited = new Set(); const descendants = [];
+  while (pending.length) {
+    const pid = pending.shift();
+    if (visited.has(pid)) continue;
+    visited.add(pid);
+    if (visited.size > 4096) throw new Error('Cursor pane process tree exceeded its verification limit');
+    const stat = await processStat(procRoot, pid);
+    if (!stat) continue;
+    descendants.push(stat);
+    let tasks;
+    try { tasks = await readdir(join(procRoot, String(pid), 'task')); }
+    catch (error) { if (!await processStat(procRoot, pid)) continue; throw error; }
+    const children = await batches(tasks.filter(task => /^[1-9]\d*$/.test(task)), async task => {
+      try { return await readFile(join(procRoot, String(pid), 'task', task, 'children'), 'utf8'); }
+      catch (error) { if (!await processStat(procRoot, pid)) return ''; throw error; }
+    });
+    for (const child of children.join(' ').trim().split(/\s+/).filter(Boolean)) {
+      if (!/^[1-9]\d*$/.test(child) || !Number.isSafeInteger(Number(child))) throw new Error('Cursor pane child process identity is invalid');
+      const childStat = await processStat(procRoot, Number(child));
+      if (childStat?.ppid === pid) pending.push(Number(child));
+    }
+  }
+  return descendants;
+}
+
 async function readPastedTextFile(filename) {
   // A nonblocking, non-symlink regular file cannot redirect this read to a pipe
   // or another session's paste store. Bound reads as well as the initial size:
@@ -149,10 +177,12 @@ async function readPastedTextFile(filename) {
  * { stdout, stderr }. Input goes to stdin and is never interpreted by a shell.
  */
 export class TmuxClient {
-  constructor({ tmuxPath = 'tmux', procRoot = '/proc', run, commandTimeoutMs = 5_000, maxOutputBytes = 8 * 1024 * 1024 } = {}) {
+  constructor({ tmuxPath = 'tmux', procRoot = '/proc', run, inputLeaseFactory = createInputLease, commandTimeoutMs = 5_000, maxOutputBytes = 8 * 1024 * 1024 } = {}) {
     if (!Number.isSafeInteger(commandTimeoutMs) || commandTimeoutMs <= 0) throw new Error('Tmux command timeout must be a positive integer');
     if (!Number.isSafeInteger(maxOutputBytes) || maxOutputBytes <= 0) throw new Error('Tmux output limit must be a positive integer');
     this.procRoot = procRoot;
+    this.tmuxPath = tmuxPath;
+    this.inputLeaseFactory = inputLeaseFactory;
     this.run = run || defaultRunner(tmuxPath, { commandTimeoutMs, maxOutputBytes });
     this.identities = new Map();
     this.panes = new Map();
@@ -236,6 +266,35 @@ export class TmuxClient {
     await this.discover();
     if (!this.isVerified(binding)) throw new Error('Cursor tmux binding changed, is in copy-mode, or is no longer in the foreground');
     return this.observations.get(snapshot.paneId).binding;
+  }
+
+  /** Rechecks a pinned process between full discoveries during an input lease. */
+  async verifyPinnedProcess(binding, { descendants = false } = {}) {
+    const snapshot = binding && this.snapshots.get(binding);
+    if (!snapshot || !this.isVerified(binding)) throw new Error('A verified Cursor process snapshot is required');
+    const boundary = snapshot.identity.indexOf(':/');
+    const chainText = snapshot.identity.slice(0, boundary);
+    if (boundary < 0 || !/^[1-9]\d*:\d+(?:\/[1-9]\d*:\d+)*$/.test(chainText)) throw new Error('Cursor pinned process identity is invalid');
+    const chain = chainText.split('/').map(part => { const [pid, startTime] = part.split(':'); return { pid: Number(pid), startTime }; });
+    if (chain[0].pid !== snapshot.agentPid || chain.at(-1).pid !== snapshot.panePid) throw new Error('Cursor pinned process chain changed');
+    const check = async () => {
+      const stats = await Promise.all(chain.map(item => processStat(this.procRoot, item.pid)));
+      if (stats.some((stat, index) => !stat || stat.startTime !== chain[index].startTime || (index + 1 < chain.length && stat.ppid !== chain[index + 1].pid))) throw new Error('Cursor pinned process chain changed');
+      const current = stats[0]; const pane = stats.at(-1);
+      if (!current.tty || current.tty !== pane.tty || current.pgrp <= 0 || current.pgrp !== current.foregroundPgrp || current.pgrp !== pane.foregroundPgrp) throw new Error('Cursor pinned process left the foreground');
+      return stats;
+    };
+    const before = await check();
+    const stores = await cursorStores(this.procRoot, snapshot.agentPid);
+    if (stores.length !== 1 || stores[0] !== snapshot.storePath || await readlink(join(this.procRoot, String(snapshot.agentPid), 'cwd')) !== snapshot.cwd) throw new Error('Cursor pinned process database or directory changed');
+    if (descendants) {
+      const processes = await paneDescendants(this.procRoot, snapshot.panePid);
+      const paths = new Set((await batches(processes, stat => cursorStores(this.procRoot, stat.pid))).flat());
+      if (paths.size !== 1 || !paths.has(snapshot.storePath)) throw new Error('Cursor pinned pane database binding changed');
+    }
+    const after = await check();
+    if (!before.every((stat, index) => sameProcess(stat, after[index]))) throw new Error('Cursor pinned process changed during verification');
+    return binding;
   }
 
   /** Reads Cursor's saved paste expansions without sending input to its TUI. */
@@ -358,8 +417,27 @@ export class TmuxClient {
     return result;
   }
 
-  async paste(paneId, text, { sessionId, beforePaste, afterPaste, minimumColumns } = {}) {
-    inputColumns(minimumColumns);
+  async withExclusiveInput(paneId, sessionId, identity, operation) {
+    await this.binding(paneId, sessionId, identity);
+    const binding = this.observations.get(paneId).binding;
+    const lease = await this.inputLeaseFactory({ run: this.run, binding, identity, tmuxPath: this.tmuxPath, procRoot: this.procRoot, verify: () => this.binding(paneId, sessionId, identity), verifyPinned: () => this.verifyPinnedProcess(binding, { descendants: true }) });
+    let result; let failure;
+    try { result = await operation(lease); }
+    catch (error) { failure = error; }
+    finally {
+      try { await lease.release(); }
+      catch (error) {
+        if (result?.submitted) result.inputLeaseRestoreError = error.message;
+        else if (failure instanceof Error) failure.inputLeaseRestoreError = error.message;
+        else failure = new Error(`Cursor input was not submitted; ${error.message}`, { cause: error });
+      }
+    }
+    if (failure) throw failure;
+    return result;
+  }
+
+  async paste(paneId, text, { sessionId, beforePaste, afterPaste, minimumColumns, exclusiveInput = false } = {}) {
+    inputColumns(minimumColumns, exclusiveInput);
     if (typeof text !== 'string' || !text.length) throw new Error('A nonempty text prompt is required');
     if ((beforePaste !== undefined && typeof beforePaste !== 'function') || (afterPaste !== undefined && typeof afterPaste !== 'function')) {
       throw new Error('Tmux paste guards must be functions');
@@ -370,6 +448,17 @@ export class TmuxClient {
       throw new Error('Cursor prompts cannot contain terminal control characters or malformed Unicode');
     }
     const identity = await this.binding(paneId, sessionId);
+    if (exclusiveInput) return this.withInputViewport(paneId, sessionId, identity, minimumColumns, () => this.withExclusiveInput(paneId, sessionId, identity, async lease => {
+      await lease.assertActive();
+      await beforePaste?.(lease);
+      await lease.assertActive();
+      await lease.paste(text);
+      await lease.assertActive();
+      await afterPaste?.(lease);
+      await lease.assertActive();
+      await lease.submit();
+      return { submitted: true };
+    }));
     return this.withInputViewport(paneId, sessionId, identity, minimumColumns, async () => {
       const buffer = `cursor_bridge_${randomUUID().replaceAll('-', '')}`;
       try {
@@ -395,10 +484,17 @@ export class TmuxClient {
   }
 
   /** Submits an existing draft only after the caller proves its exact contents. */
-  async submitDraft(paneId, { sessionId, beforeSubmit, minimumColumns } = {}) {
-    inputColumns(minimumColumns);
+  async submitDraft(paneId, { sessionId, beforeSubmit, minimumColumns, exclusiveInput = false } = {}) {
+    inputColumns(minimumColumns, exclusiveInput);
     if (typeof beforeSubmit !== 'function') throw new Error('A Cursor draft submission guard is required');
     const identity = await this.binding(paneId, sessionId);
+    if (exclusiveInput) return this.withInputViewport(paneId, sessionId, identity, minimumColumns, () => this.withExclusiveInput(paneId, sessionId, identity, async lease => {
+      await lease.assertActive();
+      await beforeSubmit(lease);
+      await lease.assertActive();
+      await lease.submit();
+      return { submitted: true };
+    }));
     return this.withInputViewport(paneId, sessionId, identity, minimumColumns, async () => {
       await beforeSubmit();
       await this.binding(paneId, sessionId, identity);
