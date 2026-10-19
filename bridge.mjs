@@ -565,6 +565,8 @@ export function createBridge({ send, log = () => {} }) {
     }
     if (method === 'thread/list') {
       let data = [...records.values()].filter(r => Boolean(r.archived) === Boolean(p.archived));
+      // Native clients also use this query to enumerate pinned/custom sections.
+      if (p.sectionId !== undefined) data = data.filter(r => (r.thread.section?.id ?? null) === p.sectionId);
       if (p.cwd) { const cwds = Array.isArray(p.cwd) ? p.cwd : [p.cwd]; data = data.filter(r => cwds.includes(r.thread.cwd)); }
       if (p.searchTerm) data = data.filter(r => `${r.thread.name} ${r.thread.preview}`.toLowerCase().includes(p.searchTerm.toLowerCase()));
       if (p.modelProviders?.length && !p.modelProviders.includes(PROVIDER)) data = [];

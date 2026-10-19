@@ -591,6 +591,48 @@ test('archive failure removes its temporary package and reports the packaging er
   await assert.rejects(fs.access(stage), { code: 'ENOENT' });
 });
 
+// Published v0.1.1–v0.1.3 differed only in their pinned version. Keep the
+// released text here so these tests require neither Git nor network access.
+const releasedSkill = [
+  "---",
+  "name: install-cursor-codex-bridge",
+  "description: Install, diagnose, upgrade, or uninstall Cursor Codex Bridge over an existing SSH alias so Codex desktop chats use a remote Cursor Agent.",
+  "---",
+  "",
+  "# Install Cursor Codex Bridge",
+  "",
+  "Use the project's CLI to manage the bridge from the laptop. This is an experimental protocol bridge, not an official Codex or Cursor integration. It requires an existing working SSH alias and a Linux glibc x64/arm64 host with Python 3.8+, bash, and Cursor Agent already logged in. The installer reuses remote Node.js 22+ and genuine Codex CLI or downloads pinned, checksum-verified private runtimes when absent; it does not use sudo or install global npm packages. The laptop needs Node.js 22+ with npm, Git, OpenSSH, tar, and Codex desktop.",
+  "",
+  "## Workflow",
+  "",
+  "1. Reuse the user's specified checkout and SSH alias. If the alias is missing, inspect available SSH host names without exposing identities or credentials, and ask the user to choose when necessary. Do not guess a host from unrelated context.",
+  "2. Check laptop Node.js 22+ and npm. If unavailable, discover the native Codex `load_workspace_dependencies` tool and use its bundled Node/npm when provided. Add that runtime directory to `PATH` only for the current command; do not modify shell profiles. If neither a suitable system runtime nor a bundled Node/npm is available, report the specific prerequisite and ask the user to install Node.js 22+ with npm. Do not claim the bridge is dependency-free on arbitrary laptops.",
+  "3. Prefer the pinned GitHub Release package below when no checkout was requested. Use the same `npx` prefix for `install`, then `doctor`, replacing `ALIAS` with the user's SSH alias. Alternatively, clone `https://github.com/KatarinaYuan/cursor-codex-bridge.git`, check out `v0.1.3`, run `npm ci --ignore-scripts`, then use `node cli.mjs`. Read the README and CLI `--help` for version-specific options. Reuse an existing checkout only when its origin matches this project; do not discard local edits.",
+  "4. Add `--alias BRIDGE_ALIAS` only when the user specified a bridge name or a collision needs resolving; pass that same option to every later management command. Remote binary overrides (`--node-path`, `--agent-path`, `--codex-path`) must be remote absolute paths.",
+  "5. Report the actual diagnostic result and generated bridge alias. Direct the user to enable that alias in Codex App SSH settings if the CLI requires it. Do not claim an end-to-end chat works solely because installation passed.",
+  "",
+  "```sh",
+  "npx --yes --package=https://github.com/KatarinaYuan/cursor-codex-bridge/releases/download/v0.1.3/cursor-codex-bridge-0.1.3.tgz cursor-codex install --ssh ALIAS",
+  "npx --yes --package=https://github.com/KatarinaYuan/cursor-codex-bridge/releases/download/v0.1.3/cursor-codex-bridge-0.1.3.tgz cursor-codex doctor --ssh ALIAS",
+  "```",
+  "",
+  "An explicit installation request authorizes the installer changes described by the CLI; do not add another approval step for those routine changes. It tests `CODEX_HOME` forwarding, then `LC_CURSOR_CODEX_BRIDGE`; a server rejecting both may need the user's administrator. Report that concrete blocker instead of changing the server's SSH policy.",
+  "",
+  "## Other operations",
+  "",
+  "- Diagnose: use the same `npx` prefix with `cursor-codex doctor --ssh ALIAS` (`--json` for structured results), or `node cli.mjs doctor` in a checkout. This is read-only and does not send model messages.",
+  "- Upgrade: run `cursor-codex upgrade --ssh ALIAS` using the target release package URL with `npx`, or its clean checkout with `node cli.mjs`. The command deploys the calling version; it does not fetch the latest release itself. Preserve local edits and existing user settings.",
+  "- Uninstall: run `cursor-codex uninstall --ssh ALIAS` with the same `npx` prefix, or `node cli.mjs uninstall` in a checkout. Preserve the retained bridge records, original Cursor history, and shared private runtimes. Deleting those data requires a separate explicit request. Existing manual bridge deployments are not adopted or migrated by this installer.",
+  "",
+  "Use the installer for owned SSH/profile blocks and remote files. Do not duplicate its work by manually appending shell snippets, replacing global Codex binaries, modifying `sshd_config`, or installing global hooks. Do not bundle or copy accounts and credentials.",
+  "",
+  "Do not send test messages to existing chats or tmux sessions. Do not clear drafts or press Enter to resolve a failed paste. When busy or when input cannot be verified, stop the dependent mutation and report the CLI's concrete reason; inspect read-only diagnostics and `docs/troubleshooting.md`. A new isolated model test requires the user's authorization because it creates messages and may incur cost.",
+  "",
+  "For a failed command, diagnose the actual output; do not loop installation or restart user Agent processes. Keep logs and issue reports free of chat contents, private keys, tokens, and personal host details.",
+  "",
+].join('\n');
+const releasedSkillMetadata = "interface:\n  display_name: \"Install Cursor Codex Bridge\"\n  short_description: \"Install and manage a remote Cursor bridge for Codex\"\n  default_prompt: \"Use $install-cursor-codex-bridge to install the bridge using my existing SSH alias and run diagnostics.\"\n";
+
 test('skill installation uses CODEX_HOME, is idempotent, and preserves differing existing skills', async t => {
   const directory = await temporary(t);
   const root = path.join(directory, 'package');
@@ -628,6 +670,114 @@ test('install-skill routes locally and rejects a symlink destination', async t =
   await fs.symlink(target, result.destination);
   await assert.rejects(installSkill({ root, skillDir: parent }), /regular directory/);
   assert.deepEqual(await fs.readdir(target), []);
+});
+
+async function releasedSkillInstallation(t, version = '0.1.3', { customParent = false, metadata = true } = {}) {
+  const directory = await temporary(t);
+  const root = path.join(directory, 'package');
+  const source = path.join(root, 'skills', 'install-cursor-codex-bridge');
+  const codexHome = path.join(directory, 'codex home');
+  const parent = customParent ? path.join(directory, 'custom', 'skills') : path.join(codexHome, 'skills');
+  const destination = path.join(parent, 'install-cursor-codex-bridge');
+  await fs.mkdir(source, { recursive: true });
+  await fs.writeFile(path.join(source, 'SKILL.md'), '# Current skill\n');
+  if (metadata) {
+    await fs.mkdir(path.join(source, 'agents'));
+    await fs.writeFile(path.join(source, 'agents', 'openai.yaml'), releasedSkillMetadata);
+  }
+  await fs.mkdir(path.join(destination, 'agents'), { recursive: true });
+  const original = releasedSkill.replaceAll('0.1.3', version);
+  await fs.writeFile(path.join(destination, 'SKILL.md'), original);
+  await fs.writeFile(path.join(destination, 'agents', 'openai.yaml'), releasedSkillMetadata);
+  return { directory, source, parent, destination, original,
+    settings: { root, env: { CODEX_HOME: codexHome }, ...(customParent ? { skillDir: parent } : {}) } };
+}
+
+test('install-skill safely upgrades each unmodified published release and retains its complete backup', async t => {
+  for (const version of ['0.1.1', '0.1.2', '0.1.3']) {
+    const f = await releasedSkillInstallation(t, version, { customParent: version === '0.1.2' });
+    const result = await installSkill(f.settings);
+    assert.equal(result.changed, true);
+    assert.equal(result.destination, f.destination);
+    assert.equal(path.dirname(result.backup), path.join(path.dirname(f.parent), 'skill-backups'));
+    assert.match(path.basename(result.backup), /^install-cursor-codex-bridge-\d{4}-\d{2}-\d{2}T[\w-]+-[a-f0-9-]+$/);
+    assert.equal(await fs.readFile(path.join(result.backup, 'SKILL.md'), 'utf8'), f.original);
+    assert.equal(await fs.readFile(path.join(result.backup, 'agents', 'openai.yaml'), 'utf8'), releasedSkillMetadata);
+    assert.equal(await fs.readFile(path.join(f.destination, 'SKILL.md'), 'utf8'), '# Current skill\n');
+    assert.equal(await fs.readFile(path.join(f.destination, 'agents', 'openai.yaml'), 'utf8'), releasedSkillMetadata);
+    assert.equal((await installSkill(f.settings)).changed, false);
+    assert.deepEqual(await fs.readdir(f.parent), ['install-cursor-codex-bridge']);
+  }
+});
+
+test('an upgrade dry run reports the planned backup without creating or modifying files', async t => {
+  const f = await releasedSkillInstallation(t);
+  const result = await installSkill({ ...f.settings, dryRun: true });
+  assert.equal(result.changed, true);
+  assert.equal(result.dryRun, true);
+  assert.ok(result.backup);
+  await assert.rejects(fs.access(path.dirname(result.backup)), { code: 'ENOENT' });
+  assert.equal(await fs.readFile(path.join(f.destination, 'SKILL.md'), 'utf8'), f.original);
+  assert.deepEqual(await fs.readdir(f.parent), ['install-cursor-codex-bridge']);
+});
+
+test('install-skill refuses local edits, missing metadata, and additional files before making a backup', async t => {
+  const changes = [
+    async f => fs.appendFile(path.join(f.destination, 'SKILL.md'), '\nLocal instructions\n'),
+    async f => fs.appendFile(path.join(f.destination, 'agents', 'openai.yaml'), 'local: true\n'),
+    async f => fs.rm(path.join(f.destination, 'agents'), { recursive: true }),
+    async f => fs.writeFile(path.join(f.destination, 'extra.txt'), 'local contents'),
+    async f => fs.writeFile(path.join(f.destination, 'agents', 'extra.yaml'), 'local contents'),
+  ];
+  for (const change of changes) {
+    const f = await releasedSkillInstallation(t);
+    await change(f);
+    const before = await fs.readFile(path.join(f.destination, 'SKILL.md'), 'utf8');
+    await assert.rejects(installSkill(f.settings), /existing skill differs|Unexpected files|Unexpected or non-regular/);
+    assert.equal(await fs.readFile(path.join(f.destination, 'SKILL.md'), 'utf8'), before);
+    await assert.rejects(fs.access(path.join(path.dirname(f.parent), 'skill-backups')), { code: 'ENOENT' });
+  }
+});
+
+test('matching instructions preserve existing UI metadata without following any skill symlinks', async t => {
+  const same = await releasedSkillInstallation(t);
+  await fs.copyFile(path.join(same.destination, 'SKILL.md'), path.join(same.source, 'SKILL.md'));
+  await fs.writeFile(path.join(same.destination, 'agents', 'openai.yaml'), 'interface: customized\n');
+  assert.equal((await installSkill(same.settings)).changed, false);
+  assert.equal(await fs.readFile(path.join(same.destination, 'agents', 'openai.yaml'), 'utf8'), 'interface: customized\n');
+  for (const entry of ['SKILL.md', 'agents', 'agents/openai.yaml']) {
+    for (const matching of [false, true]) {
+      const f = await releasedSkillInstallation(t, '0.1.3', { metadata: false });
+      if (matching) await fs.copyFile(path.join(f.destination, 'SKILL.md'), path.join(f.source, 'SKILL.md'));
+      const original = path.join(f.destination, entry);
+      const target = path.join(f.directory, 'unrelated');
+      await fs.rename(original, target);
+      await fs.symlink(target, original);
+      await assert.rejects(installSkill(f.settings), /regular file|non-regular/);
+      assert.equal((await fs.lstat(original)).isSymbolicLink(), true);
+      await assert.rejects(fs.access(path.join(path.dirname(f.parent), 'skill-backups')), { code: 'ENOENT' });
+    }
+  }
+});
+
+test('a failed replacement restores the original skill and removes the staged new copy', async t => {
+  const f = await releasedSkillInstallation(t);
+  const rename = fs.rename;
+  let replacementAttempted = false;
+  fs.rename = async (from, to) => {
+    if (path.basename(from).startsWith('.install-cursor-codex-bridge-') && to === f.destination) {
+      replacementAttempted = true;
+      throw new Error('replacement failed');
+    }
+    return rename(from, to);
+  };
+  try { await assert.rejects(installSkill(f.settings), /replacement failed/); }
+  finally { fs.rename = rename; }
+  assert.equal(replacementAttempted, true);
+  assert.equal(await fs.readFile(path.join(f.destination, 'SKILL.md'), 'utf8'), f.original);
+  assert.equal(await fs.readFile(path.join(f.destination, 'agents', 'openai.yaml'), 'utf8'), releasedSkillMetadata);
+  assert.deepEqual(await fs.readdir(f.parent), ['install-cursor-codex-bridge']);
+  assert.deepEqual(await fs.readdir(path.join(path.dirname(f.parent), 'skill-backups')), []);
 });
 
 test('managementMain emits parse failures as JSON without attempting SSH', async () => {

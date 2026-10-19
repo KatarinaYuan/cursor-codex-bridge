@@ -31,6 +31,19 @@ Cursor 登录属于远端用户环境。使用正确 SSH 用户并由账号拥�
 
 如果历史路径可读而仍未发现，报告 Cursor Agent 版本、安装版本和脱敏的诊断结果，不要上传真实 transcript 或数据库。
 
+## Cursor 会话被误列为置顶，没有出现在 Recents
+
+`v0.1.4` 修复了桥接服务忽略分区筛选、把普通 Cursor 会话也返回到置顶查询中的问题。升级到该版本后，会话按实际活动时间参与原生最近列表；不会通过重写更新时间把旧会话强行排到前面，也不会改变 Cursor 会话或模型。
+
+在 laptop 任意目录运行，把 `my-dev` 换成安装时的源 SSH 别名：
+
+```sh
+npx --yes --package=https://github.com/KatarinaYuan/cursor-codex-bridge/releases/download/v0.1.4/cursor-codex-bridge-0.1.4.tgz cursor-codex upgrade --ssh my-dev
+npx --yes --package=https://github.com/KatarinaYuan/cursor-codex-bridge/releases/download/v0.1.4/cursor-codex-bridge-0.1.4.tgz cursor-codex doctor --ssh my-dev
+```
+
+原来使用自定义桥别名时，两条命令都补上相同的 `--alias my-cursor`。若升级和诊断通过而 App 仍显示旧列表，在 SSH 设置中断开桥连接后重新连接。全局最近列表有条数上限，较旧会话未进入当前列表不代表丢失；仍可在对应项目中查找。诊断和列表检查不会发送模型消息。
+
 ## 不能向现有 tmux 会话发送
 
 确认 Agent 处于同一用户的默认 tmux server，使用受支持的终端布局，并且输入框为空、当前轮次结束且没有菜单或审批。模型切换、审批和自由文本回答先在原 CLI 处理。

@@ -200,28 +200,86 @@ export async function buildRuntimeArchive({ root = packageRoot, run = runProcess
   } catch (error) { await fs.rm(temporary, { recursive: true, force: true }); throw error; }
 }
 
+// Only unmodified published skills can be replaced automatically. Keep this
+// list explicit so a local customization is never mistaken for an old release.
+const publishedSkillHashes = new Set([
+  '54096f63381f651ddac2750e2a2f4f8ecba6dc6efa0ef54631374ea009ff09e6', // v0.1.1
+  'a4cd646810201eafc5d93034c7f073bbfb88b86b44625bd9b87bf9cb3cc671f4', // v0.1.2
+  'bc235e5fad62a733abe8078aa182b3803c41c5506e1f5390240f5c2c6ec0371b', // v0.1.3
+]);
+const publishedSkillMetadataHash = '63b8acb9292c020c48526eade247f7c18ceeb6928155eb400b3071b0ff2bc027';
+const sha256 = value => createHash('sha256').update(value).digest('hex');
+
+async function readSkillFiles(directory) {
+  const stat = await fs.lstat(directory);
+  if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error('Skill destination must be a regular directory');
+  const files = new Map();
+  for (const name of await fs.readdir(directory)) {
+    const filename = path.join(directory, name);
+    const entry = await fs.lstat(filename);
+    if (name === 'agents' && entry.isDirectory() && !entry.isSymbolicLink()) {
+      const names = await fs.readdir(filename);
+      if (names.length !== 1 || names[0] !== 'openai.yaml') throw new Error(`Unexpected files in skill directory: ${filename}`);
+      const metadata = path.join(filename, 'openai.yaml');
+      if (!(await fs.lstat(metadata)).isFile()) throw new Error(`Skill file must be a regular file: ${metadata}`);
+      files.set('agents/openai.yaml', await fs.readFile(metadata));
+    } else if (name === 'SKILL.md' && entry.isFile()) files.set(name, await fs.readFile(filename));
+    else throw new Error(`Unexpected or non-regular file in skill directory: ${filename}`);
+  }
+  if (!files.has('SKILL.md')) throw new Error(`Skill is missing SKILL.md: ${directory}`);
+  return files;
+}
+
 export async function installSkill({ env = process.env, skillDir, dryRun = false, root = packageRoot } = {}) {
   const name = 'install-cursor-codex-bridge';
   const parent = path.resolve(skillDir || path.join(env.CODEX_HOME || path.join(os.homedir(), '.codex'), 'skills'));
   const destination = path.join(parent, name);
   const source = path.join(root, 'skills', name);
-  await fs.access(path.join(source, 'SKILL.md'));
+  const sourceFiles = await readSkillFiles(source);
   let exists = false;
   try { const stat = await fs.lstat(destination); exists = true; if (stat.isSymbolicLink() || !stat.isDirectory()) throw new Error('Skill destination must be a regular directory'); }
   catch (error) { if (error.code !== 'ENOENT') throw error; }
   if (exists) {
-    const sourceText = await fs.readFile(path.join(source, 'SKILL.md'), 'utf8');
-    const targetText = await fs.readFile(path.join(destination, 'SKILL.md'), 'utf8');
-    if (sourceText !== targetText) throw new Error(`An existing skill differs at ${destination}; preserve or remove it before installing this version`);
-    return { ok: true, action: 'install-skill', destination, changed: false, dryRun };
+    const targetFiles = await readSkillFiles(destination);
+    if (sourceFiles.get('SKILL.md').equals(targetFiles.get('SKILL.md'))) {
+      // Preserve the user's existing UI metadata when the instructions match.
+      return { ok: true, action: 'install-skill', destination, changed: false, dryRun };
+    }
+    if (targetFiles.size !== 2 || !publishedSkillHashes.has(sha256(targetFiles.get('SKILL.md')))
+      || sha256(targetFiles.get('agents/openai.yaml') || '') !== publishedSkillMetadataHash) {
+      throw new Error(`An existing skill differs at ${destination}; preserve or remove it before installing this version`);
+    }
   }
+  const backup = exists ? path.join(path.dirname(parent), 'skill-backups',
+    `${name}-${new Date().toISOString().replaceAll(':', '-').replaceAll('.', '-')}-${randomUUID()}`) : undefined;
   if (!dryRun) {
     await fs.mkdir(parent, { recursive: true });
     const staging = path.join(parent, `.${name}-${randomUUID()}`);
-    try { await fs.cp(source, staging, { recursive: true, errorOnExist: true, force: false }); await fs.rename(staging, destination); }
+    let backedUp = false;
+    try {
+      await fs.mkdir(staging, { mode: 0o700 });
+      for (const [name, contents] of sourceFiles) {
+        const filename = path.join(staging, name);
+        await fs.mkdir(path.dirname(filename), { recursive: true });
+        await fs.writeFile(filename, contents, { flag: 'wx', mode: 0o600 });
+      }
+      if (backup) {
+        await fs.mkdir(path.dirname(backup), { recursive: true, mode: 0o700 });
+        await fs.rename(destination, backup);
+        backedUp = true;
+      }
+      try { await fs.rename(staging, destination); }
+      catch (error) {
+        if (backedUp) {
+          try { await fs.rename(backup, destination); }
+          catch (rollbackError) { throw new Error(`Skill update failed; original skill is retained at ${backup}: ${rollbackError.message}`, { cause: error }); }
+        }
+        throw error;
+      }
+    }
     finally { await fs.rm(staging, { recursive: true, force: true }); }
   }
-  return { ok: true, action: 'install-skill', destination, changed: true, dryRun };
+  return { ok: true, action: 'install-skill', destination, changed: true, dryRun, ...(backup ? { backup } : {}) };
 }
 
 function requestFor(options, id) {
@@ -352,6 +410,7 @@ export async function managementMain(args, { env = process.env, stdout = process
       for (const check of result.checks || []) stdout.write(`  ${check.ok ? '✓' : '✗'} ${check.message}\n`);
       if (result.next) stdout.write(`${result.next}\n`);
       if (result.destination) stdout.write(`Skill: ${result.destination}\n`);
+      if (result.backup) stdout.write(`Skill backup${result.dryRun ? ' (planned)' : ''}: ${result.backup}\n`);
       if (result.retainedHistory) stdout.write(`Retained bridge history: ${result.retainedHistory}\n`);
     }
     if (!result.ok) process.exitCode = 1;

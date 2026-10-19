@@ -19,15 +19,15 @@ Use Cursor Agent and your Cursor account from the Codex desktop app's native SSH
 在 laptop 上执行，把 `my-dev` 换成你已有的 SSH 别名：
 
 ```sh
-npx --yes --package=https://github.com/KatarinaYuan/cursor-codex-bridge/releases/download/v0.1.3/cursor-codex-bridge-0.1.3.tgz cursor-codex install --ssh my-dev
+npx --yes --package=https://github.com/KatarinaYuan/cursor-codex-bridge/releases/download/v0.1.4/cursor-codex-bridge-0.1.4.tgz cursor-codex install --ssh my-dev
 ```
 
-这是 GitHub 预发布版本 `v0.1.3` 的安装包，不是 npm 同名包。`npx` 会下载该版本及其依赖，然后运行安装器。也可以从源码安装或修改：
+这是 GitHub 预发布版本 `v0.1.4` 的安装包，不是 npm 同名包。`npx` 会下载该版本及其依赖，然后运行安装器。也可以从源码安装或修改：
 
 ```sh
 git clone https://github.com/KatarinaYuan/cursor-codex-bridge.git
 cd cursor-codex-bridge
-git checkout v0.1.3
+git checkout v0.1.4
 npm ci --ignore-scripts
 node cli.mjs install --ssh my-dev
 ```
@@ -51,7 +51,7 @@ node cli.mjs install --ssh my-dev --alias my-cursor \
 以下命令在任意 laptop 目录运行，不需要克隆仓库。先为当前终端设置安装包地址：
 
 ```sh
-BRIDGE_PACKAGE_URL=https://github.com/KatarinaYuan/cursor-codex-bridge/releases/download/v0.1.3/cursor-codex-bridge-0.1.3.tgz
+BRIDGE_PACKAGE_URL=https://github.com/KatarinaYuan/cursor-codex-bridge/releases/download/v0.1.4/cursor-codex-bridge-0.1.4.tgz
 
 # 只读检查；不调用付费模型，也不向现有聊天发测试消息
 npx --yes --package="$BRIDGE_PACKAGE_URL" cursor-codex doctor --ssh my-dev
@@ -64,7 +64,7 @@ npx --yes --package="$BRIDGE_PACKAGE_URL" cursor-codex upgrade --ssh my-dev
 npx --yes --package="$BRIDGE_PACKAGE_URL" cursor-codex uninstall --ssh my-dev
 ```
 
-`doctor` 返回码为 `0` 表示检查通过、`1` 表示发现阻断问题。升级到新版本时，从 [Releases](https://github.com/KatarinaYuan/cursor-codex-bridge/releases) 取得目标版本安装包 URL，替换 `BRIDGE_PACKAGE_URL` 后运行 `upgrade`；它部署当前调用的版本，不自行选择最新版本。用同一版本再次升级也可以。
+`doctor` 返回码为 `0` 表示检查通过、`1` 表示发现阻断问题。升级到新版本时，从 [Releases](https://github.com/KatarinaYuan/cursor-codex-bridge/releases) 取得目标版本安装包 URL，替换 `BRIDGE_PACKAGE_URL` 后运行 `upgrade`；它部署当前调用的版本，不自行选择最新版本。用同一版本再次升级也可以。上面的地址已固定到包含 Recents 修复的 `v0.1.4`。升级完成后运行 `doctor`；若 App 仍缓存旧会话列表，在 SSH 设置中断开桥连接后重新连接。
 
 升级和卸载遇到进行中的桥任务会拒绝操作；等待任务结束后再运行。程序不会结束原 Cursor Agent 或清空 tmux 草稿。源码安装也可在目标版本 checkout 使用 `node cli.mjs` 执行这些子命令，参数相同。
 
@@ -77,7 +77,7 @@ npx --yes --package="$BRIDGE_PACKAGE_URL" cursor-codex uninstall --ssh my-dev
 仓库附带一个安装 skill，可安装到 laptop 的 Codex skill 目录：
 
 ```sh
-npx --yes --package=https://github.com/KatarinaYuan/cursor-codex-bridge/releases/download/v0.1.3/cursor-codex-bridge-0.1.3.tgz cursor-codex install-skill
+npx --yes --package=https://github.com/KatarinaYuan/cursor-codex-bridge/releases/download/v0.1.4/cursor-codex-bridge-0.1.4.tgz cursor-codex install-skill
 ```
 
 也可指定目录：
@@ -86,7 +86,17 @@ npx --yes --package=https://github.com/KatarinaYuan/cursor-codex-bridge/releases
 npx --yes --package="$BRIDGE_PACKAGE_URL" cursor-codex install-skill --skill-dir "$HOME/.codex/skills"
 ```
 
-这里的 `BRIDGE_PACKAGE_URL` 使用上文定义的版本地址。源码目录中也可运行 `node cli.mjs install-skill`。`--skill-dir` 指定 skill 的父目录；相同内容可重复安装，已有不同内容时拒绝覆盖，保留用户修改。
+这里的 `BRIDGE_PACKAGE_URL` 使用上文定义的版本地址。源码目录中也可运行 `node cli.mjs install-skill`。`--skill-dir` 指定 skill 的父目录。
+
+已有官方旧版 skill 的朋友也可直接运行同一条 `v0.1.4 install-skill` 命令：与目标内容相同则不改动；识别到未修改的官方 `v0.1.1`、`v0.1.2` 或 `v0.1.3` 两文件内容时，先保留旧目录备份，再原子更新，并输出备份路径。自定义内容、额外文件或符号链接会拒绝覆盖，保留用户修改，无需先手动删除旧目录。
+
+也可以一条命令升级远端桥和本机安装 skill：
+
+```sh
+npx --yes --package="$BRIDGE_PACKAGE_URL" -c 'cursor-codex upgrade --ssh my-dev && cursor-codex install-skill'
+```
+
+把 `my-dev` 换成安装时的源 SSH 别名；如原来有自定义桥别名，在 `upgrade` 后补上同一 `--alias my-cursor`。完成后运行上文的 `doctor`。单独执行 `upgrade` 只升级远端桥，不更新本机 skill。
 
 随后在 Codex 中选择该 skill，或输入：
 
@@ -101,6 +111,7 @@ npx --yes --package="$BRIDGE_PACKAGE_URL" cursor-codex install-skill --skill-dir
 | 新建聊天 | 使用 Cursor ACP，模型列表来自远端 Cursor；支持已实现的原生审批和选项提问 |
 | 既有 CLI 会话 | 扫描当前用户 Cursor 历史，保留 Cursor 会话 ID 并映射到原生聊天 |
 | 自动同步 | 默认每 2 秒发现新会话和历史更新；不发送模型请求 |
+| Recents 侧边栏 | 按会话实际活动时间显示；正确区分普通会话和置顶／自定义分区，避免把全部 Cursor 会话误列为置顶 |
 | 已有 tmux 会话 | 精确绑定原进程，尝试在同一输入框发送文字、观察回复，并用正式历史校准 |
 
 旧 CLI 会话只支持文字。tmux 内的提问、审批和模型切换需在原 Cursor CLI 处理；已有草稿、忙碌状态或无法识别的界面会阻止代发。主题、Cursor 版本和模型显示格式变化可能需要适配。
@@ -120,7 +131,7 @@ npm test
 
 测试使用模拟 Cursor 和隔离的临时数据，不发送付费模型请求。部分集成测试需要真实 Codex CLI；找不到该程序时会跳过，不能将跳过计为集成验证成功。可通过 `CURSOR_BRIDGE_TEST_REAL_CODEX` 指定可执行文件。
 
-附带尚未启用的 [GitHub Actions 模板](docs/github-actions-test.yml)，配置 Node.js 22/24、Linux/macOS。启用时将其保存为 `.github/workflows/test.yml`。真实 SSH、Codex App、Cursor 账号及现有 tmux 的组合需要单独验收。测试范围见 [v0.1.3 验证说明](docs/verification-v0.1.3.md)。欢迎附带脱敏诊断提交 issue 或 PR。
+附带尚未启用的 [GitHub Actions 模板](docs/github-actions-test.yml)，配置 Node.js 22/24、Linux/macOS。启用时将其保存为 `.github/workflows/test.yml`。真实 SSH、Codex App、Cursor 账号及现有 tmux 的组合需要单独验收。本版测试范围见 [v0.1.4 验证说明](docs/verification-v0.1.4.md)；长消息发送的历史验收见 [v0.1.3 验证说明](docs/verification-v0.1.3.md)。欢迎附带脱敏诊断提交 issue 或 PR。
 
 ## 许可证
 

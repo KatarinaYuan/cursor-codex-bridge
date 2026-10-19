@@ -360,6 +360,65 @@ test('provider filters, archive state, and unsupported chat calls cannot fall th
   assert.equal((await trace()).some(event => event.method === 'session/prompt'), false);
 });
 
+test('section filters keep unsectioned Cursor chats in Recents and paginate only matching sections', async t => {
+  const fixture = await setup(t);
+  if (!fixture) return;
+  const { client, start, temp, env, trace } = fixture;
+  await client.initialize();
+  const { thread } = await client.call('thread/start', { cwd: temp });
+  const pinnedId = '00000000-0000-7000-8000-111111111111';
+  const otherId = '00000000-0000-7000-8000-222222222222';
+  const unknownId = '00000000-0000-7000-8000-333333333333';
+  const ids = result => result.data.map(item => item.id);
+  assert.deepEqual(ids(await client.call('thread/list')), [thread.id]);
+  assert.deepEqual(ids(await client.call('thread/list', { sectionId: null })), [thread.id]);
+  for (const sectionId of [pinnedId, unknownId]) {
+    assert.deepEqual(await client.call('thread/list', { sectionId, limit: 1 }), {
+      data: [], nextCursor: null, backwardsCursor: null,
+    });
+  }
+
+  await client.close();
+  const recordPath = join(env.CODEX_HOME, 'cursor-bridge', `${thread.id}.json`);
+  const seed = JSON.parse(await readFile(recordPath, 'utf8'));
+  const pinned = { id: pinnedId, name: 'Pinned' };
+  const other = { id: otherId, name: 'Other section' };
+  const rows = [
+    { id: thread.id, recency: 60, section: null },
+    { id: '00000000-0000-7000-8000-444444444444', recency: 50, section: pinned },
+    { id: '00000000-0000-7000-8000-555555555555', recency: 40, section: other },
+    { id: '00000000-0000-7000-8000-666666666666', recency: 30, section: pinned },
+    { id: '00000000-0000-7000-8000-777777777777', recency: 20 },
+    { id: '00000000-0000-7000-8000-888888888888', recency: 70, section: pinned, archived: true },
+  ];
+  for (const row of rows) {
+    const record = structuredClone(seed);
+    record.archived = Boolean(row.archived);
+    Object.assign(record.thread, {
+      id: row.id, sessionId: row.id, recencyAt: row.recency, updatedAt: row.recency,
+      path: join(env.CODEX_HOME, 'cursor-bridge', `${row.id}.json`), section: row.section,
+    });
+    // Older records omit section entirely; they still belong to Recents.
+    if (!Object.hasOwn(row, 'section')) delete record.thread.section;
+    await writeFile(record.thread.path, JSON.stringify(record));
+  }
+  const restarted = start();
+  await restarted.initialize();
+  assert.deepEqual(ids(await restarted.call('thread/list')), rows.slice(0, 5).map(row => row.id));
+  assert.deepEqual(ids(await restarted.call('thread/list', { sectionId: null })), [rows[0].id, rows[4].id]);
+  assert.deepEqual(ids(await restarted.call('thread/list', { sectionId: otherId })), [rows[2].id]);
+  const first = await restarted.call('thread/list', { sectionId: pinnedId, limit: 1 });
+  assert.deepEqual(ids(first), [rows[1].id]);
+  assert.deepEqual(first.data[0].section, pinned);
+  assert.equal(first.nextCursor, '1');
+  const second = await restarted.call('thread/list', { sectionId: pinnedId, limit: 1, cursor: first.nextCursor });
+  assert.deepEqual(ids(second), [rows[3].id]);
+  assert.equal(second.nextCursor, null);
+  assert.deepEqual(ids(await restarted.call('thread/list', { sectionId: pinnedId, archived: true })), [rows[5].id]);
+  assert.deepEqual(ids(await restarted.call('thread/list', { sectionId: unknownId })), []);
+  assert.equal((await trace()).some(event => event.method === 'session/prompt'), false);
+});
+
 test('native approval decline is returned to Cursor without executing an approved action', async t => {
   const fixture = await setup(t);
   if (!fixture) return;
