@@ -122,7 +122,7 @@ if (process.argv[2] === '--bridge-retry-fixture') {
     const result = await fixture(t, 'valid');
     assert.equal(result.response.error, undefined);
     assert.deepEqual(result.readiness, [{ deferred: true, proven: true }, { deferred: true, proven: true }]);
-    assert.deepEqual(result.calls, ['submit-draft', 'verify-draft-at-100', 'Enter']);
+    assert.deepEqual(result.calls, ['submit-draft', 'verify-draft-at-145', 'Enter']);
     assert.equal(result.turn.status, 'completed');
     assert.equal(result.mapping, result.turn.id);
     assert.equal(result.savedTurnCount, 3);
@@ -142,7 +142,7 @@ if (process.argv[2] === '--bridge-retry-fixture') {
     assert.equal(result.response.error, undefined);
     assert.equal(result.turn.status, 'failed');
     assert.match(result.turn.error.message, /draft changed/);
-    assert.deepEqual(result.calls, ['submit-draft', 'verify-draft-at-100']);
+    assert.deepEqual(result.calls, ['submit-draft', 'verify-draft-at-145']);
     assert.equal(result.mapping, undefined);
     assert.equal(result.columns, 93);
   });

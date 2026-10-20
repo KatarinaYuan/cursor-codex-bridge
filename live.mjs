@@ -62,6 +62,7 @@ function matchesRenderedDraft(screen, text) {
   const actual = screen.inputDraft;
   const expected = actual && renderDraft(text, actual.width);
   if (!expected || !actual.caret || actual.rows.length !== expected.rows.length
+    || prelayoutRows(text, actual.width) > 6
     || actual.caret.row !== expected.caret.row || actual.caret.offset !== expected.caret.offset) return false;
   return actual.rows.every((row, index) => row.startsWith(expected.rows[index])
     && /^ *$/u.test(row.slice(expected.rows[index].length)));
@@ -76,17 +77,56 @@ function matchesViewport(screen, expected) {
       && /^ *$/u.test(row.slice(expected.rows[index].length))));
 }
 
+function prelayoutColumns(code) {
+  // Cursor's scroll layout measures raw UTF-16 units before Ink renders the
+  // string. Its width policy differs from Ink's grapheme-aware string-width.
+  if (code >= 0x300 && code <= 0x36f || code >= 0x200b && code <= 0x200d || code === 0xfeff) return 0;
+  return code >= 0x1100 && code <= 0x115f || code >= 0x2e80 && code <= 0x9fff
+    || code >= 0xac00 && code <= 0xd7af || code >= 0xf900 && code <= 0xfaff
+    || code >= 0xfe30 && code <= 0xfe4f || code >= 0xff00 && code <= 0xff60
+    || code >= 0xffe0 && code <= 0xffe6 ? 2 : 1;
+}
+
+function prelayoutRows(text, width) {
+  let rows = 0;
+  for (const line of text.split('\n')) {
+    let start = 0, column = 0, lastSpace = -1, index = 0;
+    while (index < line.length) {
+      const cells = prelayoutColumns(line.charCodeAt(index));
+      if (column + cells > width && index > start) {
+        rows++;
+        // The scroll layout keeps the breaking space on the previous row.
+        // Breaking a long CJK word can therefore create an extra short row,
+        // even when Ink would fit the full draft in six rows.
+        if (lastSpace >= start && line[index] !== ' ') index = lastSpace + 1;
+        start = index; column = 0; lastSpace = -1;
+        continue;
+      }
+      column += cells;
+      if (line[index] === ' ') lastSpace = index;
+      index++;
+    }
+    rows++;
+  }
+  return rows;
+}
+
+const fullInlineDraftFits = (text, width) => prelayoutRows(text, width) <= 6
+  && renderDraft(text, width)?.rows.length <= 6;
+
 function minimumInputColumns(text, width) {
   // Cursor folds pastes longer than 800 UTF-16 code units into a saved token.
   // Smaller pastes stay inline, in a viewport capped at six visual rows.
   if (text.length > 800) return undefined;
   if (!Number.isSafeInteger(width) || width < 1) throw new Error('The Cursor input width could not be verified; no text was pasted');
-  if (renderDraft(text, width)?.rows.length <= 6) return undefined;
+  // Both layouts must retain the full draft: Cursor clips its own word-wrapped
+  // rows before Ink performs the final render used by exact verification.
+  if (fullInlineDraftFits(text, width)) return undefined;
   if (text.split('\n').length > 6) {
     return Math.max(width + 7, draftViewportColumns(text));
   }
   for (let candidate = width + 1; candidate <= 1000; candidate++) {
-    if (renderDraft(text, candidate)?.rows.length <= 6) return candidate + 7;
+    if (fullInlineDraftFits(text, candidate)) return candidate + 7;
   }
   throw new Error('This Cursor message cannot fit within six visible input rows at the supported terminal width; no text was pasted');
 }

@@ -142,6 +142,21 @@ class NarrowTmuxClient extends MockTmuxClient {
   }
 }
 
+// An independently captured layout counterexample, using only synthetic text.
+// Cursor's scroll layout produces seven rows at input width 86, although Ink
+// alone produces five. The TUI drops the first 43 CJK characters before Ink.
+const preclippedPrompt = Array(3).fill('中'.repeat(44)).join(' ') + '\n';
+const preclippedViewport = `中 \n${'中'.repeat(43)}\n中 \n${'中'.repeat(43)}\n中\n`;
+class PreclippedTmuxClient extends NarrowTmuxClient {
+  async capture(paneId) {
+    if (this.draft === preclippedPrompt && this.columns === 93) {
+      this.raw = sizedFrame(this.columns, preclippedViewport, this.overlay);
+      return MockTmuxClient.prototype.capture.call(this, paneId);
+    }
+    return super.capture(paneId);
+  }
+}
+
 // Independent no-soft-wrap transcription of Cursor's observed layout: LF and
 // empty-line offsets miss its half-open line lookup and fall back to line zero.
 // This fake transports exact cursor keys and edits; it never calls the planner.
@@ -524,7 +539,7 @@ const retryFor = (text, overrides = {}) => ({ text, proof: {
   model: 'composer-2.5[fast=true]', sourceTurnIds: ['old'], ...overrides,
 } });
 
-test('a narrow terminal automatically exposes a seven-row wrapped message for exact verification', async t => {
+test('a narrow terminal automatically exposes a clipped wrapped message for exact verification', async t => {
   const clipped = parseCursorScreen(sizedFrame(93, narrowWrapper), { knownCursor: true });
   assert.equal(narrowWrapper.length < 800, true, 'Cursor does not collapse this message to a paste token');
   assert.equal(clipped.inputDraft.width, 86);
@@ -536,8 +551,8 @@ test('a narrow terminal automatically exposes a seven-row wrapped message for ex
   response.catch(() => {});
   await Promise.race([client.submitted, response]);
   await new Promise(resolve => setImmediate(resolve));
-  assert.deepEqual(client.minimumColumnRequests, [100], '93 input columns plus seven frame columns expose all six rows');
-  assert.deepEqual(client.columnTransactions, [{ requested: 100, active: 100, restored: 93 }]);
+  assert.deepEqual(client.minimumColumnRequests, [145], 'Both the scroll layout and Ink must expose at most six rows');
+  assert.deepEqual(client.columnTransactions, [{ requested: 145, active: 145, restored: 93 }]);
   assert.equal(client.draft, narrowWrapper, 'the complete original message is pasted without rewriting it');
   assert.deepEqual(client.calls.map(call => call.type), ['paste-request', 'paste', 'Enter']);
   session.acceptHistory(history([turn('old', 'Earlier question'), turn('narrow-native', narrowWrapper)]));
@@ -545,7 +560,7 @@ test('a narrow terminal automatically exposes a seven-row wrapped message for ex
 });
 
 test('a wrapped message already within six visual rows does not resize the terminal', async t => {
-  const prompt = narrowWrapper.replace('R'.repeat(260), 'R'.repeat(170));
+  const prompt = narrowWrapper.replace('R'.repeat(260), 'R'.repeat(150));
   const { session, client } = await start(t, { client: new NarrowTmuxClient() });
   const response = session.prompt([{ type: 'text', text: prompt }]);
   response.catch(() => {});
@@ -553,6 +568,44 @@ test('a wrapped message already within six visual rows does not resize the termi
   assert.deepEqual(client.minimumColumnRequests, [undefined]);
   session.acceptHistory(history([turn('old', 'Earlier question'), turn('fitting-native', prompt)]));
   assert.equal((await response).sourceTurn.id, 'fitting-native');
+});
+
+test('automatic width planning exposes the full draft when Cursor preclips seven rows that Ink renders in five', async t => {
+  const inkOnly = wrapAnsi(`${preclippedPrompt}\x1b[7m \x1b[27m`, 86, { trim: false, hard: true }).split('\n');
+  assert.equal(inkOnly.length, 5);
+  assert.equal(preclippedPrompt.length, 135);
+  const clipped = parseCursorScreen(sizedFrame(93, preclippedViewport), { knownCursor: true });
+  assert.equal(clipped.inputDraft.rows.length, 6);
+  assert.equal(clipped.inputDraft.rows[0].startsWith('中 '), true, 'The first full CJK row was clipped before Ink rendered');
+  const { session, client } = await start(t, { client: new PreclippedTmuxClient() });
+  const response = session.prompt([{ type: 'text', text: preclippedPrompt }]);
+  response.catch(() => {});
+  await Promise.race([client.submitted, response]);
+  assert.deepEqual(client.minimumColumnRequests, [95], 'Input width 88 exposes both complete layouts');
+  assert.equal(client.draft, preclippedPrompt);
+  assert.deepEqual(client.calls.map(call => call.type), ['paste-request', 'paste', 'Enter']);
+  session.acceptHistory(history([turn('old', 'Earlier question'), turn('preclipped-native', preclippedPrompt)]));
+  assert.equal((await response).sourceTurn.id, 'preclipped-native');
+  assert.equal(client.columns, 93);
+});
+
+test('a failed preclipped draft widens before retry and sends one Enter without another paste', async t => {
+  const { session, client } = await start(t, { client: new PreclippedTmuxClient(preclippedPrompt) });
+  const response = session.prompt([{ type: 'text', text: preclippedPrompt }], { retryDraft: retryFor(preclippedPrompt) });
+  response.catch(() => {});
+  await Promise.race([client.submitted, response]);
+  assert.deepEqual(client.minimumColumnRequests, [95]);
+  assert.deepEqual(client.calls.map(call => call.type), ['submit-draft-request', 'Enter']);
+  assert.equal(client.draft, preclippedPrompt);
+  session.acceptHistory(history([turn('old', 'Earlier question'), turn('preclipped-retry', preclippedPrompt)]));
+  assert.equal((await response).sourceTurn.id, 'preclipped-retry');
+});
+
+test('a complete-looking Ink frame cannot prove a draft that Cursor would have preclipped', async t => {
+  const { session } = await start(t);
+  const inkOnlyFrame = parseCursorScreen(sizedFrame(93, preclippedPrompt), { knownCursor: true });
+  assert.equal(inkOnlyFrame.inputDraft.rows.length, 5);
+  assert.equal(await session.matchesDraft(inkOnlyFrame, preclippedPrompt), false);
 });
 
 test('automatic width planning counts wide Chinese cells when exposing the complete draft', async t => {
@@ -579,7 +632,7 @@ test('a clipped failed draft retries at a verifiable width with one Enter and no
   response.catch(() => {});
   await Promise.race([client.submitted, response]);
   await new Promise(resolve => setImmediate(resolve));
-  assert.deepEqual(client.minimumColumnRequests, [100]);
+  assert.deepEqual(client.minimumColumnRequests, [145]);
   assert.deepEqual(client.calls.map(call => call.type), ['submit-draft-request', 'Enter']);
   assert.equal(client.draft, narrowWrapper);
   assert.equal(client.columns, 93);
@@ -592,7 +645,7 @@ test('a changed hidden first line cannot authorize retry after automatic widenin
   const { session, client } = await start(t, { client: new NarrowTmuxClient(changed) });
   const error = await session.prompt([{ type: 'text', text: narrowWrapper }], { retryDraft: retryFor(narrowWrapper) }).catch(error => error);
   assert.match(error.message, /draft changed/);
-  assert.deepEqual(client.minimumColumnRequests, [100]);
+  assert.deepEqual(client.minimumColumnRequests, [145]);
   assert.deepEqual(client.calls.map(call => call.type), ['submit-draft-request']);
   assert.equal(client.columns, 93);
   assert.equal(client.draft, changed, 'a person\'s changed draft is retained intact');
