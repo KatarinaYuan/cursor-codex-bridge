@@ -432,6 +432,7 @@ export class TmuxSession extends EventEmitter {
       const plan = completeDraftPlan(enriched, width);
       const first = plan.pages[0];
       const tail = draftViewportSnapshot(enriched, width, { offset: enriched.length, scrollOffset: Math.max(0, enriched.split('\n').length - 6), maxLength: 1024 });
+      let lastVerifiedViewport;
       const observe = async expected => {
         for (let attempt = 0; attempt < 15; attempt++) {
           diagnostic = { version: 1, phase: diagnostic.phase, operation: 'context',
@@ -451,6 +452,18 @@ export class TmuxSession extends EventEmitter {
             && slashCompletionOffset(enriched, expected.offset);
           const completionClosing = noMatches && !completion
             && viewportMismatch(screen, expected, width, true) === 'none';
+          const previous = lastVerifiedViewport;
+          const actual = screen.inputDraft;
+          const nextLength = previous && enriched.codePointAt(previous.offset) > 0xffff ? 2 : 1;
+          const staleCompletion = noMatches && diagnostic.phase === 'scan' && previous
+            && expected.offset === previous.offset + nextLength
+            && (slashCompletionOffset(enriched, previous.offset) || slashCompletionOffset(enriched, expected.offset))
+            && actual?.caret
+            && screen.inputWidth === previous.width
+            && actual.caret.row === previous.caret.row
+            && actual.caret.offset === previous.caret.offset
+            && actual.rows.length === previous.rows.length
+            && actual.rows.every((row, index) => row === previous.rows[index]);
           Object.assign(diagnostic, { actualWidth: multilineMeasurement('actualWidth', screen.inputWidth),
             actualRows: multilineMeasurement('actualRows', screen.inputDraft?.rows.length),
             actualCaretRow: multilineMeasurement('actualCaretRow', screen.inputDraft?.caret?.row),
@@ -465,17 +478,22 @@ export class TmuxSession extends EventEmitter {
           } else if (completion && diagnostic.mismatch === 'none') {
             diagnostic.operation = 'model';
             this.requireModel(expectedModel);
-          } else if (completionClosing) {
+          } else if (completionClosing || staleCompletion) {
             // The menu can trail a cursor move by one render. Keep observing
-            // this exact frame until the ordinary footer returns; this frame
-            // cannot authorize another movement, edit or final submission.
+            // an exact previous frame until this one matches, or an exact
+            // closing frame until the ordinary footer returns. Neither can
+            // authorize another movement, edit or final submission.
             diagnostic.operation = 'model';
             this.requireModel(expectedModel);
           } else if (screen.busy || screen.reason === 'unrecognized-footer-or-overlay') {
             throw new Error(`Cursor input changed during multiline verification (${screen.reason}); no Enter was sent`);
           }
           diagnostic.operation = 'capture';
-          if (diagnostic.mismatch === 'none') return;
+          if (diagnostic.mismatch === 'none') {
+            lastVerifiedViewport = { offset: expected.offset, width: screen.inputWidth,
+              rows: [...screen.inputDraft.rows], caret: { ...screen.inputDraft.caret } };
+            return;
+          }
           await new Promise(resolve => setTimeout(resolve, 40));
         }
         throw new Error('The complete multiline Cursor draft or its cursor position could not be verified; no Enter was sent');

@@ -854,6 +854,23 @@ const attachmentPrompt = `\n# Files mentioned by the user:\n\n## example.mp4: ${
 const attachmentSlash = attachmentPrompt.indexOf(attachmentPath);
 const inAttachmentSlash = offset => offset >= attachmentSlash && offset <= attachmentSlash + attachmentPath.length;
 
+function replayPreviousSlashFrame(client, { offset, previousOffset = offset - 1, lag, alter = raw => raw }) {
+  const state = { captures: 0, moves: undefined, previous: undefined };
+  client.alterDraftFrame = raw => {
+    if (!client.marker) return raw;
+    if (client.offset === previousOffset) state.previous = raw;
+    if (client.offset !== offset) return raw;
+    const moves = client.calls.filter(call => call.type === 'move').length;
+    state.moves ??= moves;
+    assert.equal(moves, state.moves, 'settling may only capture, never move the cursor');
+    if (++state.captures > lag) return raw;
+    assert.ok(state.previous, 'the previous viewport must have already been observed');
+    const stale = state.previous.replace(`  ${dim(client.footer)}\n  ${dim('/fixture/project')}`, `     ${dim('No matches')}`);
+    return alter(stale);
+  };
+  return state;
+}
+
 test('an attachment wrapper scans the exact empty slash completion and submits once after ordinary EOF verification', async t => {
   assert.equal(attachmentPrompt.split('\n').length, 11);
   assert.ok(attachmentPrompt.length <= 800);
@@ -870,6 +887,92 @@ test('an attachment wrapper scans the exact empty slash completion and submits o
   session.acceptHistory(history([turn('old', 'Earlier question'), turn('attachment', attachmentPrompt)]));
   assert.equal((await response).sourceTurn.id, 'attachment');
 });
+
+for (const lag of [1, 2]) {
+  for (const position of ['activation', 'inside', 'closing', 'two-unit-codepoint']) {
+    test(`an exact previous slash viewport settles after ${lag} captures at ${position} without extra keys`, async t => {
+      const prompt = position === 'two-unit-codepoint' ? attachmentPrompt.replaceAll('example.mp4', 'e🧪.mp4') : attachmentPrompt;
+      const filename = position === 'two-unit-codepoint' ? attachmentPath.replace('example.mp4', 'e🧪.mp4') : attachmentPath;
+      const startOffset = prompt.indexOf(filename), endOffset = startOffset + filename.length;
+      const offset = position === 'activation' ? startOffset : position === 'closing' ? endOffset + 1
+        : position === 'two-unit-codepoint' ? prompt.indexOf('🧪', startOffset) + 2 : startOffset + 5;
+      const { session, client } = await start(t, { client: new PagedTmuxClient() });
+      client.completionAt = offset => offset >= startOffset && offset <= endOffset;
+      const stale = replayPreviousSlashFrame(client, { offset, lag,
+        previousOffset: offset - (position === 'two-unit-codepoint' ? 2 : 1) });
+      const response = session.prompt([{ type: 'text', text: prompt }]);
+      response.catch(() => {});
+      await Promise.race([client.submitted, response]);
+      assert.equal(stale.captures, lag + 1);
+      assert.equal(client.calls.filter(call => call.type === 'move').length, [...prompt].length + 32 + 6);
+      assert.equal(client.calls.filter(call => call.type === 'remove-marker').length, 1);
+      assert.equal(client.calls.filter(call => call.type === 'Enter').length, 1);
+      assert.equal(client.draft, prompt);
+      session.acceptHistory(history([turn('old', 'Earlier question'), turn('settled-slash', prompt)]));
+      assert.equal((await response).sourceTurn.id, 'settled-slash');
+    });
+  }
+}
+
+test('a persistent exact previous slash viewport exhausts capture retries without moving or submitting', async t => {
+  const { session, client } = await start(t, { client: new PagedTmuxClient() });
+  client.completionAt = inAttachmentSlash;
+  const offset = attachmentSlash + 5;
+  const stale = replayPreviousSlashFrame(client, { offset, lag: Infinity });
+  const error = await session.prompt([{ type: 'text', text: attachmentPrompt }]).catch(error => error);
+  assert.equal(error.message, UNSUBMITTED_ANCHORED_DRAFT_ERROR);
+  assert.equal(error.multilineVerification.phase, 'scan');
+  assert.equal(error.multilineVerification.offset, offset);
+  assert.equal(error.multilineVerification.mismatch, 'caret-offset');
+  assert.equal(error.multilineVerification.attempt, 15);
+  assert.equal(stale.captures, 15);
+  assert.equal(client.calls.filter(call => call.type === 'move').length, stale.moves);
+  assert.equal(client.calls.some(call => ['remove-marker', 'Enter'].includes(call.type)), false);
+  assert.equal(client.draft, attachmentPrompt + error.verificationAnchor.suffix);
+});
+
+for (const change of ['unknown-menu', 'row-content', 'caret-missing', 'older-frame']) {
+  test(`a previous slash viewport with ${change} fails immediately without further input`, async t => {
+    const { session, client } = await start(t, { client: new PagedTmuxClient() });
+    client.completionAt = inAttachmentSlash;
+    const offset = attachmentSlash + 5;
+    const stale = replayPreviousSlashFrame(client, { offset, lag: Infinity,
+      previousOffset: offset - (change === 'older-frame' ? 2 : 1),
+      alter: raw => change === 'unknown-menu' ? raw.replace('No matches', 'Choose a command')
+        : change === 'row-content' ? raw.replace('## example.mp4:', '## altered.mp4:')
+          : change === 'caret-missing' ? raw.replace(/\x1b\[(?:7|27)m/gu, '') : raw });
+    const error = await session.prompt([{ type: 'text', text: attachmentPrompt }]).catch(error => error);
+    assert.equal(error.message, UNSUBMITTED_ANCHORED_DRAFT_ERROR);
+    assert.equal(error.multilineVerification.phase, 'scan');
+    assert.equal(error.multilineVerification.attempt, 1);
+    assert.equal(stale.captures, 1);
+    assert.equal(client.calls.filter(call => call.type === 'move').length, stale.moves);
+    assert.equal(client.calls.some(call => ['remove-marker', 'Enter'].includes(call.type)), false);
+    assert.equal(client.draft, attachmentPrompt + error.verificationAnchor.suffix);
+  });
+}
+
+for (const change of ['lease', 'source', 'epoch', 'model', 'session']) {
+  test(`an exact stale slash viewport still rejects a ${change} change before any further key`, async t => {
+    const { session, client } = await start(t, { client: new PagedTmuxClient() });
+    client.completionAt = inAttachmentSlash;
+    const stale = replayPreviousSlashFrame(client, { offset: attachmentSlash + 5, lag: Infinity, alter: raw => {
+      if (change === 'lease') client.leaseActive = false;
+      if (change === 'source') session.history = history([turn('old', 'Earlier question'), turn('elsewhere', 'Another turn')]);
+      if (change === 'epoch') session.setVerified(false);
+      if (change === 'model') session.model = 'changed-model';
+      if (change === 'session') session.sessionId = 'changed-session';
+      return raw;
+    } });
+    const error = await session.prompt([{ type: 'text', text: attachmentPrompt }]).catch(error => error);
+    assert.equal(error.message, UNSUBMITTED_ANCHORED_DRAFT_ERROR);
+    assert.equal(error.multilineVerification.phase, 'scan');
+    assert.equal(error.multilineVerification.operation, 'context');
+    assert.equal(stale.captures, 1);
+    assert.equal(client.calls.filter(call => call.type === 'move').length, stale.moves);
+    assert.equal(client.calls.some(call => ['remove-marker', 'Enter'].includes(call.type)), false);
+  });
+}
 
 for (const lag of [1, 2]) {
   test(`slash completion closing after ${lag} captures waits without extra cursor movement`, async t => {

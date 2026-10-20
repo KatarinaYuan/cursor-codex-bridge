@@ -673,7 +673,7 @@ test('install-skill routes locally and rejects a symlink destination', async t =
   assert.deepEqual(await fs.readdir(target), []);
 });
 
-async function releasedSkillInstallation(t, version = '0.1.10', { customParent = false, metadata = true } = {}) {
+async function releasedSkillInstallation(t, version = '0.1.11', { customParent = false, metadata = true } = {}) {
   const directory = await temporary(t);
   const root = path.join(directory, 'package');
   const source = path.join(root, 'skills', 'install-cursor-codex-bridge');
@@ -687,7 +687,7 @@ async function releasedSkillInstallation(t, version = '0.1.10', { customParent =
     await fs.writeFile(path.join(source, 'agents', 'openai.yaml'), releasedSkillMetadata);
   }
   await fs.mkdir(path.join(destination, 'agents'), { recursive: true });
-  const original = ['0.1.4', '0.1.5', '0.1.6', '0.1.7', '0.1.8', '0.1.9', '0.1.10'].includes(version)
+  const original = ['0.1.4', '0.1.5', '0.1.6', '0.1.7', '0.1.8', '0.1.9', '0.1.10', '0.1.11'].includes(version)
     ? await fs.readFile(new URL(`./fixtures/install-skill-v${version}.md`, import.meta.url), 'utf8')
     : releasedSkill.replaceAll('0.1.3', version);
   await fs.writeFile(path.join(destination, 'SKILL.md'), original);
@@ -697,7 +697,7 @@ async function releasedSkillInstallation(t, version = '0.1.10', { customParent =
 }
 
 test('install-skill safely upgrades each unmodified published release and retains its complete backup', async t => {
-  for (const version of ['0.1.1', '0.1.2', '0.1.3', '0.1.4', '0.1.5', '0.1.6', '0.1.7', '0.1.8', '0.1.9', '0.1.10']) {
+  for (const version of ['0.1.1', '0.1.2', '0.1.3', '0.1.4', '0.1.5', '0.1.6', '0.1.7', '0.1.8', '0.1.9', '0.1.10', '0.1.11']) {
     const f = await releasedSkillInstallation(t, version, { customParent: version === '0.1.2' });
     const result = await installSkill(f.settings);
     assert.equal(result.changed, true);
@@ -741,6 +741,12 @@ test('the v0.1.10 upgrade fixture and UI metadata match the published official f
   assert.equal(createHash('sha256').update(releasedSkillMetadata).digest('hex'), '63b8acb9292c020c48526eade247f7c18ceeb6928155eb400b3071b0ff2bc027');
 });
 
+test('the v0.1.11 upgrade fixture and UI metadata match the published official file hashes', async () => {
+  const original = await fs.readFile(new URL('./fixtures/install-skill-v0.1.11.md', import.meta.url));
+  assert.equal(createHash('sha256').update(original).digest('hex'), '5cc08aeb33c7101fd017b13a0d196709c2f7665ae47b59793ec91e932946d0fa');
+  assert.equal(createHash('sha256').update(releasedSkillMetadata).digest('hex'), '63b8acb9292c020c48526eade247f7c18ceeb6928155eb400b3071b0ff2bc027');
+});
+
 test('an upgrade dry run reports the planned backup without creating or modifying files', async t => {
   const f = await releasedSkillInstallation(t);
   const result = await installSkill({ ...f.settings, dryRun: true });
@@ -752,7 +758,7 @@ test('an upgrade dry run reports the planned backup without creating or modifyin
   assert.deepEqual(await fs.readdir(f.parent), ['install-cursor-codex-bridge']);
 });
 
-test('install-skill preserves customized v0.1.10 instructions, metadata, and additional files before making a backup', async t => {
+test('install-skill preserves customized v0.1.11 instructions, metadata, and additional files before making a backup', async t => {
   const contents = async directory => Object.fromEntries(await Promise.all((await fs.readdir(directory, { recursive: true })).sort().map(async name => {
     const filename = path.join(directory, name);
     return [name, (await fs.lstat(filename)).isDirectory() ? null : await fs.readFile(filename, 'utf8')];
