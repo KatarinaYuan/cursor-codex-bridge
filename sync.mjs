@@ -31,12 +31,67 @@ function freshId(id, used) {
   return `${id}:sync:${number}`;
 }
 
+const detachedObserverError = 'Cursor tmux observer detached; the original Agent keeps running in tmux';
+
+function canonicalSourceCard(card, source, sync) {
+  if (!card || card.status !== 'completed'
+    || JSON.stringify(card.sourceIdentity) !== JSON.stringify(source.sourceIdentity)
+    || card.sourceTimestampMinute !== source.sourceTimestampMinute
+    || card.items?.length !== source.items.length) return false;
+  return source.items.every((item, index) => {
+    const counterpart = card.items[index];
+    if (!counterpart || sync.sourceItems[item.id] !== counterpart.id
+      || counterpart.type === 'userMessage' && counterpart.clientId != null) return false;
+    const { id: sourceId, ...sourceBody } = item;
+    const { id: nativeId, ...nativeBody } = counterpart;
+    return JSON.stringify(sourceBody) === JSON.stringify(nativeBody);
+  });
+}
+
+/** Restore display chronology without deriving ownership of an unbound send. */
+function orderDetachedPreviews(record, history, sync) {
+  if (record.cursorSessionId !== history.id || !record.thread.cwd || record.thread.cwd !== history.cwd) return false;
+  const turns = record.thread.turns;
+  let changed = false;
+  for (const turn of [...turns]) {
+    const users = (turn.items || []).filter(item => item.type === 'userMessage');
+    const preview = turn.items?.find(item => item.id === record.livePreviewIds?.[turn.id]);
+    if (turn.status !== 'failed' || turn.error?.message !== detachedObserverError || turn.unsubmittedDraft
+      || users.length !== 1 || typeof users[0].clientId !== 'string' || !users[0].clientId.trim()
+      || typeof users[0].id !== 'string' || !users[0].id
+      || preview?.type !== 'agentMessage' || record.liveSourcePreviews?.[turn.id] === true
+      || !Number.isSafeInteger(turn.startedAt) || turn.startedAt <= 0
+      || own(record.tmuxObserverTurns || {}, turn.id)
+      || Object.values(sync.sourceTurns).includes(turn.id)
+      || Object.values(sync.sourceItems).includes(users[0].id)) continue;
+    const prompt = turnUser(turn);
+    if (!prompt) continue;
+    // Text only narrows which independent card needs a chronology check. It
+    // never establishes a source mapping or a submission/observer proof.
+    const matching = (history.turns || []).filter(source => turnUser(source) === prompt);
+    if (matching.length !== 1) continue;
+    const source = matching[0];
+    if (!stableSourceTurn(source, history) || source.status !== 'completed'
+      || !history.completedTurnIds?.includes(source.id)
+      || !Number.isSafeInteger(source.sourceTimestampMinute) || source.sourceTimestampMinute % 60_000 !== 0
+      || source.sourceTimestampMinute <= turn.startedAt * 1000) continue;
+    const card = turns.find(candidate => candidate.id === sync.sourceTurns[source.id]);
+    if (!canonicalSourceCard(card, source, sync)) continue;
+    const from = turns.indexOf(turn), to = turns.indexOf(card);
+    if (from <= to) continue;
+    turns.splice(from, 1);
+    turns.splice(to, 0, turn);
+    changed = true;
+  }
+  return changed;
+}
+
 /**
  * Pure, idempotent merge. Metadata changes count as changed so callers persist
  * the source-to-native ID bindings even when an echoed CLI turn adds no UI data.
  */
 export function reconcileHistory(record, history) {
-  const unchanged = { changed: false, record, turnsChanged: [], nameChanged: false };
+  const unchanged = { changed: false, record, turnsChanged: [], nameChanged: false, orderChanged: false };
   if (record?.backend !== 'legacy' || !record.thread || !history
     || (record.cursorSessionId && history.id !== record.cursorSessionId)) return unchanged;
 
@@ -218,6 +273,7 @@ export function reconcileHistory(record, history) {
     if (!before || JSON.stringify(before) !== JSON.stringify(native)) changes.push({ before, after: clone(native) });
   }
 
+  const orderChanged = orderDetachedPreviews(next, history, sync);
   let nameChanged = false;
   if (typeof history.title === 'string' && history.title.trim()) {
     const title = history.title.trim();
@@ -237,5 +293,5 @@ export function reconcileHistory(record, history) {
     next.thread.recencyAt = Math.max(Number(next.thread.recencyAt) || 0, updatedAt);
   }
   const changed = JSON.stringify(record) !== JSON.stringify(next);
-  return changed ? { changed, record: next, turnsChanged: changes, nameChanged } : unchanged;
+  return changed ? { changed, record: next, turnsChanged: changes, nameChanged, orderChanged } : unchanged;
 }

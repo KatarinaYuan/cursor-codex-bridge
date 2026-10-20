@@ -1051,7 +1051,9 @@ test('a recovered external source stays blocked after its observed envelope lost
   assert.match(pending.identityError.message, /ambiguous/);
 });
 
-test('verification revoked after Enter prevents a new durable source claim', async t => {
+const settleBinding = () => new Promise(resolve => setImmediate(resolve));
+
+test('verification restored after Enter durably binds the same source without sending again', async t => {
   const { session, client } = await start(t, { source: stampedHistory([]) });
   let claims = 0;
   session.onSubmittedSource = async () => { claims++; };
@@ -1059,10 +1061,211 @@ test('verification revoked after Enter prevents a new durable source claim', asy
   response.catch(() => {});
   await client.submitted; await Promise.resolve();
   session.setVerified(false);
-  session.acceptHistory(stampedHistory([['user', stampedPrompt('New question')], ['assistant', 'Reply']]));
-  await Promise.resolve(); await Promise.resolve();
+  const complete = stampedHistory([['user', stampedPrompt('New question')], ['assistant', 'Reply']]);
+  session.acceptHistory(complete);
+  const pending = session.pending;
+  const sourceTurnId = pending.sourceTurnId;
+  await settleBinding();
   assert.equal(claims, 0);
-  assert.equal(session.pending.bindingError instanceof Error, true);
+  assert.equal(pending.bindingPromise, undefined, 'an unverified TUI must not begin persistence');
+  session.setVerified(true);
+  session.acceptHistory(complete);
+  assert.equal((await response).sourceTurn.id, sourceTurnId);
+  assert.equal(claims, 1);
+  assert.equal(pending.bindingComplete, true);
+  assert.equal(pending.bindingError, null);
+  assert.equal(client.calls.filter(call => call.type === 'paste').length, 1);
+  assert.equal(client.calls.filter(call => call.type === 'Enter').length, 1);
+});
+
+test('verification revoked before a scheduled binding retries under the new epoch', async t => {
+  const { session, client } = await start(t, { source: stampedHistory([]) });
+  let claims = 0;
+  session.onSubmittedSource = async () => { claims++; };
+  const pending = session.begin('native', 'Continue'); pending.submitted = true;
+  const complete = stampedHistory([['user', stampedPrompt('Continue')], ['assistant', 'Reply']]);
+  session.acceptHistory(complete);
+  const sourceTurnId = pending.sourceTurnId;
+  session.setVerified(false);
+  await settleBinding();
+  assert.equal(claims, 0);
+  assert.match(pending.bindingError.message, /not verified/);
+  session.setVerified(true);
+  session.acceptHistory(complete);
+  assert.equal((await pending.promise).sourceTurn.id, sourceTurnId);
+  assert.equal(claims, 1);
+  assert.equal(pending.bindingError, null);
+  assert.deepEqual(client.calls, []);
+});
+
+test('temporary persistence failure retries only the pinned source after backoff', async t => {
+  const { session, client } = await start(t, { source: stampedHistory([]) });
+  let clock = session.now(), attempts = 0;
+  session.now = () => clock;
+  const sources = [];
+  session.onSubmittedSource = async event => {
+    sources.push(event.sourceTurn.id);
+    assert.equal(event.isCurrent(), true);
+    if (++attempts === 1) throw new Error('Fixture storage temporarily unavailable');
+  };
+  const pending = session.begin('native', 'Continue'); pending.submitted = true;
+  const complete = stampedHistory([['user', stampedPrompt('Continue')], ['assistant', 'Reply']]);
+  session.acceptHistory(complete);
+  await settleBinding();
+  assert.match(pending.bindingError.message, /temporarily unavailable/);
+  for (let count = 0; count < 10; count++) session.acceptHistory(complete);
+  clock += 999;
+  session.acceptHistory(complete);
+  await settleBinding();
+  assert.equal(attempts, 1);
+  clock++;
+  session.acceptHistory(complete);
+  assert.equal((await pending.promise).sourceTurn.id, sources[0]);
+  session.acceptHistory(complete);
+  await settleBinding();
+  assert.equal(attempts, 2);
+  assert.deepEqual(sources, [pending.sourceTurnId, pending.sourceTurnId]);
+  assert.equal(pending.bindingError, null);
+  assert.deepEqual(client.calls, []);
+});
+
+test('durable source binding is single flight and successful binding is never repeated', async t => {
+  const { session, client } = await start(t, { source: stampedHistory([]) });
+  let release, attempts = 0, resolved = false;
+  const held = new Promise(resolve => { release = resolve; });
+  session.onSubmittedSource = async event => { attempts++; await held; assert.equal(event.isCurrent(), true); };
+  const pending = session.begin('native', 'Continue'); pending.submitted = true;
+  pending.promise.then(() => { resolved = true; });
+  const rows = [['user', stampedPrompt('Continue')], ['assistant', 'Reply']];
+  const incomplete = stampedHistory(rows, false);
+  session.acceptHistory(incomplete);
+  await settleBinding();
+  for (let count = 0; count < 10; count++) session.acceptHistory(incomplete);
+  await settleBinding();
+  assert.equal(attempts, 1);
+  assert.equal(resolved, false);
+  release();
+  await settleBinding();
+  assert.equal(pending.bindingComplete, true);
+  for (let count = 0; count < 10; count++) session.acceptHistory(incomplete);
+  session.acceptHistory(stampedHistory(rows));
+  await pending.promise;
+  assert.equal(attempts, 1);
+  assert.deepEqual(client.calls, []);
+});
+
+test('verification changing during persistence invalidates its attempt and safely retries the same source', async t => {
+  const { session, client } = await start(t, { source: stampedHistory([]) });
+  let release, attempts = 0, firstCurrent;
+  const held = new Promise(resolve => { release = resolve; });
+  session.onSubmittedSource = async event => {
+    if (++attempts === 1) { await held; firstCurrent = event.isCurrent(); }
+    else assert.equal(event.isCurrent(), true);
+  };
+  const pending = session.begin('native', 'Continue'); pending.submitted = true;
+  const complete = stampedHistory([['user', stampedPrompt('Continue')], ['assistant', 'Reply']]);
+  session.acceptHistory(complete);
+  await settleBinding();
+  const sourceTurnId = pending.sourceTurnId;
+  session.setVerified(false);
+  session.setVerified(true);
+  session.acceptHistory(complete);
+  assert.equal(attempts, 1, 'verification changes cannot start a parallel attempt');
+  release();
+  await settleBinding();
+  assert.equal(firstCurrent, false);
+  assert.equal(pending.bindingComplete, undefined);
+  assert.match(pending.bindingError.message, /changed while/);
+  session.acceptHistory(complete);
+  assert.equal((await pending.promise).sourceTurn.id, sourceTurnId);
+  assert.equal(attempts, 2);
+  assert.equal(pending.bindingError, null);
+  assert.deepEqual(client.calls, []);
+});
+
+test('a pinned source disappearing or being replaced by the same text permanently prevents rebinding', async t => {
+  for (const replacement of [[], [['user', stampedPrompt('Continue', '02')], ['assistant', 'Other reply']]]) {
+    const { session, client } = await start(t, { source: stampedHistory([]) });
+    let claims = 0;
+    session.onSubmittedSource = async () => { claims++; };
+    const pending = session.begin('native', 'Continue'); pending.submitted = true;
+    const complete = stampedHistory([['user', stampedPrompt('Continue')], ['assistant', 'Original reply']]);
+    session.setVerified(false);
+    session.acceptHistory(complete);
+    const sourceTurnId = pending.sourceTurnId;
+    session.acceptHistory(stampedHistory(replacement));
+    session.setVerified(true);
+    session.acceptHistory(complete);
+    await settleBinding();
+    assert.equal(claims, 0);
+    assert.equal(session.pending, pending);
+    assert.equal(pending.sourceTurnId, sourceTurnId);
+    assert.match(pending.identityError.message, /identity changed/);
+    assert.deepEqual(client.calls, []);
+  }
+});
+
+test('temporary persistence failure cannot retry after its pinned source becomes ambiguous', async t => {
+  const { session, client } = await start(t, { source: stampedHistory([]) });
+  let attempts = 0;
+  session.onSubmittedSource = async () => { attempts++; throw new Error('Fixture storage failed'); };
+  const pending = session.begin('native', 'Continue'); pending.submitted = true;
+  const rows = [['user', stampedPrompt('Continue')], ['assistant', 'Reply']];
+  session.acceptHistory(stampedHistory(rows));
+  await settleBinding();
+  session.acceptHistory(stampedHistory([...rows, ...rows]));
+  session.setVerified(false); session.setVerified(true);
+  session.acceptHistory(stampedHistory(rows));
+  await settleBinding();
+  assert.equal(attempts, 1);
+  assert.equal(session.pending, pending);
+  assert.match(pending.identityError.message, /ambiguous/);
+  assert.deepEqual(client.calls, []);
+});
+
+test('a model or original binding change blocks a pending durable claim', async t => {
+  for (const change of ['model', 'binding-object', 'binding-field']) {
+    const { session, client } = await start(t, { source: stampedHistory([]) });
+    session.binding = { ...binding };
+    let claims = 0;
+    session.onSubmittedSource = async () => { claims++; };
+    const pending = session.begin('native', 'Continue'); pending.submitted = true;
+    const complete = stampedHistory([['user', stampedPrompt('Continue')], ['assistant', 'Reply']]);
+    session.setVerified(false);
+    session.acceptHistory(complete);
+    if (change === 'model') session.model = 'another-model';
+    else if (change === 'binding-object') session.binding = { ...binding };
+    else session.binding.agentStartTime = 'different';
+    session.setVerified(true);
+    session.acceptHistory(complete);
+    await settleBinding();
+    assert.equal(claims, 0, change);
+    assert.equal(session.pending, pending);
+    assert.deepEqual(client.calls, []);
+  }
+});
+
+test('closing the observer cancels a late durable callback without completing or retrying its turn', async t => {
+  const { session, client } = await start(t, { source: stampedHistory([]) });
+  let release, current, attempts = 0;
+  const held = new Promise(resolve => { release = resolve; });
+  session.onSubmittedSource = async event => { attempts++; await held; current = event.isCurrent(); };
+  const pending = session.begin('native', 'Continue'); pending.submitted = true;
+  const rejected = assert.rejects(pending.promise, /observer detached/);
+  const complete = stampedHistory([['user', stampedPrompt('Continue')], ['assistant', 'Reply']]);
+  session.acceptHistory(complete);
+  await settleBinding();
+  await session.close();
+  await rejected;
+  release();
+  await settleBinding();
+  session.acceptHistory(complete);
+  await settleBinding();
+  assert.equal(current, false);
+  assert.equal(attempts, 1);
+  assert.equal(pending.bindingComplete, undefined);
+  assert.equal(session.pending, null);
+  assert.deepEqual(client.calls, []);
 });
 
 test('a completed same-prompt envelope exported late from an older minute cannot claim a fresh native send', async t => {

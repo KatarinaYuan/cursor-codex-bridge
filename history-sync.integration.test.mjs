@@ -8,6 +8,7 @@ import { delimiter, dirname, join } from 'node:path';
 import { createInterface } from 'node:readline';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
+import { parseTranscript } from './history.mjs';
 
 const directory = dirname(fileURLToPath(import.meta.url));
 const delay = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds));
@@ -200,6 +201,69 @@ async function waitForRead(client, threadId, predicate) {
   } while (Date.now() < deadline);
   assert.fail(`Synchronized history was not visible through thread/read\n${client.stderr}`);
 }
+
+test('reconnect restores source chronology around an orphaned detached observer without retrying its native message', async t => {
+  const fixture = await setup(t);
+  if (!fixture) return;
+  const { start, sourceHome, persisted, assertNoAgent, env } = fixture;
+  const cursorId = 'observer-reconnect-session';
+  const threadId = 'original-native-chat';
+  const envelope = (text, minute) => `<timestamp>Monday, Oct 19, 2026, 10:${minute} AM (UTC)</timestamp>\n<user_query>${text}</user_query>`;
+  const rows = [row('user', envelope('Earlier question', '00')), row('assistant', 'Earlier answer'), ended,
+    row('user', envelope('Continue the work', '02')), row('assistant', 'Canonical finished answer'), ended,
+    row('user', envelope('Later CLI question', '03')), row('assistant', 'Later CLI answer'), ended];
+  const transcript = await writeCursorChat(sourceHome, cursorId, rows);
+  const source = parseTranscript(rows.join('\n'), { id: cursorId, cwd: '/work/sync-project' });
+  const failed = { id: 'detached-native-turn', rootTurnId: 'detached-native-turn', status: 'failed',
+    startedAt: Date.UTC(2026, 9, 19, 10, 1, 7) / 1000,
+    completedAt: Date.UTC(2026, 9, 19, 10, 10) / 1000,
+    error: { message: 'Cursor tmux observer detached; the original Agent keeps running in tmux', additionalDetails: null },
+    items: [{ id: 'original-native-user', type: 'userMessage', clientId: 'original-native-client',
+      content: [{ type: 'text', text: 'Continue the work\n' }] },
+    { id: 'old-terminal-preview', type: 'agentMessage', text: 'A terminal preview with tool output', phase: 'final_answer' }] };
+  const record = { version: 1, backend: 'legacy', cursorSessionId: cursorId, archived: false,
+    historySync: { version: 1, sourceTurns: Object.fromEntries(source.turns.map(turn => [turn.id, turn.id])),
+      sourceItems: Object.fromEntries(source.turns.flatMap(turn => turn.items.map(item => [item.id, item.id]))) },
+    livePreviewIds: { [failed.id]: failed.items[1].id },
+    thread: { id: threadId, name: 'Existing Cursor chat', cwd: '/work/sync-project', model: 'composer-2.5',
+      updatedAt: failed.completedAt, recencyAt: failed.completedAt, turns: [...structuredClone(source.turns), failed] } };
+  const recordDirectory = join(env.CODEX_HOME, 'cursor-bridge');
+  await mkdir(recordDirectory, { recursive: true });
+  await writeFile(join(recordDirectory, `${threadId}.json`), JSON.stringify(record));
+
+  let client = start();
+  await client.initialize();
+  const expectedOrder = [source.turns[0].id, failed.id, ...source.turns.slice(1).map(turn => turn.id)];
+  const restored = await waitForRead(client, threadId, thread => thread.turns.at(-1).id === source.turns.at(-1).id);
+  assert.deepEqual(restored.turns.map(turn => turn.id), expectedOrder);
+  assert.deepEqual(restored.turns.find(turn => turn.id === failed.id), failed, 'Historical failure evidence stays intact');
+  assert.deepEqual(restored.turns.filter(turn => turn.id !== failed.id), source.turns);
+  assert.ok(client.messages.some(message => message.method === 'thread/started'
+    && message.params.thread.id === threadId), 'Metadata changes retain the existing native thread');
+  assert.deepEqual(historyEvents(client.messages, threadId).filter(message => message.method !== 'thread/started'), []);
+  const saved = (await persisted()).find(record => record.thread.id === threadId);
+  assert.deepEqual(saved.historySync.sourceTurns, record.historySync.sourceTurns);
+  assert.deepEqual(saved.historySync.sourceItems, record.historySync.sourceItems);
+  assert.equal(saved.tmuxObserverTurns, undefined, 'Read-only history ordering cannot create submission ownership');
+  assert.equal((await client.call('thread/turns/list', { threadId, limit: 1 })).data[0].id, source.turns.at(-1).id);
+  await assertNoAgent();
+
+  await client.close();
+  client = start();
+  await client.initialize();
+  const afterRestart = (await client.call('thread/read', { threadId, includeTurns: true })).thread;
+  assert.deepEqual(afterRestart.turns, restored.turns);
+  assert.deepEqual(historyEvents(client.messages, threadId), [], 'A settled order is not replayed at every reconnect');
+  const since = client.messages.length;
+  await appendFile(transcript, `${row('user', envelope('Next CLI question', '04'))}\n${row('assistant', 'Next CLI answer')}\n${ended}\n`);
+  await assertCompletedEvents(client, threadId, 'Next CLI answer', since);
+  const later = await waitForRead(client, threadId, thread => thread.turns.length === expectedOrder.length + 1);
+  assert.deepEqual(later.turns.slice(0, -1), restored.turns);
+  assert.equal(later.id, threadId);
+  assert.equal(later.model, record.thread.model);
+  assert.equal((await persisted()).filter(record => record.cursorSessionId === cursorId).length, 1);
+  await assertNoAgent();
+});
 
 test('external Cursor CLI chats synchronize proactively, preserve native settings, and survive restart without inference', async t => {
   const fixture = await setup(t);

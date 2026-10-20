@@ -374,3 +374,111 @@ test('an unfinished new envelope cannot reuse an earlier completed same-prompt a
   assert.notEqual(result.record.historySync.sourceTurns[incoming.turns[0].id], native.thread.turns[0].id);
   assert.equal(result.record.thread.turns[0].items[1].text, 'Hello world');
 });
+
+function detachedPreviewFixture() {
+  const incoming = history([['user', envelope('Earlier request', '00')], ['assistant', 'Earlier result'],
+    ['user', envelope('Continue', '02')], ['assistant', 'The complete canonical response'],
+    ['user', envelope('Later CLI request', '03')], ['assistant', 'Later CLI result']]);
+  incoming.sourceComplete = true;
+  incoming.completedTurnIds = incoming.turns.map(turn => turn.id);
+  const native = reconcileHistory(record(incoming), incoming).record;
+  native.thread.cwd = incoming.cwd;
+  const failed = { id: 'detached-native', rootTurnId: 'detached-native', status: 'failed',
+    startedAt: Date.UTC(2026, 9, 19, 11, 1, 15) / 1000, completedAt: 1_800_000_000, durationMs: 1234,
+    error: { message: 'Cursor tmux observer detached; the original Agent keeps running in tmux', codexErrorInfo: null, additionalDetails: null },
+    items: [{ id: 'detached-user', type: 'userMessage', clientId: 'original-client',
+      content: [{ type: 'text', text: 'Continue\n' }] },
+    { id: 'detached-preview', type: 'agentMessage', text: 'A wrapped\nterminal preview', phase: 'final_answer' }] };
+  native.thread.turns.push(failed);
+  native.livePreviewIds = { [failed.id]: 'detached-preview' };
+  return { native, incoming, failed, source: incoming.turns[1] };
+}
+
+test('a detached unbound preview is displayed before its later independent canonical source without claiming it', () => {
+  const { native, incoming, failed, source } = detachedPreviewFixture();
+  const original = JSON.stringify(native);
+  const result = reconcileHistory(native, incoming);
+  assert.equal(result.changed, true);
+  assert.equal(result.orderChanged, true);
+  assert.deepEqual(result.record.thread.turns.map(turn => turn.id), [incoming.turns[0].id, failed.id, source.id, incoming.turns[2].id]);
+  assert.deepEqual(result.record.thread.turns.find(turn => turn.id === failed.id), failed);
+  assert.deepEqual(result.record.historySync, native.historySync);
+  assert.equal(result.record.tmuxObserverTurns, undefined);
+  assert.deepEqual(result.turnsChanged, [], 'a display reorder does not invent changed turn/item payloads');
+  assert.equal(JSON.stringify(native), original, 'reconciliation remains pure');
+  const repeated = reconcileHistory(JSON.parse(JSON.stringify(result.record)), incoming);
+  assert.equal(repeated.changed, false);
+  assert.equal(repeated.orderChanged, false);
+});
+
+test('newly imported canonical replies are placed after an existing detached preview on the first merge', () => {
+  const { native, incoming, failed } = detachedPreviewFixture();
+  native.thread.turns = [native.thread.turns[0], failed];
+  const result = reconcileHistory(native, incoming);
+  assert.equal(result.orderChanged, true);
+  assert.deepEqual(result.record.thread.turns.map(turn => turn.id), [incoming.turns[0].id, failed.id, incoming.turns[1].id, incoming.turns[2].id]);
+  assert.deepEqual(result.record.thread.turns.find(turn => turn.id === failed.id), failed);
+  assert.equal(Object.values(result.record.historySync.sourceTurns).includes(failed.id), false);
+  assert.equal(Object.values(result.record.historySync.sourceItems).includes(failed.items[0].id), false);
+});
+
+test('detached preview ordering rejects uncertain time, completion, identity and native provenance', () => {
+  const mutators = [
+    ({ failed, source }) => { failed.startedAt = source.sourceTimestampMinute / 1000; },
+    ({ failed, source }) => { failed.startedAt = source.sourceTimestampMinute / 1000 + 30; },
+    ({ failed }) => { delete failed.startedAt; },
+    ({ source }) => { delete source.sourceTimestampMinute; },
+    ({ source }) => { source.sourceTimestampMinute++; },
+    ({ incoming, source }) => { incoming.completedTurnIds = incoming.completedTurnIds.filter(id => id !== source.id); },
+    ({ incoming, source }) => { incoming.turns.push(structuredClone(source)); },
+    ({ source }) => { source.sourceIdentity.strength = 'ambiguous'; },
+    ({ native, failed }) => { native.tmuxObserverTurns = { [failed.id]: { version: 2 } }; },
+    ({ native, failed }) => { native.historySync.sourceTurns.other = failed.id; },
+    ({ native, failed }) => { native.historySync.sourceItems.other = failed.items[0].id; },
+    ({ failed }) => { failed.error.message = 'Another failure'; },
+    ({ failed }) => { failed.items[0].clientId = null; },
+    ({ failed }) => { failed.unsubmittedDraft = { retained: true }; },
+    ({ failed }) => { delete failed.items[0].id; },
+    ({ native, failed }) => { native.livePreviewIds[failed.id] = 'somebody-elses-item'; },
+    ({ native, failed }) => { native.liveSourcePreviews = { [failed.id]: true }; },
+    ({ native }) => { native.thread.cwd = '/another-project'; },
+  ];
+  for (const mutate of mutators) {
+    const fixture = detachedPreviewFixture(); mutate(fixture);
+    const result = reconcileHistory(fixture.native, fixture.incoming);
+    assert.equal(result.orderChanged, false, mutate.toString());
+    assert.equal(result.record.thread.turns.at(-1).id, fixture.failed.id, mutate.toString());
+  }
+});
+
+test('a source mapping cannot authorize moving a preview before a noncanonical native card', () => {
+  const { native, incoming, failed, source } = detachedPreviewFixture();
+  const card = native.thread.turns.find(turn => turn.id === source.id);
+  card.id = 'another-native'; card.rootTurnId = card.id;
+  card.items[0].clientId = 'another-client';
+  native.historySync.sourceTurns[source.id] = card.id;
+  const result = reconcileHistory(native, incoming);
+  assert.equal(result.orderChanged, false);
+  assert.equal(result.record.thread.turns.at(-1).id, failed.id);
+});
+
+test('strict canonical clones support display ordering while leaving all source mappings intact', () => {
+  const { native, incoming, failed, source } = detachedPreviewFixture();
+  const card = native.thread.turns.find(turn => turn.id === source.id);
+  card.id = 'canonical-clone'; card.rootTurnId = card.id;
+  native.historySync.sourceTurns[source.id] = card.id;
+  for (const item of card.items) {
+    const sourceId = item.id;
+    item.id += ':clone'; native.historySync.sourceItems[sourceId] = item.id;
+  }
+  const maps = JSON.stringify(native.historySync);
+  const result = reconcileHistory(native, incoming);
+  assert.equal(result.orderChanged, true);
+  assert.deepEqual(result.record.thread.turns.map(turn => turn.id), [incoming.turns[0].id, failed.id, card.id, incoming.turns[2].id]);
+  assert.equal(JSON.stringify(result.record.historySync), maps);
+});
+
+test('every history reconciliation result includes a boolean ordering flag', () => {
+  assert.equal(reconcileHistory(record(source), source).orderChanged, false);
+  assert.equal(reconcileHistory({ backend: 'acp' }, source).orderChanged, false);
+});

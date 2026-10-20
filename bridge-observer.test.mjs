@@ -29,7 +29,7 @@ async function runFixture(scenario) {
   process.env.CURSOR_BRIDGE_MAINTENANCE_FILE = maintenanceFile;
   const threadId = 'fixture-native-chat';
   const rewrite = kind === 'envelope-rewrite';
-  const fresh = kind === 'fresh-submission' || kind === 'failed-submission';
+  const fresh = ['fresh-submission', 'failed-submission', 'reverified-submission'].includes(kind);
   const envelope = (text, minute) => `<timestamp>Monday, Oct 19, 2026, 11:${minute} AM (UTC)</timestamp>\n<user_query>${text}</user_query>`;
   const catalog = '<available_subagent_types>\nAvailable subagent_types and a quick description of what they do:\n- helper: Helper\n</available_subagent_types>\n<available_subagent_models>\nIf the user explicitly asks for the model of a subagent/task, you may ONLY use model slugs from this list:\n- model-one\n</available_subagent_models>\n<dynamic_tool_catalog>\nThese dynamic tool namespaces were available when this conversation started. Availability may have changed, so use `GetDynamicTools` to check current state before calling `CallDynamicTool`.\n<dynamic_tool_namespaces>fixture tools</dynamic_tool_namespaces>\n</dynamic_tool_catalog>';
   const completeCatalog = catalog.replace('fixture tools', '<namespace name="fixture" tools="Read" namespaceUseInstructions="Read fixture data" source="fixture" />');
@@ -126,7 +126,8 @@ async function runFixture(scenario) {
       if (kind === 'scan-during-start' && this.calls.length === 1) fixtureHistory(history([old, current], true));
       return this.raw;
     },
-    isVerified: () => true,
+    verified: true,
+    isVerified: () => client.verified,
     async paste(_pane, text, options) {
       if (!fresh) throw new Error('Observer must not paste');
       await options.beforePaste(); this.calls.push('paste'); this.raw = frame('Earlier question', false, text);
@@ -137,6 +138,15 @@ async function runFixture(scenario) {
       fixtureHistory(snapshot);
       if (kind === 'failed-submission') throw new Error('Fixture failed before Enter');
       this.calls.push('Enter'); this.raw = frame('Continue', true);
+      if (kind === 'reverified-submission') {
+        this.verified = false;
+        fixtureSession(threadId).setVerified(false);
+        setTimeout(() => {
+          this.verified = true;
+          fixtureSession(threadId)?.setVerified(true);
+          fixtureHistory(snapshot);
+        }, 50);
+      }
     },
     async cancel() { throw new Error('Observer must not cancel'); },
   };
@@ -306,6 +316,23 @@ if (process.argv[2] === '--observer-fixture') {
     assert.equal(result.calls.filter(call => call === 'Enter').length, fails ? 0 : 1);
     assert.equal(result.saved.tmuxObserverTurns?.[turn.id], undefined);
     if (fails) assert.equal(Object.values(result.saved.historySync.sourceTurns).includes(turn.id), false);
+  });
+
+  test('real RPC reattaches a native submission after temporary foreground verification loss without another Enter', async t => {
+    const result = await (await setup(t))('native-reverified-submission');
+    const turn = result.saved.thread.turns.at(-1);
+    assert.equal(turn.status, 'completed');
+    assert.equal(turn.items[0].clientId, 'fresh-client');
+    assert.equal(turn.items[0].content[0].text, 'Continue');
+    assert.equal(result.saved.thread.model, 'composer-2.5[fast=true]');
+    assert.equal(Object.values(result.saved.historySync.sourceTurns).filter(id => id === turn.id).length, 1);
+    assert.equal(result.saved.tmuxObserverTurns?.[turn.id], undefined);
+    assert.deepEqual(turn.items.filter(item => item.type === 'agentMessage').map(item => item.text), ['Canonical current answer']);
+    assert.equal(result.calls.filter(call => call === 'paste').length, 1);
+    assert.equal(result.calls.filter(call => call === 'Enter').length, 1);
+    assert.equal(result.messages.filter(message => message.method === 'turn/started' && message.params.turn.id === turn.id).length, 1);
+    assert.equal(result.messages.filter(message => message.method === 'turn/completed' && message.params.turn.id === turn.id).length, 1);
+    assert.equal(result.messages.some(message => message.method === 'error'), false);
   });
 
   test('a graceful observer shutdown preserves the running source and a later process recovers the same native ID', async t => {

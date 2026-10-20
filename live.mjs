@@ -264,6 +264,8 @@ export class TmuxSession extends EventEmitter {
     const user = screenUser(this.screen);
     this.pending = { origin, prompt, sourceTurnId, baseline, baselineUsers, baselineScheme: this.history?.sourceIdentityScheme,
       sourceIdentitySha256: this.history?.turns.find(turn => turn.id === sourceTurnId)?.sourceIdentity?.sha256,
+      sourceIdentityScheme: sourceTurnId ? this.history?.sourceIdentityScheme : undefined,
+      originalBinding: this.binding, bindingSnapshot: { ...this.binding }, model: this.model,
       submitted: origin === 'external',
       startedAtMinute: Math.floor(this.now() / 60_000) * 60_000,
       promise, resolve, reject, baselineUser: user, user: origin === 'external' ? user : null };
@@ -656,17 +658,27 @@ export class TmuxSession extends EventEmitter {
       }
       const blocked = plausible.some(turn => !sourceTurnOwnable(turn, history)
         || pending.ambiguousSourceHashes.has(turn.sourceIdentity?.sha256)) || drift;
-      if (blocked && !pending.identityError) {
+      const pinned = pending.sourceTurnId && history.turns.filter(turn => turn.id === pending.sourceTurnId);
+      const revoked = pending.sourceIdentitySha256 && (!pinned || pinned.length !== 1
+        || pinned[0].sourceIdentity?.sha256 !== pending.sourceIdentitySha256
+        || history.sourceIdentityScheme !== pending.sourceIdentityScheme);
+      if ((blocked || revoked) && !pending.identityError) {
         pending.identityError = new Error('Cursor source identity changed or is ambiguous; the submitted turn is waiting for verified source ownership and will not be resent');
         this.log(pending.identityError.message);
       }
-      const sourceTurn = !blocked && (pending.sourceTurnId
+      const sourceTurn = !pending.identityError && (pending.sourceTurnId
         ? candidates.find(turn => turn.id === pending.sourceTurnId)
         : candidates.length === 1 ? candidates[0] : undefined);
       const currentSource = () => {
-        const current = this.history?.turns.find(turn => turn.id === pending.sourceTurnId);
-        return current && sourceTurnOwnable(current, this.history)
+        const currentHistory = this.history;
+        const sources = currentHistory?.turns.filter(turn => turn.id === pending.sourceTurnId);
+        const current = sources?.length === 1 && sources[0];
+        return !pending.identityError && current && sourceTurnOwnable(current, currentHistory)
+          && (!pending.sourceIdentitySha256 || current.sourceIdentity?.sha256 === pending.sourceIdentitySha256
+            && currentHistory.sourceIdentityScheme === pending.sourceIdentityScheme)
           && !pending.ambiguousSourceHashes.has(current.sourceIdentity?.sha256)
+          && !currentHistory.turns.some(turn => pending.baselineUsers.has(turn.id)
+            && pending.baselineUsers.get(turn.id) !== canonicalPrompt(userText(turn)))
           && (pending.origin === 'external'
             ? displayText(userText(current)) === displayText(pending.prompt)
             : canonicalPrompt(userText(current)) === canonicalPrompt(pending.prompt)) ? current : null;
@@ -674,25 +686,55 @@ export class TmuxSession extends EventEmitter {
       if (sourceTurn && pending.submitted && pending.origin === 'native' && !pending.sourceTurnId) {
         pending.sourceTurnId = sourceTurn.id;
         pending.sourceIdentitySha256 = sourceTurn.sourceIdentity?.sha256;
+        pending.sourceIdentityScheme = history.sourceIdentityScheme;
         // Source ownership is durable before a fast reply can complete. This
         // callback is installed by the bridge only for a send begun here.
         if (stableSourceTurn(sourceTurn, history) && this.onSubmittedSource) {
-          pending.bindingPromise = Promise.resolve().then(() => {
-            this.assertVerified(pending.verificationEpoch);
-            if (!currentSource()) throw new Error('The submitted Cursor source identity was revoked before persistence');
-            return this.onSubmittedSource({ sourceTurn, history, prompt: pending.prompt, model: pending.model,
-              isCurrent: () => this.pending === pending && Boolean(currentSource()) });
-          });
-          pending.bindingPromise.catch(error => {
-            pending.bindingError = error;
-            this.log(`Cursor submitted source could not be persisted: ${error.message}`);
-          });
+          pending.bindingRequired = true;
+          pending.bindingHandler = this.onSubmittedSource;
         }
+      }
+      const originalContext = () => this.pending === pending && this.state === 'ready' && this.verified
+        && this.binding === pending.originalBinding
+        && Object.entries(pending.bindingSnapshot).every(([key, value]) => this.binding[key] === value)
+        && this.model === pending.model;
+      // A source pin is never discarded after Enter. Only persistence of that
+      // same source may retry, under a fresh proof of the original TUI identity.
+      // A rejected attempt must not permanently strand a completed reply.
+      if (pending.bindingRequired && !pending.bindingComplete && !pending.bindingPromise
+        && originalContext() && currentSource()
+        && (pending.bindingEpoch !== this.verificationEpoch || this.now() >= (pending.bindingRetryAt || 0))) {
+        const epoch = this.verificationEpoch;
+        const attempt = {};
+        const isCurrent = () => pending.bindingAttempt === attempt && originalContext()
+          && this.verificationEpoch === epoch && Boolean(currentSource());
+        pending.bindingAttempt = attempt;
+        pending.bindingEpoch = epoch;
+        pending.bindingPromise = Promise.resolve().then(() => {
+          this.assertVerified(epoch);
+          if (!isCurrent()) throw new Error('The submitted Cursor source identity was revoked before persistence');
+          return pending.bindingHandler.call(this, { sourceTurn: currentSource(), history: this.history,
+            prompt: pending.prompt, model: pending.model, isCurrent });
+        }).then(() => {
+          if (!isCurrent()) throw new Error('The original Cursor submission changed while its source was being persisted');
+          pending.bindingComplete = true;
+          pending.bindingError = null;
+          pending.bindingFailures = 0;
+        }).catch(error => {
+          if (this.pending !== pending || pending.bindingAttempt !== attempt) return;
+          pending.bindingError = error;
+          pending.bindingFailures = (pending.bindingFailures || 0) + 1;
+          pending.bindingRetryAt = this.now() + Math.min(30_000, 1000 * 2 ** Math.min(pending.bindingFailures - 1, 5));
+          try { this.log(`Cursor submitted source could not be persisted: ${error.message}`); } catch { /* A logger cannot invalidate the pinned submission. */ }
+        }).finally(() => {
+          if (pending.bindingAttempt === attempt) pending.bindingPromise = null;
+        });
       }
       const completed = pending.submitted && sourceTurn && sourceTurnComplete(history, sourceTurn);
       if (completed) {
         const finish = () => {
-          if (this.pending !== pending || pending.bindingError) return;
+          if (this.pending !== pending || pending.identityError
+            || pending.bindingRequired && (!pending.bindingComplete || !originalContext())) return;
           const current = currentSource();
           if (!current || !sourceTurnComplete(this.history, current)) return;
           this.pending = null; this.committing = true;
