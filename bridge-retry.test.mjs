@@ -71,6 +71,15 @@ async function runFixture(scenario) {
       this.columns = Math.max(original, minimumColumns ?? original);
       try {
         await beforeSubmit();
+        if (['diagnostic', 'invalid-diagnostic'].includes(scenario)) {
+          const multilineVerification = { version: 1, phase: 'scan', operation: 'capture', offset: 12,
+            attempt: 15, mismatch: 'caret-offset', expectedCaretOffset: 1, actualCaretOffset: 2 };
+          if (scenario === 'invalid-diagnostic') multilineVerification.text = '/private/draft';
+          throw Object.assign(new Error(UNSUBMITTED_DRAFT_ERROR), { multilineVerification,
+            unsubmittedDraft: { sessionId: binding.sessionId, paneId: binding.paneId,
+              agentPid: binding.agentPid, agentStartTime: binding.agentStartTime,
+              model: record.thread.model, sourceTurnIds: [old.id] } });
+        }
         this.calls.push('Enter');
         setImmediate(() => session.acceptHistory({ ...history, turns: [old, sourceTurn('source-retry', prompt)] }));
       } finally { this.columns = original; }
@@ -102,7 +111,8 @@ async function runFixture(scenario) {
       finally { clearTimeout(timer); }
     }
     const saved = JSON.parse(await readFile(join(store, `${threadId}.json`), 'utf8'));
-    return { response, turn, readiness, calls: client.calls, columns: client.columns, savedTurnCount: saved.thread.turns.length, mapping: saved.historySync.sourceTurns['source-retry'] };
+    return { response, turn, readiness, calls: client.calls, columns: client.columns, savedTurnCount: saved.thread.turns.length,
+      savedTurn: saved.thread.turns.at(-1), mapping: saved.historySync.sourceTurns['source-retry'] };
   } finally { await bridge.close(); await session.close(); }
 }
 
@@ -117,6 +127,27 @@ if (process.argv[2] === '--bridge-retry-fixture') {
     });
     return JSON.parse(stdout);
   }
+
+  test('multiline diagnostics survive native error persistence without changing retry ownership', async t => {
+    const result = await fixture(t, 'diagnostic');
+    assert.equal(result.turn.error.message, UNSUBMITTED_DRAFT_ERROR);
+    assert.deepEqual(JSON.parse(result.turn.error.additionalDetails), { multilineVerification: {
+      version: 1, phase: 'scan', operation: 'capture', offset: 12, attempt: 15,
+      mismatch: 'caret-offset', expectedCaretOffset: 1, actualCaretOffset: 2,
+    } });
+    assert.deepEqual(result.savedTurn.error, result.turn.error);
+    assert.equal(result.savedTurn.unsubmittedDraft.version, 1);
+    assert.equal(result.calls.includes('Enter'), false);
+  });
+
+  test('native errors discard multiline details containing draft text', async t => {
+    const result = await fixture(t, 'invalid-diagnostic');
+    assert.equal(result.turn.error.additionalDetails, null);
+    assert.equal(result.savedTurn.error.additionalDetails, null);
+    assert.equal(result.turn.error.message, UNSUBMITTED_DRAFT_ERROR);
+    assert.equal(result.savedTurn.unsubmittedDraft.version, 1);
+    assert.equal(result.calls.includes('Enter'), false);
+  });
 
   test('turn/start admits a persisted clipped retry and verifies its complete draft before its only Enter', async t => {
     const result = await fixture(t, 'valid');

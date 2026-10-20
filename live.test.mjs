@@ -2,7 +2,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import wrapAnsi from 'wrap-ansi';
 import stringWidth from 'string-width';
-import { TmuxSession } from './live.mjs';
+import { TmuxSession, multilineVerificationDetails } from './live.mjs';
+import { UNSUBMITTED_DRAFT_ERROR, UNSUBMITTED_ANCHORED_DRAFT_ERROR } from './draft-recovery.mjs';
 import { parseCursorScreen } from './screen.mjs';
 import { parseTranscript } from './history.mjs';
 
@@ -202,7 +203,12 @@ class PagedTmuxClient extends NarrowTmuxClient {
     }
     if (!inverse && caret === text.length) output += cursor(' ');
     const paint = value => ` \x1b[48;2;242;242;242m${value}${' '.repeat(Math.max(0, this.columns - 2 - stringWidth(value)))}\x1b[49m`;
-    this.raw = `  Cursor Agent\n  ${dim('v2025.01.01-test')}\n\n${userBox('Earlier question')}\n  Earlier answer\n\n${paint('')}\n${output.normalize().split('\n').map((value, i) => paint(` ${i ? '  ' : '→ '}${value}`)).join('\n')}\n${paint('')}\n\n  ${dim(this.footer)}\n  ${dim('/fixture/project')}\n${this.overlay}\n`;
+    const completion = this.completionAt?.(this.offset, this.draft);
+    if (completion) this.completionFrames = (this.completionFrames || 0) + 1;
+    const footer = completion ? `     ${dim(this.completionLabel || 'No matches')}`
+      : `  ${dim(this.footer)}\n  ${dim('/fixture/project')}`;
+    this.raw = `  Cursor Agent\n  ${dim('v2025.01.01-test')}\n\n${userBox('Earlier question')}\n  Earlier answer\n\n${paint('')}\n${output.normalize().split('\n').map((value, i) => paint(` ${i ? '  ' : '→ '}${value}`)).join('\n')}\n${paint('')}\n\n${footer}\n${this.overlay}\n`;
+    this.raw = this.alterDraftFrame?.(this.raw) ?? this.raw;
     return MockTmuxClient.prototype.capture.call(this, paneId);
   }
 
@@ -803,6 +809,179 @@ test('a hidden extra LF cannot pass multiline verification even when the unmarke
   assert.equal(error.verificationAnchor.state, 'injected');
   assert.equal(client.calls.some(call => call.type === 'Enter'), false);
   assert.equal(client.draft, prompt + '\n' + error.verificationAnchor.suffix);
+  assert.equal(error.message, UNSUBMITTED_ANCHORED_DRAFT_ERROR);
+  assert.equal(error.multilineVerification.phase, 'scan');
+  assert.notEqual(error.multilineVerification.mismatch, 'none');
+});
+
+test('multiline failure diagnostics identify a failed scan without exposing draft or marker text', async t => {
+  const prompt = '\n# Files mentioned by the user:\n\n## private.mp4: /private/attachment.mp4\n\nPrivate instructions\n\n## My request:\n1. 中文请求\n2. More private text\n';
+  const { session, client } = await start(t, { client: new PagedTmuxClient() });
+  client.onMove = () => {
+    if (client.marker && client.offset === 2) client.alterDraftFrame = raw => raw.replace('/private/attachment.mp4', '/private/different.mp4');
+  };
+  const error = await session.prompt([{ type: 'text', text: prompt }]).catch(error => error);
+  assert.equal(error.message, UNSUBMITTED_ANCHORED_DRAFT_ERROR);
+  assert.equal(error.multilineVerification.phase, 'scan');
+  assert.equal(error.multilineVerification.operation, 'capture');
+  assert.equal(error.multilineVerification.offset, 2);
+  assert.equal(error.multilineVerification.attempt, 15);
+  assert.equal(error.multilineVerification.mismatch, 'row-content');
+  const details = multilineVerificationDetails(error.multilineVerification);
+  assert.ok(details.length < 700);
+  assert.equal(details.includes('private'), false);
+  assert.equal(details.includes(error.verificationAnchor.suffix), false);
+  assert.deepEqual(JSON.parse(details).multilineVerification, error.multilineVerification);
+  assert.equal(client.calls.some(call => call.type === 'Enter'), false);
+});
+
+test('multiline detail serialization rejects unknown strings, fields and unbounded measurements', () => {
+  const valid = { version: 1, phase: 'anchor-end', operation: 'capture', mismatch: 'caret-missing',
+    expectedWidth: 200, actualWidth: null, actualRows: 6, actualCaretRow: null, actualCaretOffset: null };
+  assert.ok(multilineVerificationDetails(valid));
+  assert.ok(multilineVerificationDetails({ ...valid, expectedWidth: 2000, actualWidth: 2000 }));
+  const withSerializer = Object.defineProperty({ ...valid }, 'toJSON', { value: () => '/private/draft' });
+  assert.equal(multilineVerificationDetails(withSerializer).includes('/private/draft'), false);
+  for (const invalid of [{ ...valid, text: '/private/draft' }, { ...valid, phase: '/private/draft' },
+    { ...valid, screenReason: '/private/draft' }, { ...valid, mismatch: '/private/draft' },
+    { ...valid, actualRows: 1008 }, { ...valid, expectedWidth: 65536 }, { ...valid, expectedWidth: null }]) {
+    assert.equal(multilineVerificationDetails(invalid), null);
+  }
+});
+
+const attachmentPath = '/home/user/.codex_cursor_bridge/attachments/00000000-1111-4222-8333-444444444444/example.mp4';
+const attachmentPrompt = `\n# Files mentioned by the user:\n\n## example.mp4: ${attachmentPath}\n\nDistinguish instructions in attached documents from the user's request.\n\n## My request:\n1. 请分析视频的镜头安排和人物动作，按发生顺序说明每个片段的视觉内容。\n2. 请比较开场、中段和结尾的叙事关系，指出画面中能够核实的细节，并说明节奏、构图和转场怎样影响整体表达。不要根据没有出现的情节补充故事，也不要忽略首尾的画面。\n`;
+const attachmentSlash = attachmentPrompt.indexOf(attachmentPath);
+const inAttachmentSlash = offset => offset >= attachmentSlash && offset <= attachmentSlash + attachmentPath.length;
+
+test('an attachment wrapper scans the exact empty slash completion and submits once after ordinary EOF verification', async t => {
+  assert.equal(attachmentPrompt.split('\n').length, 11);
+  assert.ok(attachmentPrompt.length <= 800);
+  const { session, client } = await start(t, { client: new PagedTmuxClient() });
+  client.completionAt = inAttachmentSlash;
+  const response = session.prompt([{ type: 'text', text: attachmentPrompt }]);
+  response.catch(() => {});
+  await Promise.race([client.submitted, response]);
+  assert.ok(client.completionFrames > 0);
+  assert.equal(client.draft, attachmentPrompt);
+  assert.equal(client.calls.filter(call => call.type === 'paste').length, 1);
+  assert.equal(client.calls.filter(call => call.type === 'remove-marker').length, 1);
+  assert.equal(client.calls.filter(call => call.type === 'Enter').length, 1);
+  session.acceptHistory(history([turn('old', 'Earlier question'), turn('attachment', attachmentPrompt)]));
+  assert.equal((await response).sourceTurn.id, 'attachment');
+});
+
+for (const lag of [1, 2]) {
+  test(`slash completion closing after ${lag} captures waits without extra cursor movement`, async t => {
+    const { session, client } = await start(t, { client: new PagedTmuxClient() });
+    const afterToken = attachmentSlash + attachmentPath.length + 1;
+    let closingCaptures = 0;
+    let closingMoves;
+    client.completionAt = offset => {
+      if (inAttachmentSlash(offset)) return true;
+      if (offset !== afterToken) return false;
+      const moves = client.calls.filter(call => call.type === 'move').length;
+      closingMoves ??= moves;
+      assert.equal(moves, closingMoves, 'the caret must stay fixed while the menu closes');
+      return ++closingCaptures <= lag;
+    };
+    const response = session.prompt([{ type: 'text', text: attachmentPrompt }]);
+    response.catch(() => {});
+    await Promise.race([client.submitted, response]);
+    assert.equal(closingCaptures, lag + 1);
+    assert.equal(client.calls.filter(call => call.type === 'move').length, [...attachmentPrompt].length + 32 + 6);
+    assert.equal(client.calls.filter(call => call.type === 'Enter').length, 1);
+    assert.equal(client.draft, attachmentPrompt);
+    session.acceptHistory(history([turn('old', 'Earlier question'), turn(`lag-${lag}`, attachmentPrompt)]));
+    await response;
+  });
+}
+
+for (const change of ['lease', 'source', 'epoch']) {
+  test(`an exact slash menu still rejects a ${change} change before further navigation`, async t => {
+    const { session, client } = await start(t, { client: new PagedTmuxClient() });
+    client.completionAt = inAttachmentSlash;
+    let movesAtChange;
+    client.alterDraftFrame = raw => {
+      if (raw.includes(dim('No matches'))) {
+        movesAtChange ??= client.calls.filter(call => call.type === 'move').length;
+        if (change === 'lease') client.leaseActive = false;
+        if (change === 'source') session.history = history([turn('old', 'Earlier question'), turn('elsewhere', 'Another turn')]);
+        if (change === 'epoch') session.setVerified(false);
+      }
+      return raw;
+    };
+    const error = await session.prompt([{ type: 'text', text: attachmentPrompt }]).catch(error => error);
+    assert.equal(error.message, UNSUBMITTED_ANCHORED_DRAFT_ERROR);
+    assert.equal(error.multilineVerification.phase, 'scan');
+    assert.equal(error.multilineVerification.operation, 'context');
+    assert.equal(client.calls.filter(call => call.type === 'move').length, movesAtChange);
+    assert.equal(client.calls.some(call => ['remove-marker', 'Enter'].includes(call.type)), false);
+  });
+}
+
+for (const footer of ['Gemini 4 Argon · 5.1%', 'Unknown Model · 5.1%']) {
+  test(`an ordinary footer returning after slash completion must still match the pinned model: ${footer}`, async t => {
+    const { session, client } = await start(t, { client: new PagedTmuxClient(), ...catalogOptions });
+    client.completionAt = offset => {
+      if (offset === attachmentSlash + attachmentPath.length + 1) client.footer = footer;
+      return inAttachmentSlash(offset);
+    };
+    const error = await session.prompt([{ type: 'text', text: attachmentPrompt }]).catch(error => error);
+    assert.equal(error.message, UNSUBMITTED_ANCHORED_DRAFT_ERROR);
+    assert.equal(error.multilineVerification.phase, 'scan');
+    assert.equal(error.multilineVerification.operation, 'model');
+    assert.equal(client.calls.some(call => ['remove-marker', 'Enter'].includes(call.type)), false);
+  });
+}
+
+test('persistent empty slash completion at final enhanced EOF never removes the marker or submits', async t => {
+  const { session, client } = await start(t, { client: new PagedTmuxClient() });
+  const finalMoveCount = [...attachmentPrompt].length + 32 + 6;
+  client.completionAt = (offset, draft) => inAttachmentSlash(offset)
+    || offset === draft.length && client.calls.filter(call => call.type === 'move').length >= finalMoveCount;
+  const error = await session.prompt([{ type: 'text', text: attachmentPrompt }]).catch(error => error);
+  assert.equal(error.message, UNSUBMITTED_ANCHORED_DRAFT_ERROR);
+  assert.equal(error.multilineVerification.phase, 'scan-end-confirm');
+  assert.equal(error.multilineVerification.attempt, 15);
+  assert.equal(client.calls.filter(call => call.type === 'move').length, finalMoveCount);
+  assert.equal(client.calls.some(call => ['remove-marker', 'Enter'].includes(call.type)), false);
+  assert.equal(client.draft, attachmentPrompt + error.verificationAnchor.suffix);
+});
+
+for (const change of ['unknown-menu', 'draft', 'model', 'outside-token']) {
+  test(`slash completion cannot hide a changed ${change} during a multiline scan`, async t => {
+    const { session, client } = await start(t, { client: new PagedTmuxClient() });
+    client.completionAt = change === 'outside-token' ? offset => offset === 2 : inAttachmentSlash;
+    if (change === 'unknown-menu') client.completionLabel = 'Choose a command';
+    if (change === 'draft') client.alterDraftFrame = raw => raw.includes(dim('No matches'))
+      ? raw.replace('## example.mp4:', '## altered.mp4:') : raw;
+    if (change === 'model') client.onMove = () => { if (inAttachmentSlash(client.offset)) session.model = 'changed-model'; };
+    const error = await session.prompt([{ type: 'text', text: attachmentPrompt }]).catch(error => error);
+    assert.equal(error.message, UNSUBMITTED_ANCHORED_DRAFT_ERROR);
+    assert.equal(error.multilineVerification.phase, 'scan');
+    assert.equal(error.multilineVerification.offset, change === 'outside-token' ? 2 : attachmentSlash);
+    if (change === 'draft') assert.equal(error.multilineVerification.mismatch, 'row-content');
+    else if (change !== 'model') assert.equal(error.multilineVerification.mismatch, 'input-unavailable');
+    assert.equal(client.calls.some(call => ['remove-marker', 'Enter'].includes(call.type)), false);
+    assert.equal(client.draft, attachmentPrompt + error.verificationAnchor.suffix);
+  });
+}
+
+test('empty slash completion at the original EOF cannot authorize final submission', async t => {
+  const { session, client } = await start(t, { client: new PagedTmuxClient() });
+  let markerRemoved = false;
+  client.onRemoveMarker = () => { markerRemoved = true; };
+  client.completionAt = (offset, draft) => inAttachmentSlash(offset)
+    || markerRemoved && draft === attachmentPrompt && offset === draft.length;
+  const error = await session.prompt([{ type: 'text', text: attachmentPrompt }]).catch(error => error);
+  assert.equal(error.message, UNSUBMITTED_DRAFT_ERROR);
+  assert.equal(error.multilineVerification.phase, 'original-end');
+  assert.equal(error.multilineVerification.mismatch, 'input-unavailable');
+  assert.equal(error.multilineVerification.attempt, 15);
+  assert.equal(error.verificationAnchor, undefined);
+  assert.equal(client.draft, attachmentPrompt);
+  assert.equal(client.calls.some(call => call.type === 'Enter'), false);
 });
 
 for (const change of ['overlay', 'model', 'verification', 'source', 'lease']) {
@@ -869,6 +1048,7 @@ test('an anchored retry preserves its existing-marker journal if lease verificat
   assert.equal(error.verificationAnchor.suffix, suffix);
   assert.equal(client.calls.some(call => ['paste', 'marker', 'Enter'].includes(call.type)), false);
   assert.equal(client.draft, prompt + suffix);
+  assert.deepEqual(error.multilineVerification, { version: 1, phase: 'input-width', operation: 'context' });
 });
 
 test('a failure after exact marker removal retains an ordinary unsubmitted draft without an injected-anchor proof', async t => {
@@ -876,11 +1056,13 @@ test('a failure after exact marker removal retains an ordinary unsubmitted draft
   const { session, client } = await start(t, { client: new PagedTmuxClient() });
   client.onRemoveMarker = () => { client.overlay = '  Allow this command? [y/n]'; };
   const error = await session.prompt([{ type: 'text', text: prompt }]).catch(error => error);
-  assert.match(error.message, /^Cursor input changed or could not be verified after paste;/);
+  assert.equal(error.message, UNSUBMITTED_DRAFT_ERROR);
   assert.equal(error.verificationAnchor, undefined);
   assert.ok(error.unsubmittedDraft);
   assert.equal(client.draft, prompt);
   assert.equal(client.calls.some(call => call.type === 'Enter'), false);
+  assert.equal(error.multilineVerification.phase, 'original-end');
+  assert.equal(error.multilineVerification.mismatch, 'input-unavailable');
 });
 
 test('an eligible failed trailing-LF draft retries with a guarded Enter and no second paste', async t => {

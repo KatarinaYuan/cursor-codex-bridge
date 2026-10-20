@@ -43,6 +43,25 @@ test('recognizes the real default-theme placeholder with inverse caret', () => {
   assert.equal(parsed.currentReplyBody, 'Answer');
 });
 
+test('observes the exact empty slash palette without granting input or a model', () => {
+  const raw = draftScreen(['', '# Files mentioned by the user:', '', '## clip.mp4: /fixture/clip.mp4', '', 'Read the attachment.'], [{ row: 3, offset: 13 }]);
+  const palette = raw.replace(`${dim('Composer 2.5 · 5.1%')}\n${dim('~')}`, `     ${dim('No matches')}`);
+  const parsed = parseCursorScreen(palette);
+  assert.equal(parsed.inputCompletion, 'no-matches');
+  assert.equal(parsed.reason, 'unrecognized-footer-or-overlay');
+  assert.equal(parsed.inputAvailable, false);
+  assert.equal(parsed.ready, false);
+  assert.equal(parsed.modelName, null);
+  assert.deepEqual(parsed.inputDraft.caret, { row: 3, offset: 13 });
+  for (const footer of ['     No matches', `    ${dim('No matches')}`, `     ${dim('No matches!')}`,
+    `     ${dim('No matches')}\nAllow this command?`, `     ${dim('No matches')}\n${dim('~')}`]) {
+    assert.equal(parseCursorScreen(palette.replace(`     ${dim('No matches')}`, footer)).inputCompletion, null);
+  }
+  assert.equal(parseCursorScreen(palette.replace(/\x1b\[7m|\x1b\[27m/gu, '')).inputCompletion, null);
+  assert.equal(parseCursorScreen(palette.replace('→ ', '> ')).inputCompletion, null);
+  assert.equal(parseCursorScreen(palette.replace('Cursor Agent', 'Other Agent')).inputCompletion, null);
+});
+
 test('recognizes a fresh empty prompt and supported model/path footers', () => {
   const parsed = parseCursorScreen(screen({
     input: placeholder('Plan, search, build anything'),

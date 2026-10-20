@@ -557,7 +557,10 @@ export function createBridge({ send, log = () => {} }) {
       } else {
         t.status = 'failed';
         t.error = { message: e.message, codexErrorInfo: null, additionalDetails: null };
-        if (s.kind === 'tmux') retainUnsubmittedDraft(r, t, e.unsubmittedDraft, e.verificationAnchor);
+        if (s.kind === 'tmux') {
+          t.error.additionalDetails = (await import('./live.mjs')).multilineVerificationDetails(e.multilineVerification);
+          retainUnsubmittedDraft(r, t, e.unsubmittedDraft, e.verificationAnchor);
+        }
         notify('error', { threadId: r.thread.id, turnId: t.id, error: t.error, willRetry: false });
         log(`Cursor turn failed: ${e.message}`);
       }

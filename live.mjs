@@ -68,13 +68,64 @@ function matchesRenderedDraft(screen, text) {
     && /^ *$/u.test(row.slice(expected.rows[index].length)));
 }
 
-function matchesViewport(screen, expected) {
+function viewportMismatch(screen, expected, width, allowCompletion = false) {
   const actual = screen.inputDraft;
-  return Boolean(screen.inputAvailable && !screen.inputEmpty && actual?.caret
-    && actual.rows.length === expected.rows.length
-    && actual.caret.row === expected.caret.row && actual.caret.offset === expected.caret.offset
-    && actual.rows.every((row, index) => row.startsWith(expected.rows[index])
-      && /^ *$/u.test(row.slice(expected.rows[index].length))));
+  if (!screen.inputAvailable && !allowCompletion) return 'input-unavailable';
+  if (screen.inputEmpty) return 'input-empty';
+  if (!actual) return 'draft-missing';
+  if (!actual.caret) return 'caret-missing';
+  if (screen.inputWidth !== width) return 'width';
+  if (actual.rows.length !== expected.rows.length) return 'row-count';
+  if (actual.caret.row !== expected.caret.row) return 'caret-row';
+  if (actual.caret.offset !== expected.caret.offset) return 'caret-offset';
+  return actual.rows.every((row, index) => row.startsWith(expected.rows[index])
+    && /^ *$/u.test(row.slice(expected.rows[index].length))) ? 'none' : 'row-content';
+}
+
+function slashCompletionOffset(text, offset) {
+  for (const match of text.matchAll(/(?:^|\s)(\/\S*)/gu)) {
+    const start = match.index + match[0].length - match[1].length;
+    if (offset >= start && offset <= start + match[1].length) return true;
+  }
+  return false;
+}
+
+const multilinePhases = new Set(['input-width', 'plan', 'anchor-end', 'anchor-end-confirm',
+  'anchor-start', 'anchor-start-confirm', 'scan', 'scan-end-confirm', 'marker-remove', 'original-end', 'final-context']);
+const multilineOperations = new Set(['capture', 'context', 'plan', 'model', 'move-left', 'move-right',
+  'type-marker', 'adopt-marker', 'remove-marker']);
+const multilineMismatches = new Set(['none', 'input-unavailable', 'input-empty', 'draft-missing',
+  'caret-missing', 'width', 'row-count', 'caret-row', 'caret-offset', 'row-content']);
+const multilineReasons = new Set(['ready', 'input-has-draft', 'unrecognized-cursor-screen', 'incomplete-input-frame',
+  'agent-busy', 'unrecognized-input-mode', 'unrecognized-footer-or-overlay']);
+const multilineNumbers = {
+  offset: [0, 1024], scrollOffset: [0, 1024], attempt: [1, 15], expectedWidth: [1, 65535],
+  actualWidth: [0, 65535], expectedRows: [1, 6], actualRows: [0, 1007],
+  expectedCaretRow: [0, 5], expectedCaretOffset: [0, 1024], actualCaretRow: [0, 1007], actualCaretOffset: [0, 1024],
+};
+const multilineMeasurement = (key, value) => Number.isSafeInteger(value)
+  && value >= multilineNumbers[key][0] && value <= multilineNumbers[key][1] ? value : null;
+
+/** Only bounded structural metadata may enter a persisted/public error detail. */
+export function multilineVerificationDetails(value) {
+  try {
+    if (!value || Object.getPrototypeOf(value) !== Object.prototype) return null;
+    const { version, phase, operation } = value;
+    if (version !== 1 || !multilinePhases.has(phase) || !multilineOperations.has(operation)) return null;
+    const safe = { version, phase, operation };
+    for (const [key, item] of Object.entries(value)) {
+      if (['version', 'phase', 'operation'].includes(key)) continue;
+      if (key === 'mismatch') { if (!multilineMismatches.has(item)) return null; }
+      else if (key === 'screenReason') { if (!multilineReasons.has(item)) return null; }
+      else if (Object.hasOwn(multilineNumbers, key)) {
+        const [minimum, maximum] = multilineNumbers[key];
+        if (item === null && key.startsWith('actual')) { safe[key] = null; continue; }
+        if (!Number.isSafeInteger(item) || item < minimum || item > maximum) return null;
+      } else return null;
+      safe[key] = item;
+    }
+    return JSON.stringify({ multilineVerification: safe });
+  } catch { return null; }
 }
 
 function prelayoutColumns(code) {
@@ -356,7 +407,10 @@ export class TmuxSession extends EventEmitter {
     }
     const anchoredRetry = retryDraft?.proof?.version === 2;
     const journal = { version: 1, suffix, state: anchoredRetry ? 'injected' : 'notInserted' };
+    let diagnostic = { version: 1, phase: 'input-width', operation: 'capture' };
+    const phase = value => { diagnostic = { version: 1, phase: value, operation: 'context' }; };
     const assertContext = async (checkLease = true, full = false) => {
+      diagnostic.operation = 'context';
       this.assertVerified(epoch);
       if (checkLease) await lease.assertActive(full ? { full: true } : undefined);
       this.assertVerified(epoch);
@@ -373,21 +427,55 @@ export class TmuxSession extends EventEmitter {
       await assertContext(true, true);
       const width = widthScreen.inputWidth;
       const enriched = text + suffix;
+      phase('plan');
+      diagnostic.operation = 'plan';
       const plan = completeDraftPlan(enriched, width);
       const first = plan.pages[0];
       const tail = draftViewportSnapshot(enriched, width, { offset: enriched.length, scrollOffset: Math.max(0, enriched.split('\n').length - 6), maxLength: 1024 });
       const observe = async expected => {
         for (let attempt = 0; attempt < 15; attempt++) {
+          diagnostic = { version: 1, phase: diagnostic.phase, operation: 'context',
+            offset: expected.offset, scrollOffset: expected.scrollOffset, attempt: attempt + 1,
+            expectedWidth: width, expectedRows: expected.rows.length,
+            expectedCaretRow: expected.caret.row, expectedCaretOffset: expected.caret.offset };
           await assertContext();
+          diagnostic.operation = 'capture';
           const screen = parseCursorScreen(await this.client.capture(this.binding.paneId), { knownCursor: true });
+          // Cursor's empty slash completion consumes Right only as navigation.
+          // Its menu has no model footer: trust the pinned model only during
+          // an exact scan frame within the expected slash token, never at an
+          // anchor or at the final submission boundary.
+          const noMatches = screen.inputCompletion === 'no-matches'
+            && screen.reason === 'unrecognized-footer-or-overlay' && !screen.busy;
+          const completion = noMatches && diagnostic.phase === 'scan'
+            && slashCompletionOffset(enriched, expected.offset);
+          const completionClosing = noMatches && !completion
+            && viewportMismatch(screen, expected, width, true) === 'none';
+          Object.assign(diagnostic, { actualWidth: multilineMeasurement('actualWidth', screen.inputWidth),
+            actualRows: multilineMeasurement('actualRows', screen.inputDraft?.rows.length),
+            actualCaretRow: multilineMeasurement('actualCaretRow', screen.inputDraft?.caret?.row),
+            actualCaretOffset: multilineMeasurement('actualCaretOffset', screen.inputDraft?.caret?.offset),
+            screenReason: screen.reason, mismatch: viewportMismatch(screen, expected, width, completion) });
           await assertContext();
+          diagnostic.operation = 'capture';
           if (screen.inputAvailable) {
+            diagnostic.operation = 'model';
             this.observeModel(screen, true);
+            this.requireModel(expectedModel);
+          } else if (completion && diagnostic.mismatch === 'none') {
+            diagnostic.operation = 'model';
+            this.requireModel(expectedModel);
+          } else if (completionClosing) {
+            // The menu can trail a cursor move by one render. Keep observing
+            // this exact frame until the ordinary footer returns; this frame
+            // cannot authorize another movement, edit or final submission.
+            diagnostic.operation = 'model';
             this.requireModel(expectedModel);
           } else if (screen.busy || screen.reason === 'unrecognized-footer-or-overlay') {
             throw new Error(`Cursor input changed during multiline verification (${screen.reason}); no Enter was sent`);
           }
-          if (screen.inputWidth === width && matchesViewport(screen, expected)) return;
+          diagnostic.operation = 'capture';
+          if (diagnostic.mismatch === 'none') return;
           await new Promise(resolve => setTimeout(resolve, 40));
         }
         throw new Error('The complete multiline Cursor draft or its cursor position could not be verified; no Enter was sent');
@@ -397,6 +485,7 @@ export class TmuxSession extends EventEmitter {
         // before each raw key. Keep the local source/model checks around it
         // without duplicating two full transport inventories for every offset.
         await assertContext(false);
+        diagnostic.operation = `move-${direction}`;
         await lease.moveCursor(direction, count);
         await assertContext(false);
       };
@@ -404,44 +493,59 @@ export class TmuxSession extends EventEmitter {
       // unique temporary suffix makes EOF observable even after many blank
       // lines. It is typed, not pasted, so the original <=800-unit paste keeps
       // its exact inline spelling instead of becoming a folded paste token.
+      phase('anchor-end');
       await move('right', 800);
       if (anchoredRetry) await move('right', 800);
       if (!anchoredRetry) {
         journal.state = 'unknown';
+        diagnostic.operation = 'type-marker';
         await lease.typeAscii(suffix);
         journal.state = 'injected';
       }
       await observe(tail);
+      phase('anchor-end-confirm');
       await move('right', 1);
       await observe(tail);
       // Enhanced buffers may exceed 800; two bounded moves saturate the start.
+      phase('anchor-start');
       await move('left', 800);
       await move('left', 800);
       await observe(first);
+      phase('anchor-start-confirm');
       await move('left', 1);
       await observe(first);
       for (const page of plan.pages.slice(1)) {
+        phase('scan');
+        diagnostic.offset = page.offset;
         await move(page.movement.direction, page.movement.count);
         if (page.capture) await observe(page);
       }
+      phase('scan-end-confirm');
       await move('right', 1);
       await observe(tail);
       // The full enhanced text and its unique EOF were just observed under
       // this same lease. Delete exactly the acknowledged suffix once. A failed
       // or uncertain edit leaves a diagnostic draft; it never authorizes CR.
+      phase('marker-remove');
       await assertContext(true, true);
       if (anchoredRetry) {
         if (typeof lease.adoptAsciiMarker !== 'function') throw new Error('The Cursor input lease cannot safely recover its existing verification marker');
+        diagnostic.operation = 'adopt-marker';
         await lease.adoptAsciiMarker(suffix);
       }
       journal.state = 'unknown';
+      diagnostic.operation = 'remove-marker';
       await lease.backspace(suffix.length);
       journal.state = 'removed';
+      phase('original-end');
       await observe(draftViewportSnapshot(text, width, { offset: text.length,
         scrollOffset: tail.scrollOffset, maxLength: 1024 }));
+      phase('final-context');
       await assertContext(true, true);
+      diagnostic.operation = 'model';
       this.requireModel(expectedModel);
     } catch (error) {
+      error.multilineVerification = { ...diagnostic };
       if (journal.state !== 'removed') error.verificationAnchor = journal;
       if (journal.state === 'injected') error.message = UNSUBMITTED_ANCHORED_DRAFT_ERROR;
       else if (journal.state === 'removed') error.message = UNSUBMITTED_DRAFT_ERROR;

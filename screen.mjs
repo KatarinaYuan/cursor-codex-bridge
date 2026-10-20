@@ -205,6 +205,13 @@ export function parseCursorScreen(rawANSI, { knownCursor = false } = {}) {
   if (inputAvailable && !inputEmpty) reason = 'input-has-draft';
   const ready = reason === 'ready';
   const inputWidth = completeFrame ? lines[frame.start].cells.filter(cell => cell.background === INPUT_BACKGROUND).length - 5 : null;
+  // Cursor's empty slash palette replaces the entire model/path footer while
+  // a cursor crosses an absolute path. This is only a structural observation:
+  // it never grants readiness, model inference or permission to submit input.
+  const inputCompletion = reason === 'unrecognized-footer-or-overlay' && !busy && !inputEmpty
+    && inputMatch?.[1] === '→' && draft?.caret && footer.length === 1
+    && /^ {5}No matches$/u.test(footer[0].text) && allVisibleDim(footer[0])
+    ? 'no-matches' : null;
   return { text, body, currentTurnBody, currentReplyBody, inputText, inputDraft: draft, inputWidth, inputEmpty, inputAvailable, ready, busy, stopKey, blocked: !ready, prompt,
-    modelName: modelMatch?.[1]?.trim() ?? null, userMessages, reason };
+    modelName: modelMatch?.[1]?.trim() ?? null, userMessages, reason, inputCompletion };
 }
