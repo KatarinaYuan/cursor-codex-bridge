@@ -918,6 +918,9 @@ async function retireCompletedObserver(r) {
     || history.turns.some(turn => turn.id === proof.sourceTurnId)) return false;
   const execution = turnExecutions.get(r.thread.id);
   const session = sessions.get(r.thread.id);
+  if (session && (session.kind !== 'tmux' || session.sessionId !== proof.sessionId
+    || session.binding.paneId !== proof.paneId || session.binding.agentPid !== proof.agentPid
+    || session.binding.agentStartTime !== proof.agentStartTime)) return false;
   if (execution && (execution.turnId !== active[0].id || execution.session !== session)
     || (!execution && runningTurns.has(r.thread.id))) return false;
   const snapshot = async () => {
