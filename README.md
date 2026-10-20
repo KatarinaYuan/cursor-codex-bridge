@@ -19,15 +19,15 @@ Use Cursor Agent and your Cursor account from the Codex desktop app's native SSH
 在 laptop 上执行，把 `my-dev` 换成你已有的 SSH 别名：
 
 ```sh
-npx --yes --package=https://github.com/KatarinaYuan/cursor-codex-bridge/releases/download/v0.1.12/cursor-codex-bridge-0.1.12.tgz cursor-codex install --ssh my-dev
+npx --yes --package=https://github.com/KatarinaYuan/cursor-codex-bridge/releases/download/v0.1.13/cursor-codex-bridge-0.1.13.tgz cursor-codex install --ssh my-dev
 ```
 
-这是 GitHub 预发布版本 `v0.1.12` 的安装包，不是 npm 同名包。`npx` 会下载该版本及其依赖，然后运行安装器。也可以从源码安装或修改：
+这是 GitHub 预发布版本 `v0.1.13` 的安装包，不是 npm 同名包。`npx` 会下载该版本及其依赖，然后运行安装器。也可以从源码安装或修改：
 
 ```sh
 git clone https://github.com/KatarinaYuan/cursor-codex-bridge.git
 cd cursor-codex-bridge
-git checkout v0.1.12
+git checkout v0.1.13
 npm ci --ignore-scripts
 node cli.mjs install --ssh my-dev
 ```
@@ -51,7 +51,7 @@ node cli.mjs install --ssh my-dev --alias my-cursor \
 以下命令在任意 laptop 目录运行，不需要克隆仓库。先为当前终端设置安装包地址：
 
 ```sh
-BRIDGE_PACKAGE_URL=https://github.com/KatarinaYuan/cursor-codex-bridge/releases/download/v0.1.12/cursor-codex-bridge-0.1.12.tgz
+BRIDGE_PACKAGE_URL=https://github.com/KatarinaYuan/cursor-codex-bridge/releases/download/v0.1.13/cursor-codex-bridge-0.1.13.tgz
 
 # 只读检查；不调用付费模型，也不向现有聊天发测试消息
 npx --yes --package="$BRIDGE_PACKAGE_URL" cursor-codex doctor --ssh my-dev
@@ -64,7 +64,7 @@ npx --yes --package="$BRIDGE_PACKAGE_URL" cursor-codex upgrade --ssh my-dev
 npx --yes --package="$BRIDGE_PACKAGE_URL" cursor-codex uninstall --ssh my-dev
 ```
 
-`doctor` 返回码为 `0` 表示检查通过、`1` 表示发现阻断问题。升级到新版本时，从 [Releases](https://github.com/KatarinaYuan/cursor-codex-bridge/releases) 取得目标版本安装包 URL，替换 `BRIDGE_PACKAGE_URL` 后运行 `upgrade`；它部署当前调用的版本，不自行选择最新版本。用同一版本再次升级也可以。上面的地址已固定到 `v0.1.12`：修复多行草稿只读扫描中，斜杠菜单刷新延迟仍显示前一扫描位置而造成的误拒绝；仅对精确匹配的前一视口短暂追加画面捕获，不放宽光标或原文核验，保留附件恢复和 Recents 支持。升级完成后运行 `doctor`。已打开的 App 聊天可能继续缓存旧轮次顺序；SSH 重连不保证清空该缓存，客户端缓存重新加载和显示核验需单独完成。
+`doctor` 返回码为 `0` 表示检查通过、`1` 表示发现阻断问题。升级到新版本时，从 [Releases](https://github.com/KatarinaYuan/cursor-codex-bridge/releases) 取得目标版本安装包 URL，替换 `BRIDGE_PACKAGE_URL` 后运行 `upgrade`；它部署当前调用的版本，不自行选择最新版本。用同一版本再次升级也可以。上面的地址已固定到 `v0.1.13`：处理完整来源已结束、但重复用户封套导致旧版外部观察仍显示运行中的特定情况；需要原进程绑定和新鲜空闲画面等完整证据，只协调桥显示状态，保留原 Cursor 进程、模型和草稿，不重发请求。升级完成后运行 `doctor`。已打开的 App 聊天可能继续缓存旧轮次顺序；SSH 重连不保证清空该缓存，客户端缓存重新加载和显示核验需单独完成。
 
 升级和卸载遇到进行中的桥任务会拒绝操作；等待任务结束后再运行。程序不会结束原 Cursor Agent 或清空 tmux 草稿。源码安装也可在目标版本 checkout 使用 `node cli.mjs` 执行这些子命令，参数相同。
 
@@ -77,7 +77,7 @@ npx --yes --package="$BRIDGE_PACKAGE_URL" cursor-codex uninstall --ssh my-dev
 仓库附带一个安装 skill，可安装到 laptop 的 Codex skill 目录：
 
 ```sh
-npx --yes --package=https://github.com/KatarinaYuan/cursor-codex-bridge/releases/download/v0.1.12/cursor-codex-bridge-0.1.12.tgz cursor-codex install-skill
+npx --yes --package=https://github.com/KatarinaYuan/cursor-codex-bridge/releases/download/v0.1.13/cursor-codex-bridge-0.1.13.tgz cursor-codex install-skill
 ```
 
 也可指定目录：
@@ -88,7 +88,7 @@ npx --yes --package="$BRIDGE_PACKAGE_URL" cursor-codex install-skill --skill-dir
 
 这里的 `BRIDGE_PACKAGE_URL` 使用上文定义的版本地址。源码目录中也可运行 `node cli.mjs install-skill`。`--skill-dir` 指定 skill 的父目录。
 
-已有官方旧版 skill 的朋友也可直接运行同一条 `v0.1.12 install-skill` 命令：与目标内容相同则不改动；识别到未修改的官方 `v0.1.1`、`v0.1.2`、`v0.1.3`、`v0.1.4`、`v0.1.5`、`v0.1.6`、`v0.1.7`、`v0.1.8`、`v0.1.9`、`v0.1.10` 或 `v0.1.11` 两文件内容时，先保留旧目录备份，再原子更新，并输出备份路径。自定义内容、额外文件或符号链接会拒绝覆盖，保留用户修改，无需先手动删除旧目录。
+已有官方旧版 skill 的朋友也可直接运行同一条 `v0.1.13 install-skill` 命令：与目标内容相同则不改动；识别到未修改的官方 `v0.1.1`、`v0.1.2`、`v0.1.3`、`v0.1.4`、`v0.1.5`、`v0.1.6`、`v0.1.7`、`v0.1.8`、`v0.1.9`、`v0.1.10`、`v0.1.11` 或 `v0.1.12` 两文件内容时，先保留旧目录备份，再原子更新，并输出备份路径。自定义内容、额外文件或符号链接会拒绝覆盖，保留用户修改，无需先手动删除旧目录。
 
 也可以一条命令升级远端桥和本机安装 skill：
 
@@ -120,6 +120,8 @@ npx --yes --package="$BRIDGE_PACKAGE_URL" -c 'cursor-codex upgrade --ssh my-dev 
 
 `v0.1.6` 支持短消息包含超过六个显式文本行，保留原文、空行及首尾换行，无需合并段落。桥在原 pane 中临时独占输入，粘贴一次，再逐页核验完整草稿，确认后只提交一次；结束后恢复终端输入及临时窗口设置。窄窗口的软换行仍自动处理。已有草稿、输入锁、`pipe-pane` 或不支持的布局会阻止代发；详见 [排障](docs/troubleshooting.md)。
 
+`v0.1.13` 自动收尾的范围仅限结构可核对的旧 `v1` 外部观察：此前稳定的封套已成为重复封套，完整来源已完成，且仍绑定原先同一存活进程，新捕获的画面确认输入可用、任务不忙碌。桥把失去来源归属的旧观察预览保留为已中断，并说明原因；正式完成的来源卡片完整导入，不把歧义来源重新声明为实时归属。检查会周期重试，重启后及来源内容未变化时也可继续。整个过程不向 Cursor 输入，不重发请求，不改变原进程、模型或私人草稿。原生 `v2` 已提交请求遇到歧义时继续保留等待，不重绑、不重发，也不假报完成；其他缺少证据的卡住情况仍需诊断。
+
 `v0.1.12` 在多行只读扫描遇到斜杠菜单渲染延迟时，若画面精确等于前一扫描位置，只在有界时间内重新捕获画面，等待当前预期位置精确呈现；不补发方向键，不容忍光标偏差，也不编辑草稿。无法精确匹配、出现其他变化或等待超时仍拒绝提交。完整原文、来源凭据、模型状态栏、标记移除及唯一一次提交 Enter 的核验规则继续保留。
 
 `v0.1.11` 允许严格恢复凭据已确认的失败草稿匹配 App 重新上传的同一附件。范围仅限官方单附件包装：除上传路径的 UUID 标识变化外，其余全文必须逐字节一致；新旧文件都必须是非符号链接的普通文件，且内容逐字节相同。原生入口与 ACP 入口仅将实际输入归一到原已核验附件路径，再执行完整草稿核验；业务正文、首尾换行及原生队列对原请求的幂等摘要保持原样。缺少凭据、文件不同或其他文字变化时继续拒绝，不自动提交历史业务消息。
@@ -145,7 +147,7 @@ npm test
 
 测试使用模拟 Cursor 和隔离的临时数据，不发送付费模型请求。部分集成测试需要真实 Codex CLI；找不到该程序时会跳过。输入租约的进程与终端集成测试需要 Linux 和 tmux，其他环境会跳过。这些跳过不能计为集成验证成功。可通过 `CURSOR_BRIDGE_TEST_REAL_CODEX` 指定 Codex 可执行文件。
 
-附带尚未启用的 [GitHub Actions 模板](docs/github-actions-test.yml)，配置 Node.js 22/24、Linux/macOS。启用时将其保存为 `.github/workflows/test.yml`。真实 SSH、Codex App、Cursor 账号及现有 tmux 的组合需要单独验收。本版测试范围及待验收项见 [v0.1.12 验证说明](docs/verification-v0.1.12.md)；附件重传恢复的历史验证见 [v0.1.11 验证说明](docs/verification-v0.1.11.md)，附件路径扫描的历史验证见 [v0.1.10 验证说明](docs/verification-v0.1.10.md)，来源绑定和显示顺序的历史验证见 [v0.1.9 验证说明](docs/verification-v0.1.9.md)，混合宽度输入的历史验证范围见 [v0.1.8 验证说明](docs/verification-v0.1.8.md)，来源身份修复见 [v0.1.7 验证说明](docs/verification-v0.1.7.md)，多行发送等历史功能的测试范围见 [v0.1.6 验证说明](docs/verification-v0.1.6.md)，长消息发送的历史验收见 [v0.1.3 验证说明](docs/verification-v0.1.3.md)。欢迎附带脱敏诊断提交 issue 或 PR。
+附带尚未启用的 [GitHub Actions 模板](docs/github-actions-test.yml)，配置 Node.js 22/24、Linux/macOS。启用时将其保存为 `.github/workflows/test.yml`。真实 SSH、Codex App、Cursor 账号及现有 tmux 的组合需要单独验收。本版测试范围及待验收项见 [v0.1.13 验证说明](docs/verification-v0.1.13.md)；延迟视口扫描的历史验证见 [v0.1.12 验证说明](docs/verification-v0.1.12.md)，附件重传恢复的历史验证见 [v0.1.11 验证说明](docs/verification-v0.1.11.md)，附件路径扫描的历史验证见 [v0.1.10 验证说明](docs/verification-v0.1.10.md)，来源绑定和显示顺序的历史验证见 [v0.1.9 验证说明](docs/verification-v0.1.9.md)，混合宽度输入的历史验证范围见 [v0.1.8 验证说明](docs/verification-v0.1.8.md)，来源身份修复见 [v0.1.7 验证说明](docs/verification-v0.1.7.md)，多行发送等历史功能的测试范围见 [v0.1.6 验证说明](docs/verification-v0.1.6.md)，长消息发送的历史验收见 [v0.1.3 验证说明](docs/verification-v0.1.3.md)。欢迎附带脱敏诊断提交 issue 或 PR。
 
 ## 许可证
 

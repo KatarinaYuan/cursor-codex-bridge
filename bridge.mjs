@@ -11,6 +11,7 @@ import { expandModelVariants } from './model-labels.mjs';
 import { retryDraftFor, retainUnsubmittedDraft, pinLiveSourceTurn } from './draft-recovery.mjs';
 import { resolveAttachmentDraftRetry } from './draft-attachments.mjs';
 import { createMaintenanceGate } from './maintenance.mjs';
+import { planObserverRetirement } from './observer-recovery.mjs';
 
 const PROVIDER = 'cursor';
 const now = () => Math.floor(Date.now() / 1000);
@@ -40,6 +41,7 @@ const saveLocks = new Map();
 const routes = new Map();
 const runningTurns = new Set();
 const finishingTurns = new Set();
+const turnExecutions = new Map();
 const maintenance = createMaintenanceGate({
   file: process.env.CURSOR_BRIDGE_MAINTENANCE_FILE,
   locks: () => threadLocks.values(),
@@ -296,6 +298,7 @@ export function createBridge({ send, log = () => {} }) {
 
   async function ensureSession(r) {
     if (shuttingDown) throw new Error('Cursor bridge is shutting down');
+    await retireCompletedObserver(r);
     let existing = sessions.get(r.thread.id);
     if (r.backend === 'legacy' && tmuxSync) {
       const binding = await findTmuxBinding(r);
@@ -529,11 +532,12 @@ export function createBridge({ send, log = () => {} }) {
     }
   }
 
-  async function finishTurn(r, t, s, acpInput, externalPromise, expectedModel, retryDraft, nativeObserver) {
+  async function finishTurn(r, t, s, acpInput, externalPromise, expectedModel, retryDraft, nativeObserver, execution) {
     let detachedObserver = false;
     const nativeOrigin = nativeObserver?.turnId === t.id && nativeObserver.proof.origin === 'native';
     try {
       const result = await (externalPromise || s.prompt(acpInput, { model: expectedModel, retryDraft }));
+      if (execution.retiring || turnExecutions.get(r.thread.id) !== execution) return;
       if (result?.history) {
         // Replace the rendered terminal preview with exact transcript text
         // before matching source IDs. Both phases use the same native item.
@@ -562,6 +566,7 @@ export function createBridge({ send, log = () => {} }) {
       t.status = result?.stopReason === 'cancelled' ? 'interrupted' : result?.stopReason === 'failed' ? 'failed' : 'completed';
       if (t.status === 'failed') t.error = result.sourceTurn?.error || { message: 'Cursor CLI turn failed', codexErrorInfo: null, additionalDetails: null };
     } catch (e) {
+      if (execution.retiring || turnExecutions.get(r.thread.id) !== execution) return;
       if (s.kind === 'tmux' && ((externalPromise && nativeOrigin) || observerTurnProof(r, t.id))) {
         // Losing a read-only observer cannot fail the original Cursor task.
         // Keep its exact source ownership so another observer can adopt it.
@@ -579,7 +584,8 @@ export function createBridge({ send, log = () => {} }) {
       }
     } finally {
       try {
-        if (detachedObserver) await persist(r);
+        if (execution.retiring || turnExecutions.get(r.thread.id) !== execution) { /* Another transaction owns the terminal record. */ }
+        else if (detachedObserver) await persist(r);
         else {
           for (const item of t.items) if (item.type !== 'userMessage') {
             if (item.id === r.livePreviewIds?.[t.id]) item.phase = 'final_answer';
@@ -592,14 +598,20 @@ export function createBridge({ send, log = () => {} }) {
           notify('turn/completed', { threadId: r.thread.id, turn: t });
         }
       } finally {
-        runningTurns.delete(r.thread.id); s.turnCommitted?.();
-        if (!detachedObserver && t.status === 'completed') scheduleQueue(r.thread.id);
+        if (turnExecutions.get(r.thread.id) === execution) {
+          turnExecutions.delete(r.thread.id);
+          runningTurns.delete(r.thread.id); s.turnCommitted?.();
+          if (!execution.retiring && !detachedObserver && t.status === 'completed') scheduleQueue(r.thread.id);
+        }
       }
     }
   }
 
-  function launchTurn(...args) {
-    const pending = finishTurn(...args);
+  function launchTurn(r, t, s, input, external, model, draft, nativeObserver) {
+    const execution = { session: s, turnId: t.id, retiring: false, promise: null };
+    turnExecutions.set(r.thread.id, execution);
+    const pending = finishTurn(r, t, s, input, external, model, draft, nativeObserver, execution);
+    execution.promise = pending;
     finishingTurns.add(pending);
     pending.catch(error => log(`Cursor turn persist failed: ${error.message}`)).finally(() => finishingTurns.delete(pending));
   }
@@ -895,6 +907,57 @@ async function findTmuxBinding(r) {
   return binding || null;
 }
 
+// Called under the thread lock. This only retires an external display observer;
+// the original Agent is never cancelled, typed into, or assigned a new model.
+async function retireCompletedObserver(r) {
+  const active = r.thread.turns.filter(turn => turn.status === 'inProgress');
+  if (active.length !== 1 || !tmuxSync || shuttingDown) return false;
+  const proof = observerTurnProof(r, active[0].id);
+  const history = sourceHistories.get(r.cursorSessionId);
+  if (proof?.version !== 1 || history?.sourceComplete !== true
+    || history.turns.some(turn => turn.id === proof.sourceTurnId)) return false;
+  const execution = turnExecutions.get(r.thread.id);
+  const session = sessions.get(r.thread.id);
+  if (execution && (execution.turnId !== active[0].id || execution.session !== session)
+    || (!execution && runningTurns.has(r.thread.id))) return false;
+  const snapshot = async () => {
+    const candidate = await findTmuxBinding(r);
+    if (!candidate) return null;
+    const binding = await tmuxSync.client.verifiedBinding(candidate);
+    if (!binding || !tmuxSync.client.isVerified(binding)) return null;
+    const { parseCursorScreen } = await import('./screen.mjs');
+    const screen = parseCursorScreen(await tmuxSync.client.capture(binding.paneId), { knownCursor: true });
+    await tmuxSync.client.verifiedBinding(binding);
+    if (!tmuxSync.client.isVerified(binding)) return null;
+    const current = sourceHistories.get(r.cursorSessionId);
+    // An advancing scanner invalidates this observation. The next tick retries.
+    if (current !== history || sessions.get(r.thread.id) !== session) return null;
+    return planObserverRetirement(r, { history: current, binding, screen });
+  };
+  if (!await snapshot()) return false;
+  if (execution) execution.retiring = true;
+  if (session) await session.close();
+  if (execution) await execution.promise;
+  // Closing may await an in-flight capture. Recheck the original process and
+  // source before committing, without allowing an old finishTurn to commit too.
+  const candidate = await findTmuxBinding(r);
+  const binding = candidate && await tmuxSync.client.verifiedBinding(candidate);
+  if (!binding || !tmuxSync.client.isVerified(binding)
+    || sourceHistories.get(r.cursorSessionId) !== history) return false;
+  const { parseCursorScreen } = await import('./screen.mjs');
+  const screen = parseCursorScreen(await tmuxSync.client.capture(binding.paneId), { knownCursor: true });
+  await tmuxSync.client.verifiedBinding(binding);
+  if (!tmuxSync.client.isVerified(binding) || sourceHistories.get(r.cursorSessionId) !== history) return false;
+  const plan = planObserverRetirement(r, { history, binding, screen });
+  if (!plan) return false;
+  plan.record.thread.status = { type: 'idle' };
+  await persist(plan.record);
+  Object.assign(r, plan.record);
+  publishHistoryChanges(r, plan.turnsChanged, true);
+  status(r, 'idle');
+  return true;
+}
+
 async function startTmuxSync(log, attach) {
   if (tmuxSync || !historySync || process.platform !== 'linux' || process.env.CURSOR_BRIDGE_LIVE_TMUX === '0') return;
   const { TmuxClient } = await import('./tmux.mjs');
@@ -921,10 +984,13 @@ async function startTmuxSync(log, attach) {
         catch (error) { if (error.code === 'ENOENT') { s.detach(); sessions.delete(id); } }
       }
       for (const r of records.values()) {
-        if (r.backend !== 'legacy' || r.archived || runningTurns.has(r.thread.id) || threadLocks.has(r.thread.id)) continue;
+        if (r.backend !== 'legacy' || r.archived || threadLocks.has(r.thread.id)) continue;
         if (!state.bindings.some(binding => binding.sessionId === r.cursorSessionId)) continue;
         try {
-          await withThreadLock(r.thread.id, () => attach(r));
+          await withThreadLock(r.thread.id, async () => {
+            await retireCompletedObserver(r);
+            if (!runningTurns.has(r.thread.id)) await attach(r);
+          });
           state.attachErrors.delete(r.thread.id);
         } catch (error) {
           if (state.attachErrors.get(r.thread.id) !== error.message) log(`Tmux attach ${r.thread.id}: ${error.message}`);
