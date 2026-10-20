@@ -1,6 +1,6 @@
 import { spawn } from 'node:child_process';
 import { createInterface } from 'node:readline';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
@@ -9,12 +9,25 @@ import { findLiveSourceTurn, finalizeLivePreview, hasSubmittedTurnClaim, observe
 import { queueList, queueAdd, queueUpdate, queueDelete, queueReorder, queuePeek, queueConsume } from './queue.mjs';
 import { expandModelVariants } from './model-labels.mjs';
 import { retryDraftFor, retainUnsubmittedDraft, pinLiveSourceTurn } from './draft-recovery.mjs';
+import { resolveAttachmentDraftRetry } from './draft-attachments.mjs';
 import { createMaintenanceGate } from './maintenance.mjs';
 
 const PROVIDER = 'cursor';
 const now = () => Math.floor(Date.now() / 1000);
 const home = process.env.CODEX_HOME || path.join(os.homedir(), '.codex_cursor_bridge');
 const dataDir = path.join(home, 'cursor-bridge');
+const inputDigest = input => createHash('sha256').update(JSON.stringify(input)).digest('hex');
+
+function sameAdmittedInput(record, turn, user, input) {
+  if (JSON.stringify(user.content) === JSON.stringify(input)) return true;
+  const proof = record.attachmentDraftRequests?.[turn.id];
+  return proof?.version === 1 && typeof user.clientId === 'string'
+    && proof.clientUserMessageId === user.clientId
+    && /^[a-f0-9]{64}$/u.test(proof.requestInputSha256)
+    && /^[a-f0-9]{64}$/u.test(proof.canonicalInputSha256)
+    && inputDigest(input) === proof.requestInputSha256
+    && inputDigest(user.content) === proof.canonicalInputSha256;
+}
 const clients = new Set();
 const records = new Map();
 const sessions = new Map();
@@ -693,10 +706,14 @@ export function createBridge({ send, log = () => {} }) {
       }
       const submission = queuePeek(r, p.queuedSubmissionId);
       if (!submission) throw Object.assign(new Error('No queued Cursor messages to send'), { code: -32602 });
-      const admitted = r.thread.turns.find(t => t.items.some(item => item.type === 'userMessage' && item.clientId === submission.clientUserMessageId));
+      const candidates = r.thread.turns.filter(t => t.items.some(item => item.type === 'userMessage' && item.clientId === submission.clientUserMessageId));
+      const attachmentMatches = candidates.filter(t => r.attachmentDraftRequests?.[t.id]
+        && sameAdmittedInput(r, t, t.items.find(item => item.type === 'userMessage' && item.clientId === submission.clientUserMessageId), submission.input));
+      if (attachmentMatches.length > 1) throw Object.assign(new Error('Queued message ID has ambiguous attachment retry ownership'), { code: -32602 });
+      const admitted = attachmentMatches[0] || candidates[0];
       if (admitted) {
         const user = admitted.items.find(item => item.type === 'userMessage' && item.clientId === submission.clientUserMessageId);
-        if (JSON.stringify(user.content) !== JSON.stringify(submission.input)) throw Object.assign(new Error('Queued message ID already belongs to different input'), { code: -32602 });
+        if (!sameAdmittedInput(r, admitted, user, submission.input)) throw Object.assign(new Error('Queued message ID already belongs to different input'), { code: -32602 });
         r.queuedSubmissionTurns ||= {};
         r.queuedSubmissionTurns[submission.id] = admitted.id;
         queueConsume(r, submission.id);
@@ -762,14 +779,25 @@ export function createBridge({ send, log = () => {} }) {
       await maintenance.assertOpen();
       const r = requireRecord(p.threadId);
       if (activeTurn(r)) throw new Error('Cursor turn is already running; wait for it or interrupt it');
-      const input = p.input?.length ? p.input : typeof p.toolOutput?.output === 'string' && p.toolOutput.output.trim()
+      let input = p.input?.length ? p.input : typeof p.toolOutput?.output === 'string' && p.toolOutput.output.trim()
         ? [{ type: 'text', text: p.toolOutput.output, text_elements: [] }] : [];
-      const acpInput = await inputsToAcp(input);
+      let acpInput = await inputsToAcp(input);
       const s = await ensureSession(r);
       if (r.backend === 'legacy' && acpInput.some(block => block.type !== 'text')) {
         throw new Error('An existing Cursor CLI chat currently accepts text messages only');
       }
-      const retryDraft = s.kind === 'tmux' ? retryDraftFor(r, s.binding, s.history, acpInput) : null;
+      let retryDraft = s.kind === 'tmux' ? retryDraftFor(r, s.binding, s.history, acpInput) : null;
+      const attachmentRetry = !retryDraft && s.kind === 'tmux'
+        ? await resolveAttachmentDraftRetry({ record: r, binding: s.binding, history: s.history, input, home }) : null;
+      if (attachmentRetry) {
+        // The App may upload the exact same attachment again under a fresh UUID.
+        // Keep both the native message and Cursor's proven draft on the original
+        // byte-identical file reference before publishing or persisting either.
+        input = attachmentRetry.input;
+        acpInput = await inputsToAcp(input);
+        retryDraft = retryDraftFor(r, s.binding, s.history, acpInput);
+        if (!retryDraft) throw new Error('The failed Cursor draft changed while verifying its attachment retry; no Enter was sent');
+      }
       if (s.kind === 'tmux') await s.assertReady({ retryDraft, deferDraftCheck: Boolean(retryDraft) });
       const requestedModel = p.model || p.collaborationMode?.settings?.model;
       if (requestedModel && (s.kind === 'tmux' || requestedModel !== r.thread.model)) {
@@ -779,6 +807,11 @@ export function createBridge({ send, log = () => {} }) {
       routes.set(r.thread.id, { client, ask });
       t.rootTurnId = t.id; r.thread.turns.push(t); runningTurns.add(r.thread.id);
       const message = { type: 'userMessage', id: uuid(), clientId: p.clientUserMessageId || null, content: input };
+      if (attachmentRetry && message.clientId) {
+        r.attachmentDraftRequests ||= {};
+        r.attachmentDraftRequests[t.id] = { version: 1, clientUserMessageId: message.clientId,
+          requestInputSha256: attachmentRetry.requestInputSha256, canonicalInputSha256: inputDigest(input) };
+      }
       const text = input.filter(i => i.type === 'text').map(i => i.text).join('\n');
       if (!r.thread.preview) {
         r.thread.preview = text.slice(0, 1000); r.thread.name = text.split('\n').find(Boolean)?.slice(0, 90) || 'Cursor Agent';
