@@ -76,6 +76,21 @@ function allVisibleDim(line) {
   return visible.length > 0 && visible.every(cell => cell.dim);
 }
 
+function questionOverlay(lines) {
+  const visible = lines.map(line => line.text.trim()).filter(Boolean);
+  if (!/^└─+┘$/u.test(visible.at(-1) || '')) return false;
+  const start = visible.findLastIndex(line => /^┌─+┐$/u.test(line));
+  if (start < 0) return false;
+  const box = visible.slice(start + 1, -1);
+  if (!box.length || box.some(line => !/^│.*│$/u.test(line))) return false;
+  const content = box.map(line => line.slice(1, -1).trim()).filter(Boolean);
+  const position = content[1]?.match(/^Question ([1-9]\d*) of ([1-9]\d*)$/u);
+  return content[0] === 'Clarifying Questions' && Boolean(position)
+    && Number.isSafeInteger(Number(position[2])) && Number(position[1]) <= Number(position[2])
+    && content.some(line => /^(?:›\s*)?\[[ x]\]\s+\S/u.test(line))
+    && content.at(-1) === '↑/↓ option · ←/→ question · Space select · Enter next/submit · Esc to skip';
+}
+
 function modelFooter(line) {
   if (!line) return null;
   const match = line.text.trim().match(/^(.{1,100}?)\s+[·•]\s+(\d+(?:\.\d+)?)%(?:\s+[·•]\s+\d+\s+files?\s+edited)?(?: {2,}(Run Everything))?$/u);
@@ -183,7 +198,7 @@ export function parseCursorScreen(rawANSI, { knownCursor = false } = {}) {
   const inputEmpty = Boolean(inputMatch?.[1] === '→' && placeholder && styledPlaceholder);
   const prompt = inputMatch ? (inputEmpty ? '' : inputMatch[2].trim()) : inputText;
   const headerIndex = lines.findIndex(line => /^Cursor Agent(?:\s|$)/.test(line.text.trim()));
-  const hasHeader = headerIndex >= 0 && lines[headerIndex].text.trim() === 'Cursor Agent' && headerIndex < (frame?.start ?? 0)
+  const hasHeader = headerIndex >= 0 && lines[headerIndex].text.trim() === 'Cursor Agent' && headerIndex < (frame?.start ?? lines.length)
     && lines.slice(headerIndex + 1, headerIndex + 5).some(line => /^v\d{4}\.\d{1,2}\.\d{1,2}(?:-[\w.-]+)?$/.test(line.text.trim()));
   // A long conversation may have scrolled its header beyond capture history.
   // Only a caller that verified the pane's process identity may waive it;
@@ -195,8 +210,12 @@ export function parseCursorScreen(rawANSI, { knownCursor = false } = {}) {
     ? (/^ctrl/i.test(stopHint[1]) ? 'C-c' : 'Escape') : null;
   const modelMatch = modelFooter(footer[0]);
   const hasFooter = Boolean(modelMatch) && cwdFooter(footer.slice(1), frame ? lines[frame.start].cells.length : 0);
+  // This attests only a read-only question display. It grants neither input
+  // readiness nor model inference, and never answers or dismisses the question.
+  const waitingForQuestion = recognizedCursor && !busy && questionOverlay(lines);
   let reason = 'ready';
   if (!recognizedCursor) reason = 'unrecognized-cursor-screen';
+  else if (waitingForQuestion) reason = 'question-awaiting-answer';
   else if (!completeFrame) reason = 'incomplete-input-frame';
   else if (busy) reason = 'agent-busy';
   else if (!inputMatch || inputMatch[1] !== '→') reason = 'unrecognized-input-mode';
@@ -212,6 +231,6 @@ export function parseCursorScreen(rawANSI, { knownCursor = false } = {}) {
     && inputMatch?.[1] === '→' && draft?.caret && footer.length === 1
     && /^ {5}No matches$/u.test(footer[0].text) && allVisibleDim(footer[0])
     ? 'no-matches' : null;
-  return { text, body, currentTurnBody, currentReplyBody, inputText, inputDraft: draft, inputWidth, inputEmpty, inputAvailable, ready, busy, stopKey, blocked: !ready, prompt,
+  return { text, body, currentTurnBody, currentReplyBody, inputText, inputDraft: draft, inputWidth, inputEmpty, inputAvailable, ready, busy, stopKey, waitingForQuestion, blocked: !ready, prompt,
     modelName: modelMatch?.[1]?.trim() ?? null, userMessages, reason, inputCompletion };
 }

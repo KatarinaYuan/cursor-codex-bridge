@@ -2,7 +2,8 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { parseTranscript } from './history.mjs';
 import { nativeTurnTextSha256, submittedTurnTextSha256 } from './live-history.mjs';
-import { OBSERVER_IDENTITY_LOSS_ERROR, planObserverRetirement } from './observer-recovery.mjs';
+import { OBSERVER_IDENTITY_LOSS_ERROR, observerRetirementCandidate, planObserverRetirement } from './observer-recovery.mjs';
+import { parseCursorScreen } from './screen.mjs';
 import { reconcileHistory } from './sync.mjs';
 
 const envelope = (text, minute) => `<timestamp>Monday, Oct 19, 2026, 11:${minute} AM (UTC)</timestamp>\n<user_query>${text}</user_query>`;
@@ -71,6 +72,8 @@ for (const draft of [false, true]) test(`retires only the stale observer and imp
   assert.deepEqual(result.record.thread.turns[0], f.record.thread.turns[0]);
   assert.equal(result.record.thread.turns.slice(2).every(turn => turn.status === 'completed'), true);
   assert.equal(result.record.tmuxObserverTurns[f.preview.id], undefined);
+  assert.deepEqual(result.record.retiredObserverTurns[f.preview.id], before.record.tmuxObserverTurns[f.preview.id]);
+  assert.notEqual(result.record.retiredObserverTurns[f.preview.id], before.record.tmuxObserverTurns[f.preview.id]);
   assert.equal(Object.values(result.record.historySync.sourceTurns).includes(f.preview.id), false);
   assert.equal(Object.values(result.record.historySync.sourceItems).some(id => f.preview.items.some(item => item.id === id)), false);
   assert.equal(result.record.historySync.sourceTurns[f.source.id], undefined);
@@ -169,14 +172,242 @@ test('retirement refuses every missing or uncertain completion, process, identit
   }
 });
 
-test('even a fully valid native version 2 proof cannot be retired through ambiguous display identities', () => {
-  const f = fixture();
-  const user = f.preview.items[0]; user.clientId = 'native-client';
-  Object.assign(f.record.tmuxObserverTurns[f.preview.id], { version: 2, origin: 'native', clientId: user.clientId,
-    model: f.record.thread.model, userTextSha256: submittedTurnTextSha256(f.preview), nativeUserTextSha256: nativeTurnTextSha256(f.preview) });
-  const before = structuredClone(f.record);
+function advancedFixture({ native = true, busy = true, unfinished = true, matchingPreview = false } = {}) {
+  const f = fixture({ matchingPreview });
+  if (native) {
+    const user = f.preview.items[0]; user.clientId = 'native-client';
+    Object.assign(f.record.tmuxObserverTurns[f.preview.id], { version: 2, origin: 'native', clientId: user.clientId,
+      model: f.record.thread.model, userTextSha256: submittedTurnTextSha256(f.preview), nativeUserTextSha256: nativeTurnTextSha256(f.preview) });
+  }
+  if (unfinished) {
+    f.history.sourceComplete = false;
+    f.history.completedTurnIds.pop();
+    f.history.turns.at(-1).items[1].text = 'Only a partial successor reply';
+  }
+  if (busy) {
+    const row = (text, rgb = '242;242;242') => ` \x1b[48;2;${rgb}m ${text}${' '.repeat(80)}\x1b[49m`;
+    f.screen = parseCursorScreen([
+      '  Cursor Agent', '  v2026.10.19-test',
+      row('A later question', '227;227;227'), 'Only a partial successor reply',
+      row(''), row('→ Add a follow-up    ctrl+c to stop'), row(''),
+    ].join('\n'), { knownCursor: true });
+    assert.equal(f.screen.reason, 'agent-busy');
+    assert.equal(f.screen.modelName, null, 'a busy frame need not expose its model');
+  }
+  return f;
+}
+
+test('native version 2 retirement still refuses ambiguous identities without a valid later boundary', () => {
+  const f = advancedFixture({ busy: false, unfinished: false });
+  f.history.turns.pop(); f.history.completedTurnIds.pop();
+  const before = structuredClone(f);
   assert.equal(planObserverRetirement(f.record, f), null);
-  assert.deepEqual(f.record, before);
+  assert.deepEqual(f, before);
+});
+
+for (const native of [false, true]) test(`a later busy stable turn releases a version ${native ? 2 : 1} observer and imports only its completed prefix`, () => {
+  const f = advancedFixture({ native, matchingPreview: true });
+  const before = structuredClone(f);
+  const candidate = observerRetirementCandidate(f.record, f.history);
+  assert.ok(candidate);
+  assert.equal(candidate.turn, f.preview);
+  assert.equal(candidate.proof.version, native ? 2 : 1);
+  assert.equal(candidate.boundaryTurnId, f.history.turns.at(-1).id);
+  assert.equal(candidate.advanced, true);
+  assert.deepEqual(candidate.importTurns, f.history.turns.slice(0, -1));
+  const result = planObserverRetirement(f.record, f);
+  assert.ok(result);
+  assert.deepEqual(f, before, 'planning keeps record, canonical capture and bindings pure');
+  const retired = result.record.thread.turns.find(turn => turn.id === f.preview.id);
+  assert.equal(retired.status, 'interrupted');
+  assert.deepEqual(retired.items, f.preview.items);
+  assert.deepEqual(result.record.retiredObserverTurns[f.preview.id], f.record.tmuxObserverTurns[f.preview.id]);
+  assert.equal(result.record.thread.model, f.record.thread.model);
+  assert.deepEqual(result.record.queuedSubmissions, f.record.queuedSubmissions);
+  assert.deepEqual(result.record.thread.turns.map(turn => turn.id),
+    [f.history.turns[0].id, f.preview.id, ...f.history.turns.slice(1, -1).map(turn => turn.id)]);
+  for (const source of f.history.turns.slice(1, -1)) {
+    assert.notEqual(result.record.historySync.sourceTurns[source.id], f.preview.id);
+  }
+  const tail = f.history.turns.at(-1);
+  assert.equal(result.record.historySync.sourceTurns[tail.id], undefined);
+  assert.equal(result.record.thread.turns.some(turn => turn.id === tail.id), false, 'provisional parser completion is not end evidence');
+  assert.equal(Object.values(result.record.historySync.sourceItems).some(id => retired.items.some(item => item.id === id)), false);
+  assert.equal(planObserverRetirement(JSON.parse(JSON.stringify(result.record)), f), null);
+});
+
+test('a completed later boundary permits native retirement on an idle capture', () => {
+  const f = advancedFixture({ busy: false, unfinished: false });
+  const result = planObserverRetirement(f.record, f);
+  assert.ok(result);
+  assert.equal(result.record.thread.turns.at(-1).id, f.history.turns.at(-1).id);
+  assert.equal(result.record.thread.turns.at(-1).status, 'completed');
+});
+
+test('a busy capture of a later explicitly completed boundary also preserves its canonical card', () => {
+  const f = advancedFixture({ unfinished: false });
+  f.history.sourceComplete = false;
+  const result = planObserverRetirement(f.record, f);
+  assert.ok(result);
+  assert.equal(result.record.thread.turns.at(-1).id, f.history.turns.at(-1).id);
+});
+
+test('version 1 globally completed idle recovery remains possible without any later turn', () => {
+  const f = fixture();
+  f.history.turns.pop(); f.history.completedTurnIds.pop();
+  assert.equal(observerRetirementCandidate(f.record, f.history).advanced, false);
+  assert.ok(planObserverRetirement(f.record, f));
+});
+
+test('advanced retirement refuses uncertain boundary, schema, completion, binding, proof and native user mapping evidence', () => {
+  const mutations = [
+    f => { f.history.turns.at(-1).sourceTimestampMinute = f.history.turns[1].sourceTimestampMinute; },
+    f => { f.history.turns.at(-1).sourceTimestampMinute = f.history.turns[1].sourceTimestampMinute - 60_000; },
+    f => { delete f.history.turns.at(-1).sourceTimestampMinute; },
+    f => { f.history.turns.at(-1).sourceTimestampMinute += 1; },
+    f => { f.history.turns.at(-1).sourceTimestampMinute = String(f.history.turns.at(-1).sourceTimestampMinute); },
+    f => { f.history.turns[1].sourceTimestampMinute -= 60_000; },
+    f => { delete f.history.turns[1].sourceTimestampMinute; },
+    f => { f.history.turns.at(-1).sourceIdentity.version = 2; },
+    f => { f.history.turns.at(-1).sourceIdentity.strength = 'position'; },
+    f => { f.history.turns.at(-1).sourceIdentity.kind = 'legacy-position'; },
+    f => { f.history.turns.at(-1).sourceIdentity.sha256 = 'invalid'; },
+    f => { f.history.turns.at(-1).id += ':unknown'; },
+    f => { f.history.turns.at(-1).status = 'unknown'; },
+    f => { f.history.turns.at(-1).items[0].clientId = 'untrusted-client'; },
+    f => { f.history.turns.at(-1).items[0].content[0].type = 'image'; },
+    f => { f.history.turns.at(-1).items[0].content[0].text = ' '; },
+    f => { f.history.turns[0].items[0].id = f.history.turns[1].items[0].id; },
+    f => { f.history.turns[1].items[1].type = 'toolCall'; },
+    f => { f.history.turns[2].sourceIdentity.version = 2; },
+    f => { f.history.turns[2].items[0].content[0].text = 'Continue carefully\non this line'; },
+    f => { f.history.turns[2].status = 'inProgress'; },
+    f => { f.history.sourceIdentityScheme = 'cursor-envelope-v2'; },
+    f => { delete f.history.sourceComplete; },
+    f => { delete f.history.completedTurnIds; },
+    f => { f.history.completedTurnIds.shift(); },
+    f => { f.history.completedTurnIds.pop(); },
+    f => { f.history.completedTurnIds.push(f.history.completedTurnIds[0]); },
+    f => { f.history.completedTurnIds.push('unknown-source'); },
+    f => { f.history.turns.push(structuredClone(f.history.turns.at(-1))); },
+    f => { f.history.turns.splice(1, 0, f.history.turns.pop()); },
+    f => { f.history.id = 'other-session'; },
+    f => { f.history.cwd = '/other-project'; },
+    f => { f.binding.cwd = '/other-project'; },
+    f => { f.binding.sessionId = 'other-session'; },
+    f => { f.binding.paneId = '%9'; },
+    f => { f.binding.agentPid++; },
+    f => { f.binding.agentStartTime = '999999'; },
+    f => { f.record.tmuxAffinity.agentStartTime = '999999'; },
+    f => { f.record.thread.model = 'a-different-model'; },
+    f => { f.record.tmuxObserverTurns[f.preview.id].model = 'a-different-model'; },
+    f => { f.record.tmuxObserverTurns[f.preview.id].extra = true; },
+    f => { f.record.tmuxObserverTurns[f.preview.id].nativeUserTextSha256 = 'f'.repeat(64); },
+    f => { f.preview.items[0].clientId = 'different-client'; },
+    f => { f.preview.items[0].content[0].text += ' '; },
+    f => { f.preview.unsubmittedDraft = { retained: true }; },
+    f => { f.record.thread.turns.push({ id: 'unrelated-active', status: 'inProgress', items: [] }); },
+    f => { delete f.record.historySync.sourceItems[`${f.source.id}:user`]; },
+    f => { f.record.historySync.sourceItems[`${f.source.id}:user`] = 'wrong-native-user'; },
+    f => { f.record.historySync.sourceItems.alias = f.preview.items[0].id; },
+    f => { f.record.historySync.sourceTurns.alias = f.preview.id; },
+    f => { f.record.retiredObserverTurns = { [f.preview.id]: structuredClone(f.record.tmuxObserverTurns[f.preview.id]) }; },
+  ];
+  for (const mutate of mutations) {
+    const f = advancedFixture(); mutate(f);
+    const before = structuredClone(f);
+    assert.equal(planObserverRetirement(f.record, f) === null, true, mutate.toString());
+    assert.deepEqual(f, before, 'every rejected advanced plan remains pure');
+  }
+});
+
+test('a busy successor requires a complete recognized capture of the exact latest user boundary', () => {
+  const mutations = [
+    f => { f.screen.busy = false; },
+    f => { delete f.screen.busy; },
+    f => { f.screen.reason = 'unrecognized-cursor-screen'; },
+    f => { f.screen.reason = 'incomplete-input-frame'; },
+    f => { f.screen.reason = 'unrecognized-footer-or-overlay'; },
+    f => { f.screen.inputAvailable = true; },
+    f => { delete f.screen.inputAvailable; },
+    f => { f.screen.ready = true; },
+    f => { delete f.screen.stopKey; },
+    f => { f.screen.stopKey = 'Enter'; },
+    f => { f.screen.userMessages = []; },
+    f => { f.screen.userMessages = ['Continue  carefully\non this line']; },
+    f => { f.screen.userMessages.push('A newer screen-only user'); },
+  ];
+  for (const mutate of mutations) {
+    const f = advancedFixture(); mutate(f);
+    const before = structuredClone(f);
+    assert.equal(planObserverRetirement(f.record, f) === null, true, mutate.toString());
+    assert.deepEqual(f, before);
+  }
+  const wrapped = advancedFixture();
+  wrapped.screen.userMessages = ['Earlier visible prompt', 'A later\nquestion'];
+  assert.ok(planObserverRetirement(wrapped.record, wrapped), 'screen soft wrapping follows the live observer comparison');
+});
+
+function questionFixture(native = true) {
+  const f = advancedFixture({ native, busy: false });
+  Object.assign(f.screen, { waitingForQuestion: true, busy: false, ready: false, inputAvailable: false,
+    stopKey: null, reason: 'incomplete-input-frame', userMessages: ['A later question'], modelName: null,
+    inputText: 'Cursor Clarifying Questions\nQuestion 1 of 2\nPrivate typed answer stays here',
+    inputDraft: { rows: ['Private typed answer stays here'], caret: { row: 0, offset: 29 }, width: 80 } });
+  return f;
+}
+
+for (const native of [false, true]) test(`a recognized clarifying question releases version ${native ? 2 : 1} ownership without importing its unfinished successor or touching input`, () => {
+  const f = questionFixture(native);
+  const before = structuredClone(f);
+  const result = planObserverRetirement(f.record, f);
+  assert.ok(result);
+  assert.deepEqual(f, before, 'the question overlay, private answer and all recovery inputs remain untouched');
+  const retired = result.record.thread.turns.find(turn => turn.id === f.preview.id);
+  assert.equal(retired.status, 'interrupted');
+  assert.deepEqual(retired.items, f.preview.items);
+  assert.deepEqual(result.record.retiredObserverTurns[f.preview.id], f.record.tmuxObserverTurns[f.preview.id]);
+  assert.equal(result.record.thread.model, f.record.thread.model);
+  assert.deepEqual(result.record.privateDraft, f.record.privateDraft);
+  assert.deepEqual(result.record.queuedSubmissions, f.record.queuedSubmissions);
+  assert.deepEqual(result.record.thread.turns.map(turn => turn.id),
+    [f.history.turns[0].id, f.preview.id, ...f.history.turns.slice(1, -1).map(turn => turn.id)]);
+  assert.equal(result.record.historySync.sourceTurns[f.history.turns.at(-1).id], undefined);
+  assert.equal(Object.values(result.record.historySync.sourceTurns).includes(f.preview.id), false);
+  assert.equal(Object.values(result.record.historySync.sourceItems).some(id => retired.items.some(item => item.id === id)), false);
+});
+
+test('a clarifying-question successor requires explicit parser recognition, unavailable input and the latest proven boundary', () => {
+  const mutations = [
+    f => { delete f.screen.waitingForQuestion; },
+    f => { f.screen.waitingForQuestion = false; },
+    f => { f.screen.waitingForQuestion = 'true'; },
+    f => { f.screen.busy = true; },
+    f => { delete f.screen.busy; },
+    f => { f.screen.ready = true; },
+    f => { delete f.screen.ready; },
+    f => { f.screen.inputAvailable = true; },
+    f => { delete f.screen.inputAvailable; },
+    f => { f.screen.stopKey = 'Escape'; },
+    f => { delete f.screen.stopKey; },
+    f => { delete f.screen.userMessages; },
+    f => { f.screen.userMessages = []; },
+    f => { f.screen.userMessages = ['Continue  carefully\non this line']; },
+    f => { f.screen.userMessages.push('A different latest question'); },
+    f => { f.history.turns.at(-1).sourceTimestampMinute = f.history.turns[1].sourceTimestampMinute; },
+    f => { f.history.turns.at(-1).sourceIdentity.strength = 'ambiguous'; },
+    f => { f.history.completedTurnIds.pop(); },
+    f => { f.binding.agentStartTime = '999999'; },
+    f => { f.record.thread.model = 'changed-model'; },
+    f => { f.preview.unsubmittedDraft = { retained: true }; },
+    f => { f.record.historySync.sourceItems.alias = f.preview.items[0].id; },
+  ];
+  for (const mutate of mutations) {
+    const f = questionFixture(); mutate(f);
+    const before = structuredClone(f);
+    assert.equal(planObserverRetirement(f.record, f) === null, true, mutate.toString());
+    assert.deepEqual(f, before, 'rejected question recovery never edits private input or persisted evidence');
+  }
 });
 
 test('other saved observer evidence and retained drafts are untouched', () => {

@@ -687,7 +687,7 @@ async function releasedSkillInstallation(t, version = '0.1.12', { customParent =
     await fs.writeFile(path.join(source, 'agents', 'openai.yaml'), releasedSkillMetadata);
   }
   await fs.mkdir(path.join(destination, 'agents'), { recursive: true });
-  const original = ['0.1.4', '0.1.5', '0.1.6', '0.1.7', '0.1.8', '0.1.9', '0.1.10', '0.1.11', '0.1.12'].includes(version)
+  const original = ['0.1.4', '0.1.5', '0.1.6', '0.1.7', '0.1.8', '0.1.9', '0.1.10', '0.1.11', '0.1.12', '0.1.13'].includes(version)
     ? await fs.readFile(new URL(`./fixtures/install-skill-v${version}.md`, import.meta.url), 'utf8')
     : releasedSkill.replaceAll('0.1.3', version);
   await fs.writeFile(path.join(destination, 'SKILL.md'), original);
@@ -697,7 +697,7 @@ async function releasedSkillInstallation(t, version = '0.1.12', { customParent =
 }
 
 test('install-skill safely upgrades each unmodified published release and retains its complete backup', async t => {
-  for (const version of ['0.1.1', '0.1.2', '0.1.3', '0.1.4', '0.1.5', '0.1.6', '0.1.7', '0.1.8', '0.1.9', '0.1.10', '0.1.11', '0.1.12']) {
+  for (const version of ['0.1.1', '0.1.2', '0.1.3', '0.1.4', '0.1.5', '0.1.6', '0.1.7', '0.1.8', '0.1.9', '0.1.10', '0.1.11', '0.1.12', '0.1.13']) {
     const f = await releasedSkillInstallation(t, version, { customParent: version === '0.1.2' });
     const result = await installSkill(f.settings);
     assert.equal(result.changed, true);
@@ -750,6 +750,12 @@ test('the v0.1.11 upgrade fixture and UI metadata match the published official f
 test('the v0.1.12 upgrade fixture and UI metadata match the published official file hashes', async () => {
   const original = await fs.readFile(new URL('./fixtures/install-skill-v0.1.12.md', import.meta.url));
   assert.equal(createHash('sha256').update(original).digest('hex'), '997d4c647e34799c21f29b39a6cb1360ef5958c081e28c973d303bb1271b5de3');
+  assert.equal(createHash('sha256').update(releasedSkillMetadata).digest('hex'), '63b8acb9292c020c48526eade247f7c18ceeb6928155eb400b3071b0ff2bc027');
+});
+
+test('the v0.1.13 upgrade fixture and UI metadata match the published official file hashes', async () => {
+  const original = await fs.readFile(new URL('./fixtures/install-skill-v0.1.13.md', import.meta.url));
+  assert.equal(createHash('sha256').update(original).digest('hex'), '6c85e71dc5da9115bed2b61a6aeb6a99974efd0f5e435c0197f91306a645f2d7');
   assert.equal(createHash('sha256').update(releasedSkillMetadata).digest('hex'), '63b8acb9292c020c48526eade247f7c18ceeb6928155eb400b3071b0ff2bc027');
 });
 

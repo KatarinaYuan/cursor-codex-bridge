@@ -215,6 +215,7 @@ const publishedSkillHashes = new Set([
   '08624899418b8465ea31901d19913da126e3992d458a43432a0cfd5a2bef1e55', // v0.1.10
   '5cc08aeb33c7101fd017b13a0d196709c2f7665ae47b59793ec91e932946d0fa', // v0.1.11
   '997d4c647e34799c21f29b39a6cb1360ef5958c081e28c973d303bb1271b5de3', // v0.1.12
+  '6c85e71dc5da9115bed2b61a6aeb6a99974efd0f5e435c0197f91306a645f2d7', // v0.1.13
 ]);
 const publishedSkillMetadataHash = '63b8acb9292c020c48526eade247f7c18ceeb6928155eb400b3071b0ff2bc027';
 const sha256 = value => createHash('sha256').update(value).digest('hex');

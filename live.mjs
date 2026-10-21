@@ -276,11 +276,11 @@ export class TmuxSession extends EventEmitter {
     this.observeModel(screen);
     const user = screenUser(screen);
     const latestSource = this.history?.turns.at(-1);
-    // A busy terminal can redraw an already completed question, including after
+    // A busy terminal or question overlay can redraw an already completed question, including after
     // an idle frame or observer restart. Only an unfinished canonical source ID
     // establishes a new CLI turn. Waiting for its transcript also disambiguates
     // genuine repeated prompts without relying on scrollback or frame counts.
-    if (!this.pending && !this.committing && user && screen.busy && latestSource
+    if (!this.pending && !this.committing && user && (screen.busy || screen.waitingForQuestion) && latestSource
       && sourceTurnOwnable(latestSource, this.history)
       && !sourceTurnComplete(this.history, latestSource) && !this.knownSourceIds.has(latestSource.id)
       && displayText(userText(latestSource)) === user.text) {

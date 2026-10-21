@@ -482,3 +482,39 @@ test('every history reconciliation result includes a boolean ordering flag', () 
   assert.equal(reconcileHistory(record(source), source).orderChanged, false);
   assert.equal(reconcileHistory({ backend: 'acp' }, source).orderChanged, false);
 });
+
+test('retired submission receipts cannot be reclaimed by mapped, direct or content fallback matches', () => {
+  const envelope = '<timestamp>Monday, Oct 19, 2026, 11:01 AM (UTC)</timestamp>\n<user_query>Repeated request</user_query>';
+  for (const mode of ['mapped', 'direct', 'fallback', 'ambiguous']) {
+    const incoming = history([['user', envelope], ['assistant', 'The same complete answer']]);
+    incoming.sourceComplete = true;
+    incoming.completedTurnIds = incoming.turns.map(turn => turn.id);
+    const source = incoming.turns[0];
+    const retired = structuredClone(source);
+    retired.id = mode === 'direct' ? source.id : 'retired-native-turn';
+    retired.rootTurnId = retired.id; retired.status = 'interrupted';
+    retired.items[0].clientId = 'original-submission';
+    retired.items[0].id = 'retired-native-user';
+    retired.items[1].id = 'retired-native-preview';
+    const native = record(incoming);
+    native.thread.turns = [retired];
+    native.retiredObserverTurns = { [retired.id]: { version: 2, clientId: 'original-submission' } };
+    native.historySync = { sourceTurns: mode === 'mapped' ? { [source.id]: retired.id } : {}, sourceItems: {} };
+    if (mode === 'ambiguous') {
+      source.sourceIdentity.strength = 'ambiguous';
+      source.id = `${incoming.id}:turn:ambiguous:${source.sourceIdentity.sha256}:display:0`;
+      incoming.completedTurnIds = [source.id];
+      native.historySync.sourceTurns[`${incoming.id}:turn:envelope:${source.sourceIdentity.sha256}`] = retired.id;
+    }
+    const result = reconcileHistory(native, incoming);
+    const cardId = result.record.historySync.sourceTurns[source.id];
+    // Ambiguous entries are display-only and do not gain source ownership.
+    const card = mode === 'ambiguous' ? result.record.thread.turns.find(turn => turn.id !== retired.id)
+      : result.record.thread.turns.find(turn => turn.id === cardId);
+    assert.ok(card, mode);
+    assert.notEqual(card.id, retired.id, mode);
+    assert.equal(card.status, 'completed');
+    assert.deepEqual(result.record.thread.turns.find(turn => turn.id === retired.id), retired, mode);
+    assert.equal(reconcileHistory(JSON.parse(JSON.stringify(result.record)), incoming).changed, false, mode);
+  }
+});

@@ -105,6 +105,9 @@ export function reconcileHistory(record, history) {
   next.historySync = sync;
   next.thread.turns ||= [];
   const turns = next.thread.turns;
+  // Retired previews retain native submission receipts. They may never become
+  // source counterparts again after a truncated scan or an envelope rewrite.
+  const retired = new Set(Object.keys(next.retiredObserverTurns || {}));
   const changes = [];
   const usedTurnIds = new Set(turns.map(turn => turn.id));
   const usedItemIds = new Set(turns.flatMap(turn => (turn.items || []).map(item => item.id)));
@@ -198,7 +201,7 @@ export function reconcileHistory(record, history) {
     const stable = stableSourceTurn(source, history);
     const sourceCompleted = history.sourceComplete !== false || source !== history.turns.at(-1)
       || history.completedTurnIds?.includes(source.id);
-    const agrees = candidate => candidate && !claimedTurns.has(candidate.id)
+    const agrees = candidate => candidate && !retired.has(candidate.id) && !claimedTurns.has(candidate.id)
       && turnUser(candidate) === sourceUser;
     let native = own(sync.sourceTurns, source.id)
       ? turns.find(turn => turn.id === sync.sourceTurns[source.id]) : undefined;

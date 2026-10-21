@@ -5,13 +5,13 @@ import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { CursorSession } from './cursor.mjs';
-import { findLiveSourceTurn, finalizeLivePreview, hasSubmittedTurnClaim, observerTurnProof, recoverableObserverTurn, retainSubmittedTurn } from './live-history.mjs';
+import { findLiveSourceTurn, finalizeLivePreview, hasSubmittedTurnClaim, nativeTurnTextSha256, observerTurnProof, recoverableObserverTurn, retainSubmittedTurn, submittedTurnTextSha256 } from './live-history.mjs';
 import { queueList, queueAdd, queueUpdate, queueDelete, queueReorder, queuePeek, queueConsume } from './queue.mjs';
 import { expandModelVariants } from './model-labels.mjs';
 import { retryDraftFor, retainUnsubmittedDraft, pinLiveSourceTurn } from './draft-recovery.mjs';
 import { resolveAttachmentDraftRetry } from './draft-attachments.mjs';
 import { createMaintenanceGate } from './maintenance.mjs';
-import { planObserverRetirement } from './observer-recovery.mjs';
+import { observerRetirementCandidate, planObserverRetirement } from './observer-recovery.mjs';
 
 const PROVIDER = 'cursor';
 const now = () => Math.floor(Date.now() / 1000);
@@ -28,6 +28,26 @@ function sameAdmittedInput(record, turn, user, input) {
     && /^[a-f0-9]{64}$/u.test(proof.canonicalInputSha256)
     && inputDigest(input) === proof.requestInputSha256
     && inputDigest(user.content) === proof.canonicalInputSha256;
+}
+
+// A retired observer can belong to an already submitted native request. Its
+// durable receipt acknowledges retries without ever submitting that request a
+// second time, including while a later CLI turn is running.
+function retiredSubmission(record, clientId, input) {
+  if (typeof clientId !== 'string' || !clientId.trim()) return null;
+  const candidates = record.thread.turns.filter(turn => record.retiredObserverTurns?.[turn.id]
+    && turn.items?.some(item => item.type === 'userMessage' && item.clientId === clientId));
+  if (!candidates.length) return null;
+  const turn = candidates[0], proof = record.retiredObserverTurns[turn.id];
+  const users = turn.items.filter(item => item.type === 'userMessage');
+  if (candidates.length !== 1 || turn.status !== 'interrupted' || proof.version !== 2
+    || proof.origin !== 'native' || proof.sessionId !== record.cursorSessionId || proof.clientId !== clientId
+    || users.length !== 1 || proof.userTextSha256 !== submittedTurnTextSha256(turn)
+    || proof.nativeUserTextSha256 !== nativeTurnTextSha256(turn)
+    || !sameAdmittedInput(record, turn, users[0], input)) {
+    throw Object.assign(new Error('Retired Cursor message ID already belongs to different or unverifiable input'), { code: -32602 });
+  }
+  return turn;
 }
 const clients = new Set();
 const records = new Map();
@@ -790,9 +810,11 @@ export function createBridge({ send, log = () => {} }) {
     if (method === 'turn/start') {
       await maintenance.assertOpen();
       const r = requireRecord(p.threadId);
-      if (activeTurn(r)) throw new Error('Cursor turn is already running; wait for it or interrupt it');
       let input = p.input?.length ? p.input : typeof p.toolOutput?.output === 'string' && p.toolOutput.output.trim()
         ? [{ type: 'text', text: p.toolOutput.output, text_elements: [] }] : [];
+      const retired = retiredSubmission(r, p.clientUserMessageId, input);
+      if (retired) return { turn: { ...retired, items: [] } };
+      if (activeTurn(r)) throw new Error('Cursor turn is already running; wait for it or interrupt it');
       let acpInput = await inputsToAcp(input);
       const s = await ensureSession(r);
       if (r.backend === 'legacy' && acpInput.some(block => block.type !== 'text')) {
@@ -907,15 +929,15 @@ async function findTmuxBinding(r) {
   return binding || null;
 }
 
-// Called under the thread lock. This only retires an external display observer;
+// Called under the thread lock. This only retires an ambiguous display observer;
 // the original Agent is never cancelled, typed into, or assigned a new model.
 async function retireCompletedObserver(r) {
   const active = r.thread.turns.filter(turn => turn.status === 'inProgress');
   if (active.length !== 1 || !tmuxSync || shuttingDown) return false;
-  const proof = observerTurnProof(r, active[0].id);
   const history = sourceHistories.get(r.cursorSessionId);
-  if (proof?.version !== 1 || history?.sourceComplete !== true
-    || history.turns.some(turn => turn.id === proof.sourceTurnId)) return false;
+  const recovery = observerRetirementCandidate(r, history);
+  if (!recovery) return false;
+  const { proof } = recovery;
   const execution = turnExecutions.get(r.thread.id);
   const session = sessions.get(r.thread.id);
   if (session && (session.kind !== 'tmux' || session.sessionId !== proof.sessionId

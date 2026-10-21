@@ -21,6 +21,14 @@ const reset = '\x1b[0m';
 const dim = text => `\x1b[2m${text}${reset}`;
 const row = (text, rgb = '242;242;242') => ` \x1b[48;2;${rgb}m ${text}${' '.repeat(80)}\x1b[49m`;
 const frame = (busy, privateDraft = false) => `  Cursor Agent\n  ${dim('v2025.01.01-test')}\n\n${['', 'Do the requested work', ''].map(text => row(text, '227;227;227')).join('\n')}\n\n  Rendered partial\n\n${row('')}\n${row(privateDraft ? `→ ${draft}\x1b[7m \x1b[27m` : `\x1b[2m→ \x1b[0;7m\x1b[48;2;242;242;242mA\x1b[0;2m\x1b[48;2;242;242;242mdd a follow-up${busy ? '    ctrl+c to stop' : ''}`)}\n${row('')}\n\n  ${dim('Composer 2.5 · 5.1%')}\n  ${dim('/fixture/project')}\n`;
+const questionFrame = () => `  Cursor Agent\n  ${dim('v2025.01.01-test')}\n\n${['', 'A later independent request', ''].map(text => row(text, '227;227;227')).join('\n')}\n\n  Current reply\n
+ ┌─────────────────────────────────────────────────────────────────────────────────────┐
+ │ Clarifying Questions                                                                │
+ │ Question 1 of 1                                                                     │
+ │ 1. What should happen next?                                                         │
+ │   › [ ] Keep waiting                                                               │
+ │ ↑/↓ option · ←/→ question · Space select · Enter next/submit · Esc to skip            │
+ └─────────────────────────────────────────────────────────────────────────────────────┘\n`;
 const transcriptRow = (role, text) => JSON.stringify({ role, message: { content: [{ type: 'text', text }] } });
 const ended = JSON.stringify({ type: 'turn_ended', status: 'success' });
 const envelope = (text, minute) => `<timestamp>Monday, Oct 19, 2026, 11:${minute} AM (UTC)</timestamp>\n<user_query>${text}</user_query>`;
@@ -37,7 +45,12 @@ function histories() {
   // The scanner supplies snapshot completion in addition to parsed end markers.
   stable.sourceComplete = false;
   complete.sourceComplete = true;
-  return { stable, complete };
+  const advanced = parse([...earlier, request, request,
+    transcriptRow('assistant', 'The full completed answer\n\nwith retained newlines.'), ended,
+    transcriptRow('user', envelope('A later independent request', '02')),
+    transcriptRow('assistant', 'Working on the later request')]);
+  advanced.sourceComplete = false;
+  return { stable, complete, advanced };
 }
 
 function savedRecord(stable, native) {
@@ -66,7 +79,10 @@ function savedRecord(stable, native) {
 }
 
 async function runFixture(scenario) {
-  const { stable, complete } = histories();
+  const all = histories();
+  const { stable } = all;
+  const advanced = scenario.includes('advanced');
+  const complete = advanced ? all.advanced : all.complete;
   const native = scenario.startsWith('native-');
   const live = scenario.endsWith('live') || scenario === 'persistence-failure';
   const initial = savedRecord(stable, native);
@@ -152,6 +168,8 @@ export function fixtureFailNextSave() {
       fixture.fixtureHistory(complete);
     }
     client.raw = frame(false, true);
+    if (advanced) client.raw = scenario.includes('question') ? questionFrame()
+      : frame(true).replace('Do the requested work', 'A later independent request');
     const unchangedFrame = client.raw;
     const before = fixture.fixtureState();
     const since = messages.length;
@@ -198,10 +216,31 @@ export function fixtureFailNextSave() {
         assert.equal(await fixture.fixtureRetire(), true);
       }
     }
-    return { scenario, first, afterFirst, before, state: fixture.fixtureState(),
+    let recovered, retryResponses, finished, recoveredFrameUnchanged;
+    if (advanced && first === true) {
+      await bridge.receive({ id: 3, method: 'thread/resume', params: { threadId } });
+      for (let count = 0; count < 100 && !fixture.fixtureState().running; count++) await delay(10);
+      recovered = fixture.fixtureState();
+      const original = initial.thread.turns.find(turn => turn.id === nativeId).items[0];
+      for (const [id, input] of [[4, original.content], [5, [{ type: 'text', text: 'Changed request' }]]]) {
+        await bridge.receive({ id, method: 'turn/start', params: { threadId,
+          clientUserMessageId: original.clientId, input } });
+      }
+      retryResponses = messages.filter(message => [4, 5].includes(message.id));
+      recoveredFrameUnchanged = client.raw === unchangedFrame;
+      client.raw = frame(false).replace('Do the requested work', 'A later independent request');
+      const final = structuredClone(complete);
+      final.sourceComplete = true;
+      final.completedTurnIds.push(final.turns.at(-1).id);
+      final.turns.at(-1).items.push({ id: `${final.turns.at(-1).id}:final`, type: 'agentMessage', text: 'Later request finished' });
+      fixture.fixtureHistory(final);
+      for (let count = 0; count < 120 && fixture.fixtureState().running; count++) await delay(25);
+      finished = fixture.fixtureState();
+    }
+    return { scenario, first, afterFirst, before, recovered, retryResponses, finished, state: fixture.fixtureState(),
       saved: JSON.parse(await readFile(recordPath, 'utf8')), source: complete,
       messages: messages.slice(since), calls, response,
-      frameUnchanged: client.raw === unchangedFrame, binding: client.binding };
+      frameUnchanged: recoveredFrameUnchanged ?? client.raw === unchangedFrame, binding: client.binding };
   } finally { await bridge.close(); await fixture.shutdownBridge(); }
 }
 
@@ -300,6 +339,38 @@ if (process.argv[2] === '--recovery-fixture') {
         || message.method === 'thread/status/changed' && message.params.status.type === 'idle'), false);
       if (scenario === 'native-restart') assert.match(result.response.error.message, /saved Cursor observer cannot be verified/);
       assertReadOnly(result);
+    });
+  }
+
+  for (const scenario of ['native-advanced-live', 'native-advanced-restart', 'native-advanced-question-live']) {
+    test(`a later busy CLI boundary retires native ambiguity, follows the current turn and never resends: ${scenario}`, async t => {
+      const result = await run(t, scenario);
+      assert.equal(result.first, true);
+      assertReadOnly(result);
+      const retired = result.recovered.record.thread.turns.find(turn => turn.id === nativeId);
+      assert.equal(retired.status, 'interrupted');
+      assert.deepEqual(retired.items, result.before.record.thread.turns.find(turn => turn.id === nativeId).items);
+      assert.deepEqual(result.recovered.record.retiredObserverTurns[nativeId], result.before.record.tmuxObserverTurns[nativeId]);
+      const boundary = result.source.turns.at(-1);
+      const current = result.recovered.record.thread.turns.find(turn => turn.id === result.recovered.record.historySync.sourceTurns[boundary.id]);
+      assert.ok(current);
+      assert.equal(current.status, 'inProgress', 'The unfinished successor must never be imported as a completed card');
+      assert.equal(result.recovered.record.tmuxObserverTurns[current.id].version, 1);
+      assert.equal(result.recovered.running, true);
+      for (const source of result.source.turns.slice(0, -1)) {
+        const card = result.recovered.record.thread.turns.find(turn => turn.id === result.recovered.record.historySync.sourceTurns[source.id]);
+        assert.equal(card.status, 'completed');
+        assert.deepEqual(card.items, source.items);
+      }
+      assert.equal(result.retryResponses.find(message => message.id === 4).result.turn.id, nativeId);
+      assert.equal(result.retryResponses.find(message => message.id === 4).result.turn.status, 'interrupted');
+      assert.equal(result.retryResponses.find(message => message.id === 5).error.code, -32602);
+      assert.equal(result.finished.running, false);
+      assert.equal(result.finished.record.thread.turns.find(turn => turn.id === current.id).status, 'completed');
+      assert.equal(result.finished.record.thread.turns.find(turn => turn.id === current.id).items.at(-1).text,
+        'Working on the later request\nLater request finished');
+      assert.equal(result.messages.filter(message => message.method === 'turn/completed' && message.params.turn.id === nativeId).length, 1);
+      assert.equal(result.messages.filter(message => message.method === 'turn/completed' && message.params.turn.id === current.id).length, 1);
     });
   }
 

@@ -25,6 +25,31 @@ function draftScreen(rows, carets = []) {
   return `Cursor Agent\nv2025.01.01-test\n${border}\n${painted.join('\n')}\n${border}\n${dim('Composer 2.5 · 5.1%')}\n${dim('~')}\n`;
 }
 
+test('a complete bottom question box is observation-only and never grants typing readiness', () => {
+  const raw = `Cursor Agent\nv2025.01.01-test\n${userBox('A current question')}\nA partial reply\n
+ ┌─────────────────────────────────────────────────────────────────────────────────────┐
+ │ Clarifying Questions                                                                │
+ │ Question 1 of 2                                                                     │
+ │ 1. What should happen next?                                                         │
+ │   › [ ] Keep waiting                                                               │
+ │     [ ] Other: (type to answer)                                                     │
+ │ ↑/↓ option · ←/→ question · Space select · Enter next/submit · Esc to skip            │
+ └─────────────────────────────────────────────────────────────────────────────────────┘\n`;
+  const parsed = parseCursorScreen(raw, { knownCursor: true });
+  assert.equal(parsed.waitingForQuestion, true);
+  assert.equal(parsed.reason, 'question-awaiting-answer');
+  assert.equal(parsed.inputAvailable, false);
+  assert.equal(parsed.ready, false);
+  assert.equal(parsed.busy, false);
+  assert.equal(parsed.stopKey, null);
+  assert.match(parsed.currentReplyBody, /Clarifying Questions/);
+  for (const altered of [raw.replace('Clarifying Questions', 'Unrecognized Menu'), raw.replace('Question 1 of 2', 'Question 3 of 2'),
+    raw.replace('Esc to skip', 'Esc to close'), raw.replace('└', '┌'), `${raw}\nAnother overlay`, raw.replaceAll('[ ]', '[?]'),
+    raw.replace('Cursor Agent', 'Cursor Agent Preview')]) {
+    assert.equal(parseCursorScreen(altered, { knownCursor: true }).waitingForQuestion, false);
+  }
+});
+
 test('recognizes the real default-theme placeholder with inverse caret', () => {
   const parsed = parseCursorScreen(screen());
   assert.equal(parsed.ready, true);
