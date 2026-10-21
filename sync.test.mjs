@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { parseTranscript } from './history.mjs';
 import { reconcileHistory } from './sync.mjs';
+import { retainSubmittedTurn } from './live-history.mjs';
 
 function history(rows, extra = {}) {
   return parseTranscript(rows.map(([role, text]) => JSON.stringify({ role, message: { content: [{ type: 'text', text }] } })).join('\n'), {
@@ -16,6 +17,110 @@ function record(source, extra = {}) {
   };
 }
 const source = history([['user', 'First question'], ['assistant', 'First answer']]);
+
+function projectedFixture(completed = false) {
+  const incoming = history([['user', '<timestamp>Monday, Oct 19, 2026, 11:01 AM (UTC)</timestamp>\n<user_query>First\n\n  Second  line</user_query>'],
+    ['assistant', 'Complete projected reply']]);
+  incoming.sourceComplete = completed;
+  incoming.completedTurnIds = completed ? incoming.turns.map(turn => turn.id) : [];
+  const native = record(incoming);
+  native.thread.cwd = incoming.cwd;
+  const turn = native.thread.turns[0];
+  turn.id = 'projected-native'; turn.rootTurnId = turn.id; turn.status = 'inProgress';
+  turn.items[0].id = 'projected-native-user'; turn.items[0].clientId = 'projected-client';
+  turn.items[0].content[0].text = 'First\n\n\n\n  Second  line\n';
+  turn.items[1].id = 'projected-native-answer';
+  const binding = { sessionId: incoming.id, cwd: incoming.cwd, paneId: '%12', agentPid: 42, agentStartTime: '12345' };
+  native.tmuxAffinity = { paneId: binding.paneId, agentPid: binding.agentPid, agentStartTime: binding.agentStartTime };
+  native.historySync = { sourceTurns: { [incoming.turns[0].id]: turn.id },
+    sourceItems: { [incoming.turns[0].items[0].id]: turn.items[0].id } };
+  assert.equal(retainSubmittedTurn(native, turn, incoming.turns[0], binding, incoming), true);
+  const proof = native.tmuxObserverTurns[turn.id];
+  assert.equal(proof.version, 3);
+  if (completed) {
+    turn.status = 'completed';
+    native.exportedSubmissionTurns = { [turn.id]: structuredClone(proof) };
+    delete native.tmuxObserverTurns[turn.id];
+  }
+  return { native, incoming, turn, proof: completed ? native.exportedSubmissionTurns[turn.id] : proof };
+}
+
+for (const completed of [false, true]) test(`a ${completed ? 'retained completed' : 'live'} v3 receipt reconciles the projected echo without duplicating or replacing the raw native user`, () => {
+  const f = projectedFixture(completed);
+  if (completed) f.native.tmuxAffinity = { paneId: '%99', agentPid: 900, agentStartTime: '99999' };
+  const before = structuredClone(f);
+  const result = reconcileHistory(f.native, f.incoming);
+  assert.deepEqual(f, before);
+  assert.equal(result.record.thread.turns.length, 1);
+  const native = result.record.thread.turns[0];
+  assert.equal(native.items.filter(item => item.type === 'userMessage').length, 1);
+  assert.deepEqual(native.items.find(item => item.type === 'userMessage'), f.turn.items[0]);
+  assert.equal(native.items[0].content[0].text, 'First\n\n\n\n  Second  line\n');
+  assert.equal(result.record.historySync.sourceItems[f.incoming.turns[0].items[0].id], f.turn.items[0].id);
+  assert.equal(reconcileHistory(JSON.parse(JSON.stringify(result.record)), f.incoming).changed, false);
+});
+
+test('a retained completed projection survives later model and original process changes without duplicating its native user', () => {
+  const f = projectedFixture(true);
+  f.native.thread.model = 'different-current-model';
+  f.native.tmuxAffinity = { paneId: '%99', agentPid: 900, agentStartTime: '99999' };
+  const before = structuredClone(f);
+  const result = reconcileHistory(f.native, f.incoming);
+  assert.deepEqual(f, before);
+  assert.equal(result.record.thread.turns.length, 1);
+  assert.deepEqual(result.record.thread.turns[0].items, f.turn.items);
+  assert.equal(result.record.thread.model, 'different-current-model');
+  assert.deepEqual(result.record.exportedSubmissionTurns, f.native.exportedSubmissionTurns);
+  assert.equal(reconcileHistory(JSON.parse(JSON.stringify(result.record)), f.incoming).changed, false);
+});
+
+test('a live projection still requires its model and a terminal projection requires an archived receipt before ignoring later model changes', () => {
+  for (const terminal of [false, true]) {
+    const f = projectedFixture();
+    if (terminal) f.turn.status = 'completed';
+    f.native.thread.model = 'different-current-model';
+    const result = reconcileHistory(f.native, f.incoming);
+    assert.notEqual(result.record.historySync.sourceTurns[f.incoming.turns[0].id], f.turn.id);
+    assert.deepEqual(result.record.thread.turns.find(turn => turn.id === f.turn.id).items, f.turn.items);
+  }
+});
+
+test('projection echo matching refuses missing or corrupt receipts and every uncertain ownership field', () => {
+  const mutations = [
+    f => { delete f.native.exportedSubmissionTurns; },
+    f => { f.proof.version = 2; },
+    f => { f.proof.origin = 'external'; },
+    f => { f.proof.extra = true; },
+    f => { f.proof.sessionId = 'other-session'; },
+    f => { f.proof.sourceTurnId += ':wrong'; },
+    f => { f.proof.paneId = 'not-pane'; },
+    f => { f.proof.agentPid = 0; },
+    f => { f.proof.agentStartTime = 'not-start'; },
+    f => { f.proof.model = ''; },
+    f => { f.proof.model = '   '; },
+    f => { f.proof.clientId = 'other-client'; },
+    f => { f.proof.nativeUserTextSha256 = '0'.repeat(64); },
+    f => { f.proof.userTextSha256 = '0'.repeat(64); },
+    f => { f.turn.items[0].content[0].text += '\n'; },
+    f => { f.incoming.turns[0].items[0].content[0].text = 'First\n  Second  line'; },
+    f => { f.incoming.turns[0].items[0].content[0].text = 'First\n\n  Second line'; },
+    f => { f.incoming.turns[0].sourceIdentity.strength = 'ambiguous'; },
+    f => { delete f.native.historySync.sourceTurns[f.incoming.turns[0].id]; },
+    f => { f.native.historySync.sourceTurns.other = f.turn.id; },
+    f => { delete f.native.historySync.sourceItems[f.incoming.turns[0].items[0].id]; },
+    f => { f.native.historySync.sourceItems.other = f.turn.items[0].id; },
+    f => { f.native.thread.cwd = '/other-project'; },
+    f => { f.native.thread.turns.push({ id: 'duplicate-client', items: [structuredClone(f.turn.items[0])] }); },
+    f => { f.native.tmuxObserverTurns = { [f.turn.id]: { ...f.proof, clientId: 'competing-proof' } }; },
+  ];
+  for (const mutate of mutations) {
+    const f = projectedFixture(true); mutate(f);
+    const original = structuredClone(f.turn.items[0]);
+    const result = reconcileHistory(f.native, f.incoming);
+    assert.notEqual(result.record.historySync.sourceTurns[f.incoming.turns[0].id], f.turn.id, mutate.toString());
+    assert.deepEqual(result.record.thread.turns.find(turn => turn.id === f.turn.id).items[0], original);
+  }
+});
 
 test('imports new external turns and is idempotent after persistence', () => {
   const initial = record(source);
@@ -485,7 +590,7 @@ test('every history reconciliation result includes a boolean ordering flag', () 
 
 test('retired submission receipts cannot be reclaimed by mapped, direct or content fallback matches', () => {
   const envelope = '<timestamp>Monday, Oct 19, 2026, 11:01 AM (UTC)</timestamp>\n<user_query>Repeated request</user_query>';
-  for (const mode of ['mapped', 'direct', 'fallback', 'ambiguous']) {
+  for (const family of ['retiredObserverTurns', 'retiredUnboundTurns']) for (const mode of ['mapped', 'direct', 'fallback', 'ambiguous']) {
     const incoming = history([['user', envelope], ['assistant', 'The same complete answer']]);
     incoming.sourceComplete = true;
     incoming.completedTurnIds = incoming.turns.map(turn => turn.id);
@@ -498,7 +603,7 @@ test('retired submission receipts cannot be reclaimed by mapped, direct or conte
     retired.items[1].id = 'retired-native-preview';
     const native = record(incoming);
     native.thread.turns = [retired];
-    native.retiredObserverTurns = { [retired.id]: { version: 2, clientId: 'original-submission' } };
+    native[family] = { [retired.id]: { version: 2, clientId: 'original-submission' } };
     native.historySync = { sourceTurns: mode === 'mapped' ? { [source.id]: retired.id } : {}, sourceItems: {} };
     if (mode === 'ambiguous') {
       source.sourceIdentity.strength = 'ambiguous';
@@ -517,4 +622,13 @@ test('retired submission receipts cannot be reclaimed by mapped, direct or conte
     assert.deepEqual(result.record.thread.turns.find(turn => turn.id === retired.id), retired, mode);
     assert.equal(reconcileHistory(JSON.parse(JSON.stringify(result.record)), incoming).changed, false, mode);
   }
+});
+
+test('a valid retained v3 projection receipt cannot reclaim a retired unbound preview', () => {
+  const f = projectedFixture(true);
+  f.native.retiredUnboundTurns = { [f.turn.id]: { version: 1 } };
+  const original = structuredClone(f.turn);
+  const result = reconcileHistory(f.native, f.incoming);
+  assert.notEqual(result.record.historySync.sourceTurns[f.incoming.turns[0].id], f.turn.id);
+  assert.deepEqual(result.record.thread.turns.find(turn => turn.id === f.turn.id), original);
 });

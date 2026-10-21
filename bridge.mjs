@@ -12,6 +12,8 @@ import { retryDraftFor, retainUnsubmittedDraft, pinLiveSourceTurn } from './draf
 import { resolveAttachmentDraftRetry } from './draft-attachments.mjs';
 import { createMaintenanceGate } from './maintenance.mjs';
 import { observerRetirementCandidate, planObserverRetirement } from './observer-recovery.mjs';
+import { unboundExportCandidate, planUnboundExportRetirement } from './export-recovery.mjs';
+import { cursorExportUserText } from './source-identity.mjs';
 
 const PROVIDER = 'cursor';
 const now = () => Math.floor(Date.now() / 1000);
@@ -35,14 +37,27 @@ function sameAdmittedInput(record, turn, user, input) {
 // second time, including while a later CLI turn is running.
 function retiredSubmission(record, clientId, input) {
   if (typeof clientId !== 'string' || !clientId.trim()) return null;
-  const candidates = record.thread.turns.filter(turn => record.retiredObserverTurns?.[turn.id]
+  const candidates = record.thread.turns.filter(turn => (record.retiredObserverTurns?.[turn.id] || record.retiredUnboundTurns?.[turn.id])
     && turn.items?.some(item => item.type === 'userMessage' && item.clientId === clientId));
   if (!candidates.length) return null;
-  const turn = candidates[0], proof = record.retiredObserverTurns[turn.id];
+  const turn = candidates[0], proof = record.retiredObserverTurns?.[turn.id] || record.retiredUnboundTurns[turn.id];
   const users = turn.items.filter(item => item.type === 'userMessage');
-  if (candidates.length !== 1 || turn.status !== 'interrupted' || proof.version !== 2
-    || proof.origin !== 'native' || proof.sessionId !== record.cursorSessionId || proof.clientId !== clientId
-    || users.length !== 1 || proof.userTextSha256 !== submittedTurnTextSha256(turn)
+  const textOnly = users.length === 1 && Array.isArray(users[0].content) && users[0].content.length
+    && users[0].content.every(block => block?.type === 'text' && typeof block.text === 'string');
+  const projectedHash = textOnly ? createHash('sha256').update(cursorExportUserText(users[0].content.map(block => block.text).join('\n'))).digest('hex') : null;
+  const unbound = record.retiredUnboundTurns?.[turn.id] === proof && proof.version === 1 && proof.reason === 'cursor-export-newlines'
+    && proof.sourceCandidateTextSha256 === projectedHash
+    && typeof proof.sourceCandidateId === 'string' && proof.sourceCandidateId.startsWith(`${record.cursorSessionId}:turn:envelope:`)
+    && typeof proof.successorTurnId === 'string' && proof.successorTurnId.startsWith(`${record.cursorSessionId}:turn:envelope:`)
+    && proof.sourceCandidateId !== proof.successorTurnId
+    && typeof proof.model === 'string' && Boolean(proof.model.trim())
+    && /^%\d+$/u.test(proof.paneId || '') && Number.isSafeInteger(proof.agentPid) && proof.agentPid > 0
+    && typeof proof.agentStartTime === 'string' && /^\d+$/u.test(proof.agentStartTime);
+  const submitted = [2, 3].includes(proof.version) && proof.origin === 'native'
+    && proof.userTextSha256 === (proof.version === 3 ? projectedHash : submittedTurnTextSha256(turn));
+  if (candidates.length !== 1 || turn.status !== 'interrupted' || (!unbound && !submitted)
+    || proof.sessionId !== record.cursorSessionId || proof.clientId !== clientId
+    || !textOnly
     || proof.nativeUserTextSha256 !== nativeTurnTextSha256(turn)
     || !sameAdmittedInput(record, turn, users[0], input)) {
     throw Object.assign(new Error('Retired Cursor message ID already belongs to different or unverifiable input'), { code: -32602 });
@@ -349,7 +364,7 @@ export function createBridge({ send, log = () => {} }) {
     // Admission validated this native-origin ownership against the original
     // process and canonical source. Later queue/model UI state is not allowed
     // to turn its read-only observer into an external user preview or a retry.
-    const nativeObserver = recovery?.proof.version === 2 ? Object.freeze({
+    const nativeObserver = [2, 3].includes(recovery?.proof.version) ? Object.freeze({
       turnId: recovery.turn.id, proof: Object.freeze(structuredClone(recovery.proof)),
     }) : null;
     if (binding) {
@@ -373,12 +388,16 @@ export function createBridge({ send, log = () => {} }) {
         || (clientId != null && !retainSubmittedTurn(r, turn, sourceTurn, s.binding, history))) {
         throw new Error('The submitted Cursor source cannot be durably linked to its original native message');
       }
+      if (r.tmuxObserverTurns?.[turn.id]?.version === 3) {
+        r.exportedSubmissionTurns ||= {};
+        r.exportedSubmissionTurns[turn.id] = structuredClone(r.tmuxObserverTurns[turn.id]);
+      }
       await persist(r);
     });
     openingSessionInstances.add(s);
     s.on('exit', () => { if (sessions.get(r.thread.id) === s) sessions.delete(r.thread.id); });
     s.on('model', model => {
-      if (recovery?.proof.version === 2 && r.tmuxObserverTurns?.[recovery.turn.id]
+      if ([2, 3].includes(recovery?.proof.version) && r.tmuxObserverTurns?.[recovery.turn.id]
         && model !== recovery.proof.model) {
         throw new Error('The saved native Cursor turn model differs from its original process; no input was submitted');
       }
@@ -484,7 +503,7 @@ export function createBridge({ send, log = () => {} }) {
       }
       const result = await s.start(r.cursorSessionId ? { sessionId: r.cursorSessionId } : {});
       if (shuttingDown) throw new Error('Cursor bridge is shutting down');
-      if (recovery?.proof.version === 2 && result?.models?.currentModelId
+      if ([2, 3].includes(recovery?.proof.version) && result?.models?.currentModelId
         && result.models.currentModelId !== recovery.proof.model) {
         throw new Error('The saved native Cursor turn model could not be verified; no input was submitted');
       }
@@ -613,6 +632,10 @@ export function createBridge({ send, log = () => {} }) {
           }
           t.completedAt = now(); t.durationMs = Date.now() - t.startedAt * 1000;
           r.thread.updatedAt = now(); r.thread.recencyAt = now();
+          if (r.tmuxObserverTurns?.[t.id]?.version === 3) {
+            r.exportedSubmissionTurns ||= {};
+            r.exportedSubmissionTurns[t.id] = structuredClone(r.tmuxObserverTurns[t.id]);
+          }
           if (r.tmuxObserverTurns) delete r.tmuxObserverTurns[t.id];
           await persist(r); status(r, 'idle');
           notify('turn/completed', { threadId: r.thread.id, turn: t });
@@ -932,18 +955,18 @@ async function findTmuxBinding(r) {
 // Called under the thread lock. This only retires an ambiguous display observer;
 // the original Agent is never cancelled, typed into, or assigned a new model.
 async function retireCompletedObserver(r) {
-  const active = r.thread.turns.filter(turn => turn.status === 'inProgress');
-  if (active.length !== 1 || !tmuxSync || shuttingDown) return false;
+  if (!tmuxSync || shuttingDown) return false;
   const history = sourceHistories.get(r.cursorSessionId);
-  const recovery = observerRetirementCandidate(r, history);
+  const recovery = observerRetirementCandidate(r, history) || unboundExportCandidate(r, history);
   if (!recovery) return false;
-  const { proof } = recovery;
+  const proof = recovery.proof || { sessionId: r.cursorSessionId, ...r.tmuxAffinity };
+  const createPlan = recovery.proof ? planObserverRetirement : planUnboundExportRetirement;
   const execution = turnExecutions.get(r.thread.id);
   const session = sessions.get(r.thread.id);
   if (session && (session.kind !== 'tmux' || session.sessionId !== proof.sessionId
     || session.binding.paneId !== proof.paneId || session.binding.agentPid !== proof.agentPid
     || session.binding.agentStartTime !== proof.agentStartTime)) return false;
-  if (execution && (execution.turnId !== active[0].id || execution.session !== session)
+  if (execution && (execution.turnId !== recovery.turn.id || execution.session !== session)
     || (!execution && runningTurns.has(r.thread.id))) return false;
   const snapshot = async () => {
     const candidate = await findTmuxBinding(r);
@@ -957,7 +980,7 @@ async function retireCompletedObserver(r) {
     const current = sourceHistories.get(r.cursorSessionId);
     // An advancing scanner invalidates this observation. The next tick retries.
     if (current !== history || sessions.get(r.thread.id) !== session) return null;
-    return planObserverRetirement(r, { history: current, binding, screen });
+    return createPlan(r, { history: current, binding, screen });
   };
   if (!await snapshot()) return false;
   if (execution) execution.retiring = true;
@@ -973,7 +996,7 @@ async function retireCompletedObserver(r) {
   const screen = parseCursorScreen(await tmuxSync.client.capture(binding.paneId), { knownCursor: true });
   await tmuxSync.client.verifiedBinding(binding);
   if (!tmuxSync.client.isVerified(binding) || sourceHistories.get(r.cursorSessionId) !== history) return false;
-  const plan = planObserverRetirement(r, { history, binding, screen });
+  const plan = createPlan(r, { history, binding, screen });
   if (!plan) return false;
   plan.record.thread.status = { type: 'idle' };
   await persist(plan.record);
@@ -1086,7 +1109,12 @@ async function startHistorySync(log) {
             imported++;
           } else {
             const { reconcileHistory } = await import('./sync.mjs');
-            const merged = reconcileHistory(existing, h);
+            // A restart loads an unproven old preview before tmux attachment.
+            // Its newer CLI tail still belongs to a live observer; the parser's
+            // provisional status must not announce that tail as completed.
+            const unbound = unboundExportCandidate(existing, h);
+            const visible = unbound?.unfinished ? { ...h, turns: unbound.prefix } : h;
+            const merged = reconcileHistory(existing, visible);
             if (merged.changed) {
               // Backend listeners hold the record object; preserve its identity.
               await persist(merged.record);

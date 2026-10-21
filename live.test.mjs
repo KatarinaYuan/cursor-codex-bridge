@@ -1240,6 +1240,70 @@ const stampedHistory = (rows, complete = true) => ({ ...parseTranscript(rows.map
 { id: binding.sessionId, cwd: binding.cwd }), sourceComplete: complete });
 const stampedPrompt = (text, minute = '01') => `<timestamp>Monday, Oct 19, 2026, 11:${minute} AM (UTC)</timestamp>\n<user_query>${text}</user_query>`;
 
+test('a fresh native turn binds once to the exact Cursor empty-line export and completes without changing its input', async t => {
+  const { session, client } = await start(t, { source: stampedHistory([]) });
+  const original = 'First\r\n\r\n\r\n\r\n  Second  line\r\n';
+  const pending = session.begin('native', original); pending.submitted = true;
+  let claims = 0;
+  session.onSubmittedSource = async event => {
+    claims++;
+    assert.equal(event.prompt, original);
+    assert.equal(event.isCurrent(), true);
+    assert.equal(event.sourceTurn.items[0].content[0].text, 'First\n\n  Second  line');
+  };
+  const complete = stampedHistory([['user', stampedPrompt('First\n\n  Second  line')], ['assistant', 'Exported reply']]);
+  session.acceptHistory(complete);
+  const result = await pending.promise;
+  assert.equal(result.sourceTurn, complete.turns[0]);
+  assert.equal(result.stopReason, 'end_turn');
+  assert.equal(pending.prompt, original);
+  assert.equal(claims, 1);
+  assert.deepEqual(client.calls, [], 'history reconciliation cannot type or resubmit');
+});
+
+test('native export matching preserves spaces and one versus two hard breaks and refuses projected ambiguity', async t => {
+  for (const wrong of ['First\n  Second  line', 'First\n\n  Second line', 'First Second line']) {
+    const { session, client } = await start(t, { source: stampedHistory([]) });
+    const pending = session.begin('native', 'First\n\n\n\n  Second  line'); pending.submitted = true;
+    let claims = 0;
+    session.onSubmittedSource = async () => { claims++; };
+    session.acceptHistory(stampedHistory([['user', stampedPrompt(wrong)], ['assistant', 'Wrong attribution']]));
+    await settleBinding();
+    assert.equal(session.pending, pending);
+    assert.equal(pending.sourceTurnId, undefined);
+    assert.equal(claims, 0);
+    assert.deepEqual(client.calls, []);
+    await session.close();
+  }
+  const { session, client } = await start(t, { source: stampedHistory([]) });
+  const pending = session.begin('native', 'First\n\n\n\nSecond'); pending.submitted = true;
+  let claims = 0;
+  session.onSubmittedSource = async () => { claims++; };
+  session.acceptHistory(stampedHistory([['user', stampedPrompt('First\n\nSecond')], ['assistant', 'One'],
+    ['user', stampedPrompt('First\n\nSecond')], ['assistant', 'Two']]));
+  await settleBinding();
+  assert.equal(claims, 0);
+  assert.match(pending.identityError.message, /identity changed or is ambiguous/);
+  assert.deepEqual(client.calls, []);
+});
+
+test('baseline export collapse does not become drift, but changed spaces still block a new native claim', async t => {
+  for (const changedSpace of [false, true]) {
+    const old = turn('old-export', 'Earlier\n\n\n\nline  spacing');
+    const { session, client } = await start(t, { source: history([old]) });
+    const pending = session.begin('native', 'Current\n\n\n\nquestion'); pending.submitted = true;
+    const prior = turn(old.id, changedSpace ? 'Earlier\n\nline spacing' : 'Earlier\n\nline  spacing');
+    const complete = history([prior, turn('current-export', 'Current\n\nquestion')]);
+    session.acceptHistory(complete);
+    if (changedSpace) {
+      assert.match(pending.identityError.message, /identity changed/);
+      assert.equal(session.pending, pending);
+    } else assert.equal((await pending.promise).sourceTurn.id, 'current-export');
+    assert.deepEqual(client.calls, []);
+    await session.close();
+  }
+});
+
 test('old ambiguous same-prompt groups do not block a later unique submitted source', async t => {
   const older = [['user', stampedPrompt('Continue')], ['assistant', 'One'], ['user', stampedPrompt('Continue')], ['assistant', 'Two']];
   const { session, client } = await start(t, { source: stampedHistory(older) });

@@ -62,6 +62,81 @@ function submittedFixture() {
   return { ...fixture, proof };
 }
 
+function projectedSubmittedFixture(nativeText = 'First\n\n\n\n  Second  line\n') {
+  const fixture = submittedFixture();
+  const { native, turn, binding } = fixture;
+  turn.items[0].content[0].text = nativeText;
+  const source = history([['user', '<timestamp>Monday, Oct 19, 2026, 11:01 AM (UTC)</timestamp>\n<user_query>First\n\n  Second  line</user_query>'],
+    ['assistant', 'Canonical partial']]);
+  delete native.tmuxObserverTurns;
+  native.historySync = { sourceTurns: { [source.turns[0].id]: turn.id },
+    sourceItems: { [source.turns[0].items[0].id]: turn.items[0].id } };
+  assert.equal(retainSubmittedTurn(native, turn, source.turns[0], binding, source), true);
+  return { ...fixture, source, proof: native.tmuxObserverTurns[turn.id] };
+}
+
+test('fresh projected sends retain v3 source and raw native hashes without replacing original blank lines', () => {
+  for (const raw of ['First\n\n\n  Second  line', 'First\n\n\n\n  Second  line\n', ' First\r\n\r\n\r\n  Second  line\r\n']) {
+    const fixture = projectedSubmittedFixture(raw);
+    const before = structuredClone(fixture);
+    assert.equal(fixture.proof.version, 3);
+    assert.equal(fixture.proof.userTextSha256, submittedTurnTextSha256(fixture.source.turns[0]));
+    assert.notEqual(fixture.proof.userTextSha256, submittedTurnTextSha256(fixture.turn));
+    assert.equal(fixture.proof.nativeUserTextSha256, nativeTurnTextSha256(fixture.turn));
+    assert.equal(observerTurnProof(fixture.native, fixture.turn.id), fixture.proof);
+    assert.equal(recoverableObserverTurn(fixture.native, fixture.binding, fixture.source)?.turn, fixture.turn);
+    assert.equal(fixture.turn.items[0].content[0].text, raw);
+    assert.deepEqual(fixture, before);
+  }
+});
+
+test('v3 projection proofs reject changed spaces, line breaks, bytes, mappings and ambiguous sources', () => {
+  const corruptions = [
+    ({ proof }) => { proof.version = 2; },
+    ({ proof }) => { proof.userTextSha256 = '0'.repeat(64); },
+    ({ proof }) => { proof.nativeUserTextSha256 = '0'.repeat(64); },
+    ({ turn }) => { turn.items[0].content[0].text += '\n'; },
+    ({ source }) => { source.turns[0].items[0].content[0].text = 'First\n  Second  line'; },
+    ({ source }) => { source.turns[0].items[0].content[0].text = 'First\n\n  Second line'; },
+    ({ source }) => { source.turns[0].items[0].content[0].text = 'First\n\n\n  Second  line'; },
+    ({ source }) => { source.turns[0].sourceIdentity.strength = 'ambiguous'; },
+    ({ source }) => { source.turns.push(structuredClone(source.turns[0])); },
+    ({ native, source }) => { delete native.historySync.sourceItems[source.turns[0].items[0].id]; },
+    ({ binding }) => { binding.agentStartTime = 'different'; },
+    ({ native }) => { native.thread.model = 'other-model'; },
+    ({ native }) => { native.queuedSubmissions = [{ clientUserMessageId: 'queued' }]; },
+  ];
+  for (const corrupt of corruptions) {
+    const fixture = projectedSubmittedFixture();
+    corrupt(fixture);
+    const before = structuredClone(fixture);
+    assert.equal(recoverableObserverTurn(fixture.native, fixture.binding, fixture.source), null, String(corrupt));
+    assert.deepEqual(fixture, before);
+  }
+});
+
+test('projection cannot create proof for a spacing change and exact submissions remain v2', () => {
+  for (const sourceText of ['First\n  Second  line', 'First\n\n  Second line', 'First Second line']) {
+    const { native, turn, binding } = submittedFixture();
+    turn.items[0].content[0].text = 'First\n\n\n\n  Second  line';
+    const source = history([['user', `<timestamp>Monday, Oct 19, 2026, 11:01 AM (UTC)</timestamp>\n<user_query>${sourceText}</user_query>`]]);
+    delete native.tmuxObserverTurns;
+    native.historySync = { sourceTurns: { [source.turns[0].id]: turn.id },
+      sourceItems: { [source.turns[0].items[0].id]: turn.items[0].id } };
+    assert.equal(retainSubmittedTurn(native, turn, source.turns[0], binding, source), false);
+    assert.equal(native.tmuxObserverTurns, undefined);
+  }
+  const { native, turn, binding } = submittedFixture();
+  const source = history([['user', '<timestamp>Monday, Oct 19, 2026, 11:01 AM (UTC)</timestamp>\n<user_query>Continue please</user_query>']]);
+  delete native.tmuxObserverTurns;
+  native.historySync = { sourceTurns: {}, sourceItems: {} };
+  assert.equal(pinLiveSourceTurn(native, turn, source.turns[0]), true);
+  assert.equal(retainSubmittedTurn(native, turn, source.turns[0], binding, source), true);
+  assert.equal(native.tmuxObserverTurns[turn.id].version, 2);
+  native.tmuxObserverTurns[turn.id].version = 3;
+  assert.equal(observerTurnProof(native, turn.id), null, 'unchanged native text cannot masquerade as projection evidence');
+});
+
 test('explicit submitted proof recovers the same native client, model, user bytes and exact source without mutation', () => {
   for (const complete of [false, true]) {
     const fixture = submittedFixture();

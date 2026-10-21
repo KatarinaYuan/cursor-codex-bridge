@@ -2,6 +2,10 @@ import { createHash } from 'node:crypto';
 
 export const SOURCE_IDENTITY_SCHEME = 'cursor-envelope-v1';
 
+/** Cursor's JSONL export collapses runs of empty lines; input bytes stay intact. */
+export const cursorExportUserText = text => String(text || '').replace(/\r\n/gu, '\n')
+  .replace(/\n{3,}/gu, '\n\n').trim();
+
 function withoutAttachedSkills(text) {
   const attachment = text.match(/^\s*<manually_attached_skills>([\s\S]*?)<\/manually_attached_skills>\s*([\s\S]*)$/u);
   if (!attachment) return text;

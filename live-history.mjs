@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { unwrapUserEnvelope } from './source-identity.mjs';
+import { cursorExportUserText, unwrapUserEnvelope } from './source-identity.mjs';
 
 const textContent = content => typeof content === 'string' ? content
   : Array.isArray(content) ? content.filter(block => block?.type === 'text' && typeof block.text === 'string').map(block => block.text).join('\n') : '';
@@ -20,9 +20,11 @@ const sameObserverBinding = (proof, binding) => binding && proof.paneId === bind
   && proof.agentPid === binding.agentPid && proof.agentStartTime === binding.agentStartTime;
 const sha256 = text => createHash('sha256').update(text).digest('hex');
 const canonicalSubmittedText = turn => userText(turn).replace(/\r\n/gu, '\n').trim();
+const projectedSubmittedText = turn => cursorExportUserText(userText(turn));
 
 // Match the existing native tmux send contract: Cursor may trim the outer
-// whitespace, but all interior whitespace and hard newlines remain significant.
+// whitespace. This hash remains the strict canonical source hash, including its
+// exact interior spaces and newlines; export projection is separately versioned.
 export const submittedTurnTextSha256 = turn => sha256(canonicalSubmittedText(turn));
 export const nativeTurnTextSha256 = turn => sha256((turn?.items || [])
   .filter(item => item.type === 'userMessage').map(item => textContent(item.content)).join('\n'));
@@ -46,10 +48,15 @@ export function retainSubmittedTurn(record, nativeTurn, sourceTurn, binding, his
   if (!stableSourceTurn(sourceTurn, history) || history?.id !== record?.cursorSessionId
     || binding?.sessionId !== history.id || binding?.cwd !== record?.thread?.cwd
     || history.cwd !== record.thread.cwd || nativeTurn?.status !== 'inProgress'
-    || !record.thread.turns.includes(nativeTurn) || canonicalSubmittedText(sourceTurn) !== canonicalSubmittedText(nativeTurn)) return false;
+    || !record.thread.turns.includes(nativeTurn)
+    || history.turns?.filter(turn => turn.id === sourceTurn.id).length !== 1
+    || !history.turns.includes(sourceTurn)
+    || canonicalSubmittedText(sourceTurn) !== canonicalSubmittedText(nativeTurn)
+      && canonicalSubmittedText(sourceTurn) !== projectedSubmittedText(nativeTurn)) return false;
   const user = nativeTurn.items?.filter(item => item.type === 'userMessage');
   if (user?.length !== 1 || !nonempty(user[0].clientId)) return false;
-  const proof = { version: 2, sourceTurnId: sourceTurn.id, sessionId: history.id,
+  const proof = { version: canonicalSubmittedText(sourceTurn) === canonicalSubmittedText(nativeTurn) ? 2 : 3,
+    sourceTurnId: sourceTurn.id, sessionId: history.id,
     paneId: binding.paneId, agentPid: binding.agentPid, agentStartTime: binding.agentStartTime,
     origin: 'native', clientId: user[0].clientId, model: record.thread.model,
     userTextSha256: submittedTurnTextSha256(sourceTurn), nativeUserTextSha256: nativeTurnTextSha256(nativeTurn) };
@@ -65,14 +72,14 @@ export function retainSubmittedTurn(record, nativeTurn, sourceTurn, binding, his
 export function hasSubmittedTurnClaim(record, turnId) {
   const proof = record?.tmuxObserverTurns?.[turnId];
   return Object.hasOwn(record?.tmuxObserverTurns || {}, turnId)
-    && proof && typeof proof === 'object' && (proof.version === 2 || proof.origin === 'native');
+    && proof && typeof proof === 'object' && ([2, 3].includes(proof.version) || proof.origin === 'native');
 }
 
 /** Validate persisted observer ownership without deriving it from rendered text. */
 export function observerTurnProof(record, turnId) {
   const proof = record?.tmuxObserverTurns?.[turnId];
   const turns = record?.thread?.turns;
-  const submitted = proof?.version === 2;
+  const submitted = proof?.version === 2 || proof?.version === 3;
   const keys = submitted ? submittedProofKeys : observerProofKeys;
   if (record?.backend !== 'legacy' || !nonempty(turnId) || !Array.isArray(turns)
     || !Object.hasOwn(record.tmuxObserverTurns || {}, turnId)
@@ -94,7 +101,9 @@ export function observerTurnProof(record, turnId) {
     || !displayText(userText(turn))) return null;
   if (submitted && (proof.origin !== 'native' || !nonempty(proof.clientId) || !proof.clientId.trim()
     || proof.clientId !== users[0].clientId || !nonempty(proof.model) || proof.model !== record.thread.model
-    || !/^[a-f0-9]{64}$/u.test(proof.userTextSha256) || proof.userTextSha256 !== submittedTurnTextSha256(turn)
+    || !/^[a-f0-9]{64}$/u.test(proof.userTextSha256)
+    || proof.userTextSha256 !== (proof.version === 3 ? sha256(projectedSubmittedText(turn)) : submittedTurnTextSha256(turn))
+    || proof.version === 3 && projectedSubmittedText(turn) === canonicalSubmittedText(turn)
     || !/^[a-f0-9]{64}$/u.test(proof.nativeUserTextSha256) || proof.nativeUserTextSha256 !== nativeTurnTextSha256(turn)
     || turns.filter(candidate => candidate.status === 'inProgress').length !== 1
     || turns.some(candidate => candidate !== turn && candidate.items?.some(item => item.type === 'userMessage' && item.clientId === proof.clientId)))) return null;
@@ -119,8 +128,9 @@ export function recoverableObserverTurn(record, binding, history) {
   const sources = history.turns.filter(source => source?.id === proof.sourceTurnId);
   const sourceTurn = sources[0];
   if (sources.length !== 1 || !sourceTurnOwnable(sourceTurn, history) || !Array.isArray(sourceTurn.items) || sourceTurn.items.some(item => !item || typeof item !== 'object')
+    || proof.version === 3 && !stableSourceTurn(sourceTurn, history)
     || displayText(userText(sourceTurn)) !== displayText(userText(turn))) return null;
-  if (proof.version === 2) {
+  if (proof.version === 2 || proof.version === 3) {
     const users = sourceTurn.items.filter(item => item.type === 'userMessage');
     const nativeUser = turn.items.find(item => item.type === 'userMessage');
     const mapping = record.historySync?.sourceItems;
@@ -129,7 +139,7 @@ export function recoverableObserverTurn(record, binding, history) {
       || users.length !== 1 || users[0].clientId != null || !nonempty(users[0].id) || !nonempty(nativeUser.id)
       || !Array.isArray(users[0].content) || !users[0].content.length
       || users[0].content.some(block => block?.type !== 'text' || typeof block.text !== 'string')
-      || canonicalSubmittedText(sourceTurn) !== canonicalSubmittedText(turn)
+      || canonicalSubmittedText(sourceTurn) !== (proof.version === 3 ? projectedSubmittedText(turn) : canonicalSubmittedText(turn))
       || submittedTurnTextSha256(sourceTurn) !== proof.userTextSha256
       || !mapping || !Object.hasOwn(mapping, users[0].id) || mapping[users[0].id] !== nativeUser.id
       || Object.entries(mapping).some(([sourceId, nativeId]) => sourceId !== users[0].id && nativeId === nativeUser.id)) return null;

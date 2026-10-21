@@ -242,3 +242,31 @@ test('source pinning rejects unrelated input and conflicting mappings without mu
     assert.deepEqual(f.record, before);
   }
 });
+
+test('fresh source pinning permits only the documented export blank-line projection', () => {
+  const f = fixture();
+  const original = 'First  paragraph\n\n\n\nSecond paragraph\nLast line.\n';
+  const native = { id: 'fresh-native', status: 'inProgress', items: [{ ...user('fresh-user', original), clientId: 'fresh-client' }] };
+  f.record.thread.turns.push(native);
+  const digest = 'a'.repeat(64);
+  const source = { id: `${sessionId}:turn:envelope:${digest}`, sourceIdentity: {
+    version: 1, kind: 'timestamped-user-envelope', strength: 'stable', sha256: digest },
+    items: [user('export-user', original.replace(/\n{3,}/gu, '\n\n').trim())] };
+  const before = structuredClone(native);
+  assert.equal(pinLiveSourceTurn(f.record, native, source), true);
+  assert.deepEqual(native, before);
+  assert.equal(f.record.historySync.sourceTurns[source.id], native.id);
+  assert.equal(f.record.historySync.sourceItems['export-user'], 'fresh-user');
+  for (const change of [
+    (n, s) => { n.items[0].clientId = null; },
+    (n, s) => { s.sourceIdentity.strength = 'ambiguous'; },
+    (n, s) => { s.items[0].content[0].text = s.items[0].content[0].text.replace('First  ', 'First '); },
+    (n, s) => { s.items[0].content[0].text = s.items[0].content[0].text.replace('\nLast', ' Last'); },
+  ]) {
+    const next = structuredClone(f.record), n = next.thread.turns.at(-1), s = structuredClone(source);
+    change(n, s);
+    const unchanged = structuredClone(next);
+    assert.equal(pinLiveSourceTurn(next, n, s), false);
+    assert.deepEqual(next, unchanged);
+  }
+});

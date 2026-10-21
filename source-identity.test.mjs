@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { SOURCE_IDENTITY_SCHEME, timestampedUserEnvelope, isRuntimeContext, unwrapUserEnvelope } from './source-identity.mjs';
+import { SOURCE_IDENTITY_SCHEME, cursorExportUserText, timestampedUserEnvelope, isRuntimeContext, unwrapUserEnvelope } from './source-identity.mjs';
 
 const stamp = 'Monday, Oct 19, 2026, 3:38 AM (UTC)';
 const envelope = (query, timestamp = stamp) => `<timestamp>${timestamp}</timestamp>\n<user_query>${query}</user_query>`;
@@ -11,6 +11,18 @@ const catalog = [
   '<available_subagent_models>\nIf the user explicitly asks for the model of a subagent/task, you may ONLY use model slugs from this list:\n- inherit (default)\n</available_subagent_models>',
   '<dynamic_tool_catalog>\nThese dynamic tool namespaces were available when this conversation started. Availability may have changed, so use `GetDynamicTools` to check current state before calling `CallDynamicTool`.\n<dynamic_tool_namespaces>\n<namespace name="example" tools="Read" namespaceUseInstructions="Inspect the source.\n- Keep all text." source="native" />\n</dynamic_tool_namespaces>\n</dynamic_tool_catalog>',
 ].join('\n\n');
+
+test('the Cursor export projection changes only exterior whitespace, CRLF and runs of three or more LF', () => {
+  assert.equal(cursorExportUserText('  First\r\n\r\n\r\n\r\n  Second  line\r\n'), 'First\n\n  Second  line');
+  for (const original of ['First\nSecond', 'First\n\nSecond', 'First  Second', 'First\tSecond',
+    'First\n \n\nSecond', '<user_query>Literal\n\n\nvalue</user_query>']) {
+    assert.equal(cursorExportUserText(original), original.replace(/\n{3,}/gu, '\n\n'));
+  }
+  const raw = '\n First\n\n\n\nSecond \n';
+  assert.notEqual(timestampedUserEnvelope(envelope(raw), 'chat').sha256,
+    timestampedUserEnvelope(envelope(cursorExportUserText(raw)), 'chat').sha256,
+    'display matching must not project source envelope identity bytes');
+});
 
 test('shared display unwrapping requires a whole wrapper and preserves literal nested tags', () => {
   const query = 'Explain </user_query> and <user_query> literally';

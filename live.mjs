@@ -6,11 +6,14 @@ import { createModelCatalog } from './model-labels.mjs';
 import { draftViewportColumns, draftViewportPlan, draftViewportSnapshot } from './draft-viewport.mjs';
 import { UNSUBMITTED_DRAFT_ERROR, UNSUBMITTED_ANCHORED_DRAFT_ERROR } from './draft-recovery.mjs';
 import { sourceTurnOwnable, stableSourceTurn } from './live-history.mjs';
+import { cursorExportUserText } from './source-identity.mjs';
 
 const userText = turn => (turn?.items || []).filter(item => item.type === 'userMessage')
   .flatMap(item => item.content || []).filter(item => item.type === 'text').map(item => item.text).join('\n');
 const displayText = text => String(text || '').replace(/\s/gu, '');
 const canonicalPrompt = text => String(text || '').replace(/\r\n/g, '\n').trim();
+const sourceMatchesNativePrompt = (turn, prompt) => canonicalPrompt(userText(turn)) === canonicalPrompt(prompt)
+  || canonicalPrompt(userText(turn)) === cursorExportUserText(prompt);
 const sourceTurnComplete = (history, turn) => Boolean(history.sourceComplete
   || turn !== history.turns.at(-1) || history.completedTurnIds?.includes(turn.id));
 const screenUser = screen => {
@@ -246,7 +249,7 @@ export class TmuxSession extends EventEmitter {
   async start() {
     this.state = 'ready';
     if (this.history) for (const turn of this.history.turns) if (sourceTurnComplete(this.history, turn)) {
-      this.knownSourceIds.add(turn.id); this.knownSourceUsers.set(turn.id, canonicalPrompt(userText(turn)));
+      this.knownSourceIds.add(turn.id); this.knownSourceUsers.set(turn.id, cursorExportUserText(userText(turn)));
     }
     await this.poll(true);
     this.schedule();
@@ -305,7 +308,7 @@ export class TmuxSession extends EventEmitter {
     promise.catch(() => {});
     const baseline = new Set([...this.knownSourceIds, ...(this.history?.turns || []).map(turn => turn.id)]);
     const baselineUsers = new Map(this.knownSourceUsers);
-    for (const turn of this.history?.turns || []) baselineUsers.set(turn.id, canonicalPrompt(userText(turn)));
+    for (const turn of this.history?.turns || []) baselineUsers.set(turn.id, cursorExportUserText(userText(turn)));
     if (origin === 'external') {
       const source = this.history?.turns.find(turn => turn.id === sourceTurnId);
       if (!source || !sourceTurnOwnable(source, this.history)
@@ -761,15 +764,15 @@ export class TmuxSession extends EventEmitter {
         ? (turn.id === pending.sourceTurnId || pending.sourceIdentitySha256
           && turn.sourceIdentity?.sha256 === pending.sourceIdentitySha256)
           && displayText(userText(turn)) === displayText(pending.prompt)
-        : canonicalPrompt(userText(turn)) === canonicalPrompt(pending.prompt));
+        : sourceMatchesNativePrompt(turn, pending.prompt));
       const drift = history.turns.some(turn => pending.baselineUsers.has(turn.id)
-        && pending.baselineUsers.get(turn.id) !== canonicalPrompt(userText(turn)));
+        && pending.baselineUsers.get(turn.id) !== cursorExportUserText(userText(turn)));
       const schemeChanged = history.sourceIdentityScheme !== pending.baselineScheme;
       const plausible = matching.filter(turn => pending.sourceTurnId
         ? turn.id === pending.sourceTurnId || pending.sourceIdentitySha256
           && turn.sourceIdentity?.sha256 === pending.sourceIdentitySha256
         : !pending.baseline.has(turn.id) && (!schemeChanged
-          || ![...pending.baselineUsers.values()].includes(canonicalPrompt(userText(turn)))));
+          || ![...pending.baselineUsers.values()].includes(cursorExportUserText(userText(turn)))));
       const candidates = plausible.filter(turn => sourceTurnOwnable(turn, history)
         && (pending.origin === 'external' || !stableSourceTurn(turn, history)
           || Number.isSafeInteger(turn.sourceTimestampMinute)
@@ -800,10 +803,10 @@ export class TmuxSession extends EventEmitter {
             && currentHistory.sourceIdentityScheme === pending.sourceIdentityScheme)
           && !pending.ambiguousSourceHashes.has(current.sourceIdentity?.sha256)
           && !currentHistory.turns.some(turn => pending.baselineUsers.has(turn.id)
-            && pending.baselineUsers.get(turn.id) !== canonicalPrompt(userText(turn)))
+            && pending.baselineUsers.get(turn.id) !== cursorExportUserText(userText(turn)))
           && (pending.origin === 'external'
             ? displayText(userText(current)) === displayText(pending.prompt)
-            : canonicalPrompt(userText(current)) === canonicalPrompt(pending.prompt)) ? current : null;
+            : sourceMatchesNativePrompt(current, pending.prompt)) ? current : null;
       };
       if (sourceTurn && pending.submitted && pending.origin === 'native' && !pending.sourceTurnId) {
         pending.sourceTurnId = sourceTurn.id;
@@ -868,7 +871,7 @@ export class TmuxSession extends EventEmitter {
       }
     }
     for (const turn of history.turns) if (sourceTurnComplete(history, turn)) {
-      this.knownSourceIds.add(turn.id); this.knownSourceUsers.set(turn.id, canonicalPrompt(userText(turn)));
+      this.knownSourceIds.add(turn.id); this.knownSourceUsers.set(turn.id, cursorExportUserText(userText(turn)));
     }
   }
 

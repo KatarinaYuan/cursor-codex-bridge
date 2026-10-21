@@ -1,5 +1,5 @@
-import { sourceTurnOwnable, stableSourceTurn } from './live-history.mjs';
-import { unwrapUserEnvelope } from './source-identity.mjs';
+import { nativeTurnTextSha256, sourceTurnOwnable, stableSourceTurn, submittedTurnTextSha256 } from './live-history.mjs';
+import { cursorExportUserText, unwrapUserEnvelope } from './source-identity.mjs';
 
 /**
  * Reconcile a read-only Cursor transcript with its native bridge record.
@@ -19,6 +19,55 @@ function userText(text) {
 
 function turnUser(turn) {
   return (turn.items || []).filter(item => item.type === 'userMessage').map(item => userText(textContent(item.content))).join('\n');
+}
+
+const projectedProofKeys = ['version', 'sourceTurnId', 'sessionId', 'paneId', 'agentPid', 'agentStartTime',
+  'origin', 'clientId', 'model', 'userTextSha256', 'nativeUserTextSha256'];
+const textUser = turn => {
+  const users = turn?.items?.filter(item => item?.type === 'userMessage');
+  return users?.length === 1 && typeof users[0].id === 'string' && users[0].id
+    && Array.isArray(users[0].content) && users[0].content.length
+    && users[0].content.every(block => block?.type === 'text' && typeof block.text === 'string') ? users[0] : null;
+};
+
+/** A retained fresh-send receipt alone permits the CLI's empty-line projection. */
+function projectedCounterpart(record, history, native, source, sync) {
+  const receipts = [record.tmuxObserverTurns, record.exportedSubmissionTurns]
+    .filter(receipts => own(receipts || {}, native.id)).map(receipts => receipts[native.id]);
+  const proof = receipts[0];
+  const nativeUser = textUser(native), sourceUser = textUser(source);
+  const retainedTerminal = ['completed', 'failed', 'interrupted'].includes(native.status)
+    && own(record.exportedSubmissionTurns || {}, native.id);
+  if (!proof || typeof proof !== 'object' || Array.isArray(proof)
+    || Object.keys(proof).length !== projectedProofKeys.length
+    || !projectedProofKeys.every(key => own(proof, key))
+    || receipts.some(receipt => !receipt || Object.keys(receipt).length !== projectedProofKeys.length
+      || !projectedProofKeys.every(key => own(receipt, key) && receipt[key] === proof[key]))
+    || proof.version !== 3 || proof.origin !== 'native' || proof.sourceTurnId !== source.id
+    || proof.sessionId !== record.cursorSessionId || history.id !== proof.sessionId
+    || !record.thread.cwd || record.thread.cwd !== history.cwd
+    || typeof proof.paneId !== 'string' || !/^%\d+$/u.test(proof.paneId)
+    || !Number.isSafeInteger(proof.agentPid) || proof.agentPid <= 0
+    || typeof proof.agentStartTime !== 'string' || !/^\d+$/u.test(proof.agentStartTime)
+    || typeof proof.model !== 'string' || !proof.model.trim()
+    || !retainedTerminal && proof.model !== record.thread.model
+    || !nativeUser || !sourceUser || sourceUser.clientId != null
+    || typeof proof.clientId !== 'string' || !proof.clientId.trim() || proof.clientId !== nativeUser.clientId
+    || native.items.filter(item => item.id === nativeUser.id).length !== 1
+    || source.items.filter(item => item.id === sourceUser.id).length !== 1
+    || record.thread.turns.filter(turn => turn.id === native.id).length !== 1
+    || record.thread.turns.some(turn => turn !== native && turn.items?.some(item => item.type === 'userMessage'
+      && (item.clientId === proof.clientId || item.id === nativeUser.id)))
+    || !stableSourceTurn(source, history)
+    || history.turns.filter(turn => turn.id === source.id || turn.sourceIdentity?.sha256 === source.sourceIdentity.sha256).length !== 1
+    || !/^[a-f0-9]{64}$/u.test(proof.userTextSha256) || proof.userTextSha256 !== submittedTurnTextSha256(source)
+    || !/^[a-f0-9]{64}$/u.test(proof.nativeUserTextSha256) || proof.nativeUserTextSha256 !== nativeTurnTextSha256(native)
+    || turnUser(native) === turnUser(source) || cursorExportUserText(turnUser(native)) !== turnUser(source)
+    || !own(sync.sourceTurns, source.id) || sync.sourceTurns[source.id] !== native.id
+    || Object.entries(sync.sourceTurns).some(([sourceId, nativeId]) => sourceId !== source.id && nativeId === native.id)
+    || !own(sync.sourceItems, sourceUser.id) || sync.sourceItems[sourceUser.id] !== nativeUser.id
+    || Object.entries(sync.sourceItems).some(([sourceId, nativeId]) => sourceId !== sourceUser.id && nativeId === nativeUser.id)) return false;
+  return true;
 }
 
 const agentItems = turn => (turn.items || []).filter(item => item.type === 'agentMessage' && typeof item.text === 'string');
@@ -107,7 +156,7 @@ export function reconcileHistory(record, history) {
   const turns = next.thread.turns;
   // Retired previews retain native submission receipts. They may never become
   // source counterparts again after a truncated scan or an envelope rewrite.
-  const retired = new Set(Object.keys(next.retiredObserverTurns || {}));
+  const retired = new Set([...Object.keys(next.retiredObserverTurns || {}), ...Object.keys(next.retiredUnboundTurns || {})]);
   const changes = [];
   const usedTurnIds = new Set(turns.map(turn => turn.id));
   const usedItemIds = new Set(turns.flatMap(turn => (turn.items || []).map(item => item.id)));
@@ -117,6 +166,9 @@ export function reconcileHistory(record, history) {
 
   function bindItems(native, source, isSourceTurn) {
     native.items ||= [];
+    const projected = projectedCounterpart(next, history, native, source, sync);
+    const sameUser = (candidate, sourceItem) => userText(textContent(candidate.content)) === userText(textContent(sourceItem.content))
+      || projected && candidate.id === textUser(native).id && sourceItem.id === textUser(source).id;
     const sourceAgents = agentItems(source);
     const nativeAgents = agentItems(native);
     const sourceAgentText = agentText(source);
@@ -150,7 +202,7 @@ export function reconcileHistory(record, history) {
       if (sourceItem.type === 'agentMessage' && handledAgents) continue;
       const compatibleItem = candidate => candidate && !claimed.has(candidate.id) && candidate.type === sourceItem.type
         && (candidate.type === 'userMessage'
-          ? userText(textContent(candidate.content)) === userText(textContent(sourceItem.content))
+          ? sameUser(candidate, sourceItem)
           : candidate.text === sourceItem.text || candidate.text?.startsWith(sourceItem.text) || sourceItem.text?.startsWith(candidate.text));
       let item = own(sync.sourceItems, sourceItem.id)
         ? native.items.find(candidate => candidate.id === sync.sourceItems[sourceItem.id]) : undefined;
@@ -159,7 +211,7 @@ export function reconcileHistory(record, history) {
       if (!item && sourceItem.type === 'userMessage') {
         // Native wrappers and timestamps are absent from the human transcript.
         item = native.items.find(candidate => candidate.type === 'userMessage' && !claimed.has(candidate.id)
-          && userText(textContent(candidate.content)) === userText(textContent(sourceItem.content)));
+          && sameUser(candidate, sourceItem));
       }
       if (!item && sourceItem.type === 'agentMessage') {
         for (let index = itemCursor; index < native.items.length; index++) {
@@ -202,7 +254,7 @@ export function reconcileHistory(record, history) {
     const sourceCompleted = history.sourceComplete !== false || source !== history.turns.at(-1)
       || history.completedTurnIds?.includes(source.id);
     const agrees = candidate => candidate && !retired.has(candidate.id) && !claimedTurns.has(candidate.id)
-      && turnUser(candidate) === sourceUser;
+      && (turnUser(candidate) === sourceUser || projectedCounterpart(next, history, candidate, source, sync));
     let native = own(sync.sourceTurns, source.id)
       ? turns.find(turn => turn.id === sync.sourceTurns[source.id]) : undefined;
     if (!ownable || !agrees(native)) native = undefined;

@@ -1,5 +1,5 @@
-import { observerTurnProof, stableSourceTurn } from './live-history.mjs';
-import { SOURCE_IDENTITY_SCHEME, unwrapUserEnvelope } from './source-identity.mjs';
+import { observerTurnProof, stableSourceTurn, submittedTurnTextSha256 } from './live-history.mjs';
+import { cursorExportUserText, SOURCE_IDENTITY_SCHEME, unwrapUserEnvelope } from './source-identity.mjs';
 import { reconcileHistory } from './sync.mjs';
 
 export const OBSERVER_IDENTITY_LOSS_ERROR = 'Cursor observer source ownership was lost because its timestamped user envelope became ambiguous; completed transcript entries are shown separately and no input was resent';
@@ -50,17 +50,20 @@ export function observerRetirementCandidate(record, history) {
   const sourceItemIds = history.turns.flatMap(turn => turn.items.map(item => item.id));
   if (new Set(sourceItemIds).size !== sourceItemIds.length) return null;
   const group = history.turns.filter(turn => turn.sourceIdentity?.sha256 === sha256);
-  const prompt = exactUserText(original, proof.version === 2);
+  const submitted = proof.version === 2 || proof.version === 3;
+  const nativePrompt = exactUserText(original, submitted);
+  const prompt = proof.version === 3 && nativePrompt !== null ? cursorExportUserText(nativePrompt) : nativePrompt;
   const ambiguousPrefix = `${history.id}:turn:ambiguous:${sha256}:display:`;
   if (!prompt || group.length < 2 || group.some(turn => {
     const identity = turn.sourceIdentity;
     return identity.version !== 1 || identity.kind !== 'timestamped-user-envelope' || identity.strength !== 'ambiguous'
       || !turn.id.startsWith(ambiguousPrefix) || !/^(?:0|[1-9]\d*)$/u.test(turn.id.slice(ambiguousPrefix.length))
-      || !terminal.has(turn.status) || !completed.has(turn.id) || exactUserText(turn) !== prompt;
+      || !terminal.has(turn.status) || !completed.has(turn.id) || exactUserText(turn) !== prompt
+      || submitted && submittedTurnTextSha256(turn) !== proof.userTextSha256;
   })) return null;
   const itemIds = original.items.map(item => item.id);
   if (itemIds.some(id => !nonempty(id)) || new Set(itemIds).size !== itemIds.length) return null;
-  if (proof.version === 2) {
+  if (submitted) {
     const nativeUser = original.items.find(item => item.type === 'userMessage');
     const sourceUserId = `${proof.sourceTurnId}:user`;
     const mapping = record.historySync?.sourceItems;

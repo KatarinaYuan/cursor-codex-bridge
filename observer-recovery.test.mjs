@@ -197,6 +197,66 @@ function advancedFixture({ native = true, busy = true, unfinished = true, matchi
   return f;
 }
 
+function projectedAdvancedFixture() {
+  const f = advancedFixture();
+  const oldSource = f.source;
+  const rows = [['user', envelope('Earlier question', '00')], ['assistant', 'Earlier complete answer']];
+  const query = 'Continue  carefully\n\n  on this line';
+  const unique = transcript([...rows, ['user', envelope(query, '01')], ['assistant', 'First canonical answer']]);
+  f.source = unique.turns[1];
+  f.history = transcript([...rows, ['user', envelope(query, '01')], ['assistant', 'First canonical answer'],
+    ['user', envelope(query, '01')], ['assistant', 'Second canonical answer'],
+    ['user', envelope('A later question', '02')], ['assistant', 'Only a partial successor reply']]);
+  f.history.sourceComplete = false;
+  f.history.completedTurnIds = f.history.turns.slice(0, -1).map(turn => turn.id);
+  f.preview.items[0].content[0].text = 'Continue  carefully\n\n\n\n  on this line\n';
+  const proof = f.record.tmuxObserverTurns[f.preview.id];
+  Object.assign(proof, { version: 3, sourceTurnId: f.source.id,
+    userTextSha256: submittedTurnTextSha256(f.source), nativeUserTextSha256: nativeTurnTextSha256(f.preview) });
+  delete f.record.historySync.sourceTurns[oldSource.id];
+  f.record.historySync.sourceTurns[f.source.id] = f.preview.id;
+  delete f.record.historySync.sourceItems[oldSource.items[0].id];
+  delete f.record.historySync.sourceItems[oldSource.items[1].id];
+  f.record.historySync.sourceItems[f.source.items[0].id] = f.preview.items[0].id;
+  f.record.historySync.sourceItems[f.source.items[1].id] = f.preview.items[1].id;
+  return f;
+}
+
+test('v3 duplicate-source retirement validates exported source and raw native hashes while preserving original blank lines', () => {
+  const f = projectedAdvancedFixture();
+  const before = structuredClone(f);
+  const result = planObserverRetirement(f.record, f);
+  assert.ok(result);
+  assert.deepEqual(f, before);
+  const retired = result.record.thread.turns.find(turn => turn.id === f.preview.id);
+  assert.deepEqual(retired.items, f.preview.items);
+  assert.equal(retired.items[0].content[0].text, 'Continue  carefully\n\n\n\n  on this line\n');
+  assert.equal(result.record.retiredObserverTurns[retired.id].version, 3);
+  assert.equal(result.record.thread.turns.some(turn => turn.id === f.history.turns.at(-1).id), false);
+  assert.equal(reconcileHistory(result.record, { ...f.history, turns: f.history.turns.slice(0, -1) }).changed, false);
+});
+
+test('v3 duplicate-source retirement keeps strict hashes, whitespace, mappings and later-boundary requirements', () => {
+  const mutations = [
+    f => { f.record.tmuxObserverTurns[f.preview.id].version = 2; },
+    f => { f.record.tmuxObserverTurns[f.preview.id].userTextSha256 = '0'.repeat(64); },
+    f => { f.record.tmuxObserverTurns[f.preview.id].nativeUserTextSha256 = '0'.repeat(64); },
+    f => { f.preview.items[0].content[0].text += '\n'; },
+    f => { f.history.turns[1].items[0].content[0].text = 'Continue carefully\n\n  on this line'; },
+    f => { f.history.turns[2].items[0].content[0].text = 'Continue  carefully\n  on this line'; },
+    f => { f.record.historySync.sourceItems.alias = f.preview.items[0].id; },
+    f => { f.history.turns.pop(); },
+    f => { f.binding.agentStartTime = 'changed'; },
+    f => { f.record.thread.model = 'different-model'; },
+  ];
+  for (const mutate of mutations) {
+    const f = projectedAdvancedFixture(); mutate(f);
+    const before = structuredClone(f);
+    assert.equal(planObserverRetirement(f.record, f), null, mutate.toString());
+    assert.deepEqual(f, before);
+  }
+});
+
 test('native version 2 retirement still refuses ambiguous identities without a valid later boundary', () => {
   const f = advancedFixture({ busy: false, unfinished: false });
   f.history.turns.pop(); f.history.completedTurnIds.pop();
