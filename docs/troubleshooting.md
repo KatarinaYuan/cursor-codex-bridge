@@ -38,8 +38,8 @@ Cursor 登录属于远端用户环境。使用正确 SSH 用户并由账号拥�
 在 laptop 任意目录运行，把 `my-dev` 换成安装时的源 SSH 别名：
 
 ```sh
-npx --yes --package=https://github.com/KatarinaYuan/cursor-codex-bridge/releases/download/v0.1.15/cursor-codex-bridge-0.1.15.tgz cursor-codex upgrade --ssh my-dev
-npx --yes --package=https://github.com/KatarinaYuan/cursor-codex-bridge/releases/download/v0.1.15/cursor-codex-bridge-0.1.15.tgz cursor-codex doctor --ssh my-dev
+npx --yes --package=https://github.com/KatarinaYuan/cursor-codex-bridge/releases/download/v0.1.16/cursor-codex-bridge-0.1.16.tgz cursor-codex upgrade --ssh my-dev
+npx --yes --package=https://github.com/KatarinaYuan/cursor-codex-bridge/releases/download/v0.1.16/cursor-codex-bridge-0.1.16.tgz cursor-codex doctor --ssh my-dev
 ```
 
 原来使用自定义桥别名时，两条命令都补上相同的 `--alias my-cursor`。若升级和诊断通过而 App 仍显示旧列表，在 SSH 设置中断开桥连接后重新连接。全局最近列表有条数上限，较旧会话未进入当前列表不代表丢失；仍可在对应项目中查找。诊断和列表检查不会发送模型消息。
@@ -63,7 +63,7 @@ text remains as an unsubmitted draft in tmux. Review it in Cursor CLI
 
 `v0.1.8` 修复了中英文混排短消息的一种误拒绝：桥按终端显示宽度预测能放入六行，而 Cursor 的输入布局可能额外换行，隐藏最上面一行，导致原文无法完整核验。这不等于 SSH 已断开。新版在粘贴前更保守地规划临时列宽，同时按输入布局核验草稿；保留尾部换行及空行，无需手动拉宽窗口。升级不会自动提交已经留下的草稿；只在相同原文及完整恢复凭据均通过核对后才允许显式重试。若仍不匹配，继续保留草稿并拒绝发送 Enter，不会跳过核验。
 
-`v0.1.6` 修复了短消息超过六个显式文本行时的发送限制。消息不超过 800 个 UTF-16 字符且含超过六行时，桥会临时独占原 pane 的输入，阻止普通 tmux 按键混入，原文只粘贴一次，再移动光标检查全文。临时随机标记帮助识别连续空行；核验完成后先删除标记，再发送一次 Enter。提交原文保留空行、内部换行及首尾换行，不补字符、不合并段落，也不打开外部编辑器。看到旧的 `more than six hard lines; no text was pasted` 错误时，先升级到当前 `v0.1.15` 并运行诊断。
+`v0.1.6` 修复了短消息超过六个显式文本行时的发送限制。消息不超过 800 个 UTF-16 字符且含超过六行时，桥会临时独占原 pane 的输入，阻止普通 tmux 按键混入，原文只粘贴一次，再移动光标检查全文。临时随机标记帮助识别连续空行；核验完成后先删除标记，再发送一次 Enter。提交原文保留空行、内部换行及首尾换行，不补字符、不合并段落，也不打开外部编辑器。看到旧的 `more than six hard lines; no text was pasted` 错误时，先升级到当前 `v0.1.16` 并运行诊断。
 
 核验期间请等待临时输入锁自动释放。输入锁最多保留 300 秒，并有独立看门狗负责清理。已有 `pipe-pane`、已经关闭的 pane 输入、草稿或无法确认的布局会使桥拒绝接管。核验失败时不发送 Enter，保留草稿；如果提交是否成功的确认不明确，桥不会自动重发。
 
@@ -87,7 +87,11 @@ text remains as an unsubmitted draft in tmux. Review it in Cursor CLI
 
 `v0.1.15` 还处理一种已经提交、却未能绑定来源的多行消息：Cursor 的 JSONL 导出会把连续至少三个 LF 压成两个 LF，而原生请求保留完整原文。新版只在导出比较中使用这一窄投影，以 `v3` 凭据分别保存实际原文与导出正文摘要；不会合并普通换行、删除内部空格或放宽粘贴核验。
 
-旧未绑定预览只有在唯一已完成来源、提交时间窗口、已完成前缀、严格更晚的稳定最新请求和原进程新鲜画面等证据均成立时，才会被记为已中断，正式回复单独完整导入，最新请求继续跟踪。它不会被追认为成功提交的来源所有者；持久化收尾凭据阻止以后误合并或相同客户端消息重试时重发。存在其他归属、歧义、排队请求、未提交草稿或不匹配画面时继续拒绝处理。不要手动删空行、改状态或重复发送业务消息来清除 thinking；本版验收状态见 [v0.1.15 验证说明](verification-v0.1.15.md)。
+旧未绑定预览只有在唯一已完成来源、提交时间窗口、已完成前缀、严格更晚的稳定最新请求和原进程新鲜画面等证据均成立时，才会被记为已中断，正式回复单独完整导入，最新请求继续跟踪。它不会被追认为成功提交的来源所有者；持久化收尾凭据阻止以后误合并或相同客户端消息重试时重发。存在其他归属、歧义、排队请求、未提交草稿或不匹配画面时继续拒绝处理。不要手动删空行、改状态或重复发送业务消息来清除 thinking；该版本验收范围见 [v0.1.15 验证说明](verification-v0.1.15.md)。
+
+`v0.1.16` 处理另一种阻塞：旧原生显示没有建立来源凭据，正文又与正式来源不同，不能归属；整条聊天的运行屏障同时挡住后来已完成的回复和真实新任务。显示收尾不需要把两段正文视为相同，但必须具备独立证据：同一原进程和会话、既有映射的已完成前序来源锚点、原生开始所在分钟起的近邻完整稳定来源、已完成的中间前缀，以及严格更晚的稳定最新请求和相符的新鲜画面。
+
+满足条件后，只把旧显示原文和客户端消息保留为已中断，记录显示收尾凭据，再独立导入正式完成来源、继续观察最新请求。旧显示没有因此获得来源归属，不会被改报为成功。最新 transcript 尾部即使解析器暂写 `completed`，没有明确结束记录也不会进入完成历史。普通 CLI 草稿保持原样；当前任务仍忙碌或在提问时按真实状态继续显示，不代答、不清草稿、不改模型、不重发业务消息。缺少来源锚点、进程或最新画面等证据时继续拒绝收尾；范围与验收状态见 [v0.1.16 验证说明](verification-v0.1.16.md)。
 
 ## 升级或卸载提示忙碌
 

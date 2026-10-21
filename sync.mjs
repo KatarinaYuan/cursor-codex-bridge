@@ -248,11 +248,14 @@ export function reconcileHistory(record, history) {
 
   for (const source of history.turns || []) {
     if (!source?.id || !Array.isArray(source.items)) continue;
+    // The parser's provisional status can be "completed" before turn_ended.
+    // Only the source-bound live observer may publish an unfinished tail; a
+    // read-only history merge must neither import it nor rewrite its preview.
+    if (history.sourceComplete === false && source === history.turns.at(-1)
+      && !history.completedTurnIds?.includes(source.id)) continue;
     const sourceUser = turnUser(source);
     const ownable = sourceTurnOwnable(source, history);
     const stable = stableSourceTurn(source, history);
-    const sourceCompleted = history.sourceComplete !== false || source !== history.turns.at(-1)
-      || history.completedTurnIds?.includes(source.id);
     const agrees = candidate => candidate && !retired.has(candidate.id) && !claimedTurns.has(candidate.id)
       && (turnUser(candidate) === sourceUser || projectedCounterpart(next, history, candidate, source, sync));
     let native = own(sync.sourceTurns, source.id)
@@ -281,7 +284,7 @@ export function reconcileHistory(record, history) {
         // New envelope IDs must not inherit ordinal ownership. A historical
         // migration requires a unique completed user-and-answer counterpart;
         // active native submissions are bound by their live session instead.
-        if (stable && (!sourceCompleted || turn.status === 'inProgress' || !sourceAnswer || !nativeAnswer)) return false;
+        if (stable && (turn.status === 'inProgress' || !sourceAnswer || !nativeAnswer)) return false;
         if (!sourceAnswer && nativeAnswer) return false;
         return !sourceAnswer || !nativeAnswer || sourceAnswer.startsWith(nativeAnswer) || nativeAnswer.startsWith(sourceAnswer);
       });

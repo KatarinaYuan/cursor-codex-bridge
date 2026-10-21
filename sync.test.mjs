@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { parseTranscript } from './history.mjs';
 import { reconcileHistory } from './sync.mjs';
-import { retainSubmittedTurn } from './live-history.mjs';
+import { observerTurnProof, retainSubmittedTurn } from './live-history.mjs';
 
 function history(rows, extra = {}) {
   return parseTranscript(rows.map(([role, text]) => JSON.stringify({ role, message: { content: [{ type: 'text', text }] } })).join('\n'), {
@@ -47,6 +47,8 @@ function projectedFixture(completed = false) {
 
 for (const completed of [false, true]) test(`a ${completed ? 'retained completed' : 'live'} v3 receipt reconciles the projected echo without duplicating or replacing the raw native user`, () => {
   const f = projectedFixture(completed);
+  // A source can finish before its live observer commits the native turn.
+  if (!completed) f.incoming.completedTurnIds = [f.incoming.turns[0].id];
   if (completed) f.native.tmuxAffinity = { paneId: '%99', agentPid: 900, agentStartTime: '99999' };
   const before = structuredClone(f);
   const result = reconcileHistory(f.native, f.incoming);
@@ -77,6 +79,7 @@ test('a retained completed projection survives later model and original process 
 test('a live projection still requires its model and a terminal projection requires an archived receipt before ignoring later model changes', () => {
   for (const terminal of [false, true]) {
     const f = projectedFixture();
+    f.incoming.completedTurnIds = [f.incoming.turns[0].id];
     if (terminal) f.turn.status = 'completed';
     f.native.thread.model = 'different-current-model';
     const result = reconcileHistory(f.native, f.incoming);
@@ -134,6 +137,83 @@ test('imports new external turns and is idempotent after persistence', () => {
   assert.equal(result.record.thread.updatedAt, 200);
   const persisted = JSON.parse(JSON.stringify(result.record));
   assert.equal(reconcileHistory(persisted, incoming).changed, false);
+});
+
+for (const assistant of [false, true]) test(`an unfinished ${assistant ? 'partial-assistant' : 'user-only'} tail is omitted while its completed prefix imports`, () => {
+  const incoming = history([['user', 'Completed question'], ['assistant', 'Completed answer'],
+    ['user', 'Current question'], ...(assistant ? [['assistant', 'Current partial answer']] : [])]);
+  incoming.sourceComplete = false;
+  const tail = incoming.turns.at(-1);
+  assert.equal(tail.status, 'completed', 'The parser status alone is provisional');
+  assert.equal(incoming.completedTurnIds.includes(tail.id), false);
+  const native = record(incoming);
+  native.thread.turns = [];
+  const before = structuredClone({ native, incoming });
+  const result = reconcileHistory(native, incoming);
+  assert.deepEqual({ native, incoming }, before);
+  assert.deepEqual(result.record.thread.turns, incoming.turns.slice(0, -1));
+  assert.equal(result.turnsChanged.length, 1);
+  assert.equal(result.record.historySync.sourceTurns[tail.id], undefined);
+  for (const item of tail.items) assert.equal(result.record.historySync.sourceItems[item.id], undefined);
+  assert.equal(reconcileHistory(JSON.parse(JSON.stringify(result.record)), incoming).changed, false);
+});
+
+test('an unfinished tail leaves its existing active source observer, preview and mappings intact', () => {
+  const { incoming, native, turn } = projectedFixture();
+  turn.items[1].text = 'Live terminal preview'; turn.items[1].phase = 'commentary';
+  native.livePreviewIds = { [turn.id]: turn.items[1].id };
+  native.historySync.version = 1;
+  native.historySync.lastSourceTitle = incoming.title;
+  assert.ok(observerTurnProof(native, turn.id), 'The fixture retains valid active source ownership');
+  const result = reconcileHistory(native, incoming);
+  assert.equal(result.changed, false);
+  assert.deepEqual(result.record, native);
+  assert.deepEqual(result.turnsChanged, []);
+});
+
+test('a deferred tail imports exactly once when its source later explicitly completes', () => {
+  const partial = history([['user', 'Current question'], ['assistant', 'Partial answer']]);
+  partial.sourceComplete = false;
+  const native = record(partial);
+  native.thread.turns = [];
+  const first = reconcileHistory(native, partial);
+  assert.deepEqual(first.record.thread.turns, []);
+  const completed = history([['user', 'Current question'], ['assistant', 'Partial answer, now complete']]);
+  completed.sourceComplete = true;
+  const result = reconcileHistory(JSON.parse(JSON.stringify(first.record)), completed);
+  assert.deepEqual(result.record.thread.turns, completed.turns);
+  assert.equal(result.turnsChanged.length, 1);
+  assert.equal(result.turnsChanged[0].after.status, 'completed');
+  assert.equal(reconcileHistory(JSON.parse(JSON.stringify(result.record)), completed).changed, false);
+});
+
+for (const completionIds of [undefined, []]) test(`an unfinished tail is omitted with ${completionIds ? 'empty' : 'missing'} completion IDs`, () => {
+  const incoming = history([['user', 'Current question'], ['assistant', 'Partial answer']]);
+  incoming.sourceComplete = false;
+  if (completionIds) incoming.completedTurnIds = completionIds;
+  else delete incoming.completedTurnIds;
+  const native = record(incoming);
+  native.thread.turns = [];
+  const result = reconcileHistory(native, incoming);
+  assert.deepEqual(result.record.thread.turns, []);
+  assert.deepEqual(result.turnsChanged, []);
+  assert.equal(result.record.historySync.sourceTurns[incoming.turns[0].id], undefined);
+});
+
+for (const status of ['failed', 'interrupted']) test(`an explicit ${status} terminal marker remains importable when the overall snapshot is incomplete`, () => {
+  const incoming = parseTranscript([
+    { role: 'user', content: 'A terminal question' },
+    { role: 'assistant', content: 'A partial response before termination' },
+    { type: 'turn_ended', status, ...(status === 'failed' ? { error: 'Explicit source failure' } : {}) },
+  ].map(row => JSON.stringify(row)).join('\n'), { id: source.id, cwd: source.cwd });
+  incoming.sourceComplete = false;
+  const native = record(incoming);
+  native.thread.turns = [];
+  const result = reconcileHistory(native, incoming);
+  assert.deepEqual(result.record.thread.turns, incoming.turns);
+  assert.equal(result.record.thread.turns[0].status, status);
+  assert.equal(result.turnsChanged.length, 1);
+  if (status === 'failed') assert.equal(result.record.thread.turns[0].error.message, 'Explicit source failure');
 });
 
 test('binds a bridge continuation echoed by CLI without duplicating cards or IDs', () => {
@@ -475,8 +555,8 @@ test('an unfinished new envelope cannot reuse an earlier completed same-prompt a
   const native = reconcileHistory(record(prior), prior).record;
   const incoming = { ...history([['user', envelope('Continue', '02')], ['assistant', 'Hello']]), sourceComplete: false };
   const result = reconcileHistory(native, incoming);
-  assert.equal(result.record.thread.turns.length, 2);
-  assert.notEqual(result.record.historySync.sourceTurns[incoming.turns[0].id], native.thread.turns[0].id);
+  assert.equal(result.record.thread.turns.length, 1);
+  assert.equal(result.record.historySync.sourceTurns[incoming.turns[0].id], undefined);
   assert.equal(result.record.thread.turns[0].items[1].text, 'Hello world');
 });
 

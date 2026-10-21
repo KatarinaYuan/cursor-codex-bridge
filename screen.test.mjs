@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { parseCursorScreen } from './screen.mjs';
+import { needsHistoryCapture, parseCursorScreen } from './screen.mjs';
 
 const reset = '\x1b[0m';
 const dim = text => `\x1b[2m${text}${reset}`;
@@ -340,4 +340,30 @@ test('foreground truecolor, OSC links and styled footer text preserve the gate',
   assert.equal(parsed.body.includes('https://example.com'), false);
   assert.match(parsed.body, /Linked answer$/);
   assert.equal(parsed.currentReplyBody, '');
+});
+
+
+test('history capture fallback requires an empty user list and a supported exact observation state', () => {
+  const busy = { userMessages: [], ready: false, inputAvailable: false, busy: true,
+    waitingForQuestion: false, stopKey: 'C-c', reason: 'agent-busy' };
+  const question = { ...busy, busy: false, waitingForQuestion: true, stopKey: null, reason: 'question-awaiting-answer' };
+  const idle = { ...busy, ready: true, inputAvailable: true, busy: false, stopKey: null, reason: 'ready' };
+  const draft = { ...idle, ready: false, reason: 'input-has-draft' };
+  for (const supported of [busy, { ...busy, stopKey: 'Escape' }, question, idle, draft]) {
+    assert.equal(needsHistoryCapture(supported), true);
+    assert.equal(needsHistoryCapture({ ...supported, userMessages: ['Already visible'] }), false);
+    assert.equal(needsHistoryCapture({ ...supported, userMessages: [null] }), false);
+    assert.equal(needsHistoryCapture({ ...supported, userMessages: null }), false);
+    assert.equal(needsHistoryCapture({ ...supported, userMessages: '' }), false);
+    assert.equal(needsHistoryCapture({ ...supported, reason: 'unrecognized-footer-or-overlay' }), false);
+  }
+  for (const unsupported of [undefined, null, {}, [],
+    { ...busy, ready: true }, { ...busy, inputAvailable: true }, { ...busy, busy: 'true' },
+    { ...busy, stopKey: 'Enter' }, { ...busy, stopKey: null },
+    { ...question, waitingForQuestion: false }, { ...question, waitingForQuestion: 'true' },
+    { ...question, stopKey: 'Escape' }, { ...question, inputAvailable: true },
+    { ...idle, ready: false }, { ...idle, inputAvailable: false }, { ...idle, stopKey: 'C-c' },
+    { ...draft, ready: true }, { ...draft, busy: true }]) {
+    assert.equal(needsHistoryCapture(unsupported), false, JSON.stringify(unsupported));
+  }
 });

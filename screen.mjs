@@ -234,3 +234,14 @@ export function parseCursorScreen(rawANSI, { knownCursor = false } = {}) {
   return { text, body, currentTurnBody, currentReplyBody, inputText, inputDraft: draft, inputWidth, inputEmpty, inputAvailable, ready, busy, stopKey, waitingForQuestion, blocked: !ready, prompt,
     modelName: modelMatch?.[1]?.trim() ?? null, userMessages, reason, inputCompletion };
 }
+/** A supported frame may have scrolled its user envelope out of the short capture. */
+export function needsHistoryCapture(screen) {
+  if (!Array.isArray(screen?.userMessages) || screen.userMessages.length) return false;
+  const busy = screen.ready === false && screen.inputAvailable === false && screen.busy === true
+    && screen.reason === 'agent-busy' && ['C-c', 'Escape'].includes(screen.stopKey);
+  const question = screen.ready === false && screen.inputAvailable === false && screen.busy === false
+    && screen.waitingForQuestion === true && screen.stopKey === null && screen.reason === 'question-awaiting-answer';
+  const idle = screen.inputAvailable === true && screen.busy === false && screen.stopKey === null
+    && (screen.reason === 'ready' && screen.ready === true || screen.reason === 'input-has-draft' && screen.ready === false);
+  return busy || question || idle;
+}

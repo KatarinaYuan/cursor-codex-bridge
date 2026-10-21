@@ -13,6 +13,7 @@ import { resolveAttachmentDraftRetry } from './draft-attachments.mjs';
 import { createMaintenanceGate } from './maintenance.mjs';
 import { observerRetirementCandidate, planObserverRetirement } from './observer-recovery.mjs';
 import { unboundExportCandidate, planUnboundExportRetirement } from './export-recovery.mjs';
+import { supersededUnboundCandidate, planSupersededUnboundRetirement } from './unbound-recovery.mjs';
 import { cursorExportUserText } from './source-identity.mjs';
 
 const PROVIDER = 'cursor';
@@ -32,9 +33,9 @@ function sameAdmittedInput(record, turn, user, input) {
     && inputDigest(user.content) === proof.canonicalInputSha256;
 }
 
-// A retired observer can belong to an already submitted native request. Its
-// durable receipt acknowledges retries without ever submitting that request a
-// second time, including while a later CLI turn is running.
+// A retired display retains its original request ID even when submission could
+// not be attributed. A retry returns that interrupted display without sending
+// input again, including while a later independent CLI turn is running.
 function retiredSubmission(record, clientId, input) {
   if (typeof clientId !== 'string' || !clientId.trim()) return null;
   const candidates = record.thread.turns.filter(turn => (record.retiredObserverTurns?.[turn.id] || record.retiredUnboundTurns?.[turn.id])
@@ -53,9 +54,19 @@ function retiredSubmission(record, clientId, input) {
     && typeof proof.model === 'string' && Boolean(proof.model.trim())
     && /^%\d+$/u.test(proof.paneId || '') && Number.isSafeInteger(proof.agentPid) && proof.agentPid > 0
     && typeof proof.agentStartTime === 'string' && /^\d+$/u.test(proof.agentStartTime);
+  const sourcePrefix = `${record.cursorSessionId}:turn:envelope:`;
+  const advancedIds = [proof.anchorTurnId, proof.firstAdvancedTurnId, proof.successorTurnId];
+  const superseded = record.retiredUnboundTurns?.[turn.id] === proof
+    && proof.version === 2 && proof.reason === 'cursor-source-advanced'
+    && advancedIds.every(id => typeof id === 'string' && id.startsWith(sourcePrefix)
+      && /^[a-f0-9]{64}$/u.test(id.slice(sourcePrefix.length)))
+    && new Set(advancedIds).size === advancedIds.length
+    && typeof proof.model === 'string' && Boolean(proof.model.trim())
+    && /^%\d+$/u.test(proof.paneId || '') && Number.isSafeInteger(proof.agentPid) && proof.agentPid > 0
+    && typeof proof.agentStartTime === 'string' && /^\d+$/u.test(proof.agentStartTime);
   const submitted = [2, 3].includes(proof.version) && proof.origin === 'native'
     && proof.userTextSha256 === (proof.version === 3 ? projectedHash : submittedTurnTextSha256(turn));
-  if (candidates.length !== 1 || turn.status !== 'interrupted' || (!unbound && !submitted)
+  if (candidates.length !== 1 || turn.status !== 'interrupted' || (!unbound && !superseded && !submitted)
     || proof.sessionId !== record.cursorSessionId || proof.clientId !== clientId
     || !textOnly
     || proof.nativeUserTextSha256 !== nativeTurnTextSha256(turn)
@@ -957,10 +968,13 @@ async function findTmuxBinding(r) {
 async function retireCompletedObserver(r) {
   if (!tmuxSync || shuttingDown) return false;
   const history = sourceHistories.get(r.cursorSessionId);
-  const recovery = observerRetirementCandidate(r, history) || unboundExportCandidate(r, history);
+  const observer = observerRetirementCandidate(r, history);
+  const exported = observer ? null : unboundExportCandidate(r, history);
+  const superseded = observer || exported ? null : supersededUnboundCandidate(r, history);
+  const recovery = observer || exported || superseded;
   if (!recovery) return false;
   const proof = recovery.proof || { sessionId: r.cursorSessionId, ...r.tmuxAffinity };
-  const createPlan = recovery.proof ? planObserverRetirement : planUnboundExportRetirement;
+  const createPlan = observer ? planObserverRetirement : exported ? planUnboundExportRetirement : planSupersededUnboundRetirement;
   const execution = turnExecutions.get(r.thread.id);
   const session = sessions.get(r.thread.id);
   if (session && (session.kind !== 'tmux' || session.sessionId !== proof.sessionId
@@ -968,13 +982,22 @@ async function retireCompletedObserver(r) {
     || session.binding.agentStartTime !== proof.agentStartTime)) return false;
   if (execution && (execution.turnId !== recovery.turn.id || execution.session !== session)
     || (!execution && runningTurns.has(r.thread.id))) return false;
+  // A source advance can retire only an already-submitted display waiter.
+  // Never detach an in-flight paste, multiline verification or source commit.
+  if (superseded && execution && (session.pending?.origin !== 'native'
+    || session.pending.submitted !== true || session.pending.sourceTurnId
+    || session.pending.bindingRequired || session.pending.bindingPromise || session.committing
+    || session.pending.prompt !== recovery.turn.items.filter(item => item.type === 'userMessage')
+      .flatMap(item => item.content.map(block => block.text)).join('\n'))) return false;
   const snapshot = async () => {
     const candidate = await findTmuxBinding(r);
     if (!candidate) return null;
     const binding = await tmuxSync.client.verifiedBinding(candidate);
     if (!binding || !tmuxSync.client.isVerified(binding)) return null;
-    const { parseCursorScreen } = await import('./screen.mjs');
-    const screen = parseCursorScreen(await tmuxSync.client.capture(binding.paneId), { knownCursor: true });
+    const { needsHistoryCapture, parseCursorScreen } = await import('./screen.mjs');
+    let screen = parseCursorScreen(await tmuxSync.client.capture(binding.paneId), { knownCursor: true });
+    if (needsHistoryCapture(screen)) screen = parseCursorScreen(
+      await tmuxSync.client.capture(binding.paneId, { historyLines: 10_000 }), { knownCursor: true });
     await tmuxSync.client.verifiedBinding(binding);
     if (!tmuxSync.client.isVerified(binding)) return null;
     const current = sourceHistories.get(r.cursorSessionId);
@@ -992,8 +1015,10 @@ async function retireCompletedObserver(r) {
   const binding = candidate && await tmuxSync.client.verifiedBinding(candidate);
   if (!binding || !tmuxSync.client.isVerified(binding)
     || sourceHistories.get(r.cursorSessionId) !== history) return false;
-  const { parseCursorScreen } = await import('./screen.mjs');
-  const screen = parseCursorScreen(await tmuxSync.client.capture(binding.paneId), { knownCursor: true });
+  const { needsHistoryCapture, parseCursorScreen } = await import('./screen.mjs');
+  let screen = parseCursorScreen(await tmuxSync.client.capture(binding.paneId), { knownCursor: true });
+  if (needsHistoryCapture(screen)) screen = parseCursorScreen(
+    await tmuxSync.client.capture(binding.paneId, { historyLines: 10_000 }), { knownCursor: true });
   await tmuxSync.client.verifiedBinding(binding);
   if (!tmuxSync.client.isVerified(binding) || sourceHistories.get(r.cursorSessionId) !== history) return false;
   const plan = createPlan(r, { history, binding, screen });
@@ -1109,6 +1134,12 @@ async function startHistorySync(log) {
             imported++;
           } else {
             const { reconcileHistory } = await import('./sync.mjs');
+            // Keep the canonical anchor and obsolete native preview together
+            // until the verified tmux transaction can retire that display.
+            // Importing first would hide its boundary or prematurely complete
+            // a user-only live tail before its independent observer attaches.
+            if (process.platform === 'linux' && process.env.CURSOR_BRIDGE_LIVE_TMUX !== '0'
+              && supersededUnboundCandidate(existing, h)) return;
             // A restart loads an unproven old preview before tmux attachment.
             // Its newer CLI tail still belongs to a live observer; the parser's
             // provisional status must not announce that tail as completed.

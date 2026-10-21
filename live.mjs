@@ -1,7 +1,7 @@
 import { EventEmitter } from 'node:events';
 import { randomBytes } from 'node:crypto';
 import wrapAnsi from 'wrap-ansi';
-import { parseCursorScreen } from './screen.mjs';
+import { needsHistoryCapture, parseCursorScreen } from './screen.mjs';
 import { createModelCatalog } from './model-labels.mjs';
 import { draftViewportColumns, draftViewportPlan, draftViewportSnapshot } from './draft-viewport.mjs';
 import { UNSUBMITTED_DRAFT_ERROR, UNSUBMITTED_ANCHORED_DRAFT_ERROR } from './draft-recovery.mjs';
@@ -274,11 +274,22 @@ export class TmuxSession extends EventEmitter {
       throw error;
     }
     if (this.state !== 'ready' || !this.verified || epoch !== this.verificationEpoch) return;
-    const screen = parseCursorScreen(raw, { knownCursor: true });
+    let screen = parseCursorScreen(raw, { knownCursor: true });
+    const latestSource = this.history?.turns.at(-1);
+    if (!this.pending && !this.committing && latestSource && sourceTurnOwnable(latestSource, this.history)
+      && !sourceTurnComplete(this.history, latestSource) && !this.knownSourceIds.has(latestSource.id)
+      && (screen.busy || screen.waitingForQuestion) && needsHistoryCapture(screen)) {
+      // Reattachment can happen after the latest user envelope has scrolled
+      // beyond the ordinary 500-line capture. Read a bounded deeper frame;
+      // never synthesize its prompt from the source transcript.
+      const deeper = await this.client.capture(this.binding.paneId, { historyLines: 10_000 });
+      if (this.state !== 'ready' || !this.verified || epoch !== this.verificationEpoch
+        || this.history?.turns.at(-1) !== latestSource) return;
+      screen = parseCursorScreen(deeper, { knownCursor: true });
+    }
     this.screen = screen;
     this.observeModel(screen);
     const user = screenUser(screen);
-    const latestSource = this.history?.turns.at(-1);
     // A busy terminal or question overlay can redraw an already completed question, including after
     // an idle frame or observer restart. Only an unfinished canonical source ID
     // establishes a new CLI turn. Waiting for its transcript also disambiguates

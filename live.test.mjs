@@ -2261,3 +2261,156 @@ test('a CLI model change after paste leaves the message unsubmitted', async t =>
   await assert.rejects(session.prompt([{ type: 'text', text: 'Do not send' }], { model: opusMedium }), /currently uses/);
   assert.deepEqual(client.calls.map(call => call.type), ['paste-request', 'paste']);
 });
+
+
+class HistoryDepthTmuxClient extends MockTmuxClient {
+  constructor() { super(); this.depths = []; this.deepRaw = frame(); }
+  async capture(paneId, options = {}) {
+    assert.equal(paneId, binding.paneId);
+    this.captures++;
+    this.depths.push(options.historyLines ?? 500);
+    if (options.historyLines === 10_000) {
+      await this.beforeDeepReturn?.();
+      return this.deepRaw;
+    }
+    return this.raw;
+  }
+}
+
+function userOutsideShallowCapture({ prompt, answer = 'A long ongoing reply', busy = true, ...options }) {
+  return frame({ prompt, answer, busy, ...options }).replace(userBox(prompt), '  Reply continues from earlier scrollback.');
+}
+
+test('a verified deep capture restores the actual external prompt beyond the shallow history and waits for its source end', async t => {
+  const client = new HistoryDepthTmuxClient();
+  const { session } = await start(t, { client });
+  const external = [], updates = [];
+  session.on('externalTurn', event => external.push(event));
+  session.on('update', event => updates.push(event));
+  const prompt = 'The original prompt beyond the short capture';
+  const current = markSourceStarted(session, 'deep-current-source', prompt);
+  client.raw = userOutsideShallowCapture({ prompt });
+  client.deepRaw = frame({ prompt, answer: 'The ongoing reply visible with its original prompt', busy: true });
+  assert.deepEqual(parseCursorScreen(client.raw, { knownCursor: true }).userMessages, []);
+  const before = client.depths.length;
+  await session.poll();
+  assert.deepEqual(client.depths.slice(before), [500, 10_000]);
+  assert.equal(external.length, 1);
+  assert.equal(external[0].prompt, prompt);
+  assert.equal(external[0].sourceTurnId, current.id);
+  assert.equal(session.pending.origin, 'external');
+  assert.equal(updates.at(-1).text, 'The ongoing reply visible with its original prompt');
+  let resolved = false;
+  external[0].promise.then(() => { resolved = true; });
+  const afterAttach = client.depths.length;
+  await session.poll();
+  await Promise.resolve();
+  assert.equal(resolved, false);
+  assert.deepEqual(client.depths.slice(afterAttach), [500], 'A pending observer never requests another deep capture');
+  assert.deepEqual(client.calls, []);
+  const completed = history([turn('old', 'Earlier question'), turn(current.id, prompt, 'The complete canonical reply')]);
+  session.acceptHistory(completed);
+  assert.equal((await external[0].promise).sourceTurn.items.at(-1).text, 'The complete canonical reply');
+  session.turnCommitted();
+  client.raw = userOutsideShallowCapture({ prompt, busy: false, input: '→ Keep this private draft' });
+  const draftFrame = client.raw;
+  const afterEnd = client.depths.length;
+  await session.poll();
+  assert.deepEqual(client.depths.slice(afterEnd), [500]);
+  assert.equal(external.length, 1);
+  assert.equal(client.raw, draftFrame);
+  assert.deepEqual(client.calls, []);
+});
+
+for (const blocked of ['unsupported', 'idle', 'source-completed', 'pending', 'committing', 'known-source']) {
+  test(`a missing shallow user never triggers deep live observation while ${blocked}`, async t => {
+    const client = new HistoryDepthTmuxClient();
+    const { session } = await start(t, { client });
+    const external = [];
+    session.on('externalTurn', event => external.push(event));
+    const prompt = `The current source for ${blocked}`;
+    const current = markSourceStarted(session, `deep-blocked-${blocked}`, prompt);
+    client.raw = userOutsideShallowCapture({ prompt, busy: !['idle', 'unsupported'].includes(blocked),
+      ...(blocked === 'unsupported' ? { footer: `  ${dim('Composer 2.5 · 5.1%')}\n  ${dim('~')}\n  Allow this command? [y/n]` } : {}) });
+    client.deepRaw = frame({ prompt, answer: 'Must not be read', busy: true });
+    if (blocked === 'source-completed') session.acceptHistory(history([turn('old', 'Earlier question'), turn(current.id, prompt)]));
+    if (blocked === 'pending') { const pending = session.begin('native', 'Existing pending request'); pending.submitted = true; }
+    if (blocked === 'committing') session.committing = true;
+    if (blocked === 'known-source') session.knownSourceIds.add(current.id);
+    const before = client.depths.length;
+    await session.poll();
+    assert.deepEqual(client.depths.slice(before), [500]);
+    assert.deepEqual(external, []);
+    assert.deepEqual(client.calls, []);
+  });
+}
+
+for (const race of ['verification-epoch', 'source-advanced']) {
+  test(`a deep capture cannot publish a frame after its ${race} context changed`, async t => {
+    const client = new HistoryDepthTmuxClient();
+    const { session } = await start(t, { client });
+    const originalScreen = session.screen;
+    const external = [], updates = [];
+    session.on('externalTurn', event => external.push(event));
+    session.on('update', event => updates.push(event));
+    const prompt = 'A prompt outside the shallow capture';
+    markSourceStarted(session, 'deep-race-original', prompt);
+    client.raw = userOutsideShallowCapture({ prompt });
+    client.deepRaw = frame({ prompt, answer: 'Stale deep reply', busy: true });
+    client.beforeDeepReturn = async () => {
+      if (race === 'verification-epoch') { session.setVerified(false); session.setVerified(true); }
+      else markSourceStarted(session, 'deep-race-successor', 'A genuinely newer source prompt');
+    };
+    const before = client.depths.length;
+    await session.poll();
+    assert.deepEqual(client.depths.slice(before), [500, 10_000]);
+    assert.equal(session.screen, originalScreen);
+    assert.deepEqual(external, []);
+    assert.deepEqual(updates, []);
+    assert.deepEqual(client.calls, []);
+  });
+}
+
+
+for (const race of ['pending-appeared', 'committing']) {
+  test(`a deep capture does not adopt a second external observer when ${race} during its read`, async t => {
+    const client = new HistoryDepthTmuxClient();
+    const { session } = await start(t, { client });
+    const external = [];
+    session.on('externalTurn', event => external.push(event));
+    const prompt = 'A current user whose envelope is outside the shallow capture';
+    markSourceStarted(session, `deep-late-${race}`, prompt);
+    client.raw = userOutsideShallowCapture({ prompt });
+    client.deepRaw = frame({ prompt, answer: 'The current reply', busy: true });
+    client.beforeDeepReturn = async () => {
+      if (race === 'committing') session.committing = true;
+      else { const pending = session.begin('native', 'A different existing native pending'); pending.submitted = true; }
+    };
+    const before = client.depths.length;
+    await session.poll();
+    assert.deepEqual(client.depths.slice(before), [500, 10_000]);
+    assert.deepEqual(external, []);
+    assert.deepEqual(client.calls, []);
+  });
+}
+
+for (const mismatch of ['another-prompt', 'unrecognized-frame']) {
+  test(`a deep capture with ${mismatch} cannot synthesize the canonical external prompt`, async t => {
+    const client = new HistoryDepthTmuxClient();
+    const { session } = await start(t, { client });
+    const external = [];
+    session.on('externalTurn', event => external.push(event));
+    const prompt = 'The genuinely current canonical user';
+    markSourceStarted(session, `deep-mismatch-${mismatch}`, prompt);
+    client.raw = userOutsideShallowCapture({ prompt });
+    client.deepRaw = mismatch === 'another-prompt'
+      ? frame({ prompt: 'An older unrelated terminal prompt', answer: 'Old reply', busy: true })
+      : 'Unrecognized terminal program $ ';
+    const before = client.depths.length;
+    await session.poll();
+    assert.deepEqual(client.depths.slice(before), [500, 10_000]);
+    assert.equal(session.pending, null);
+    assert.deepEqual(external, []);
+    assert.deepEqual(client.calls, []);
+  });
+}

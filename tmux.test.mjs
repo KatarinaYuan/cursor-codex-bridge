@@ -134,6 +134,26 @@ test('captures ANSI by default and optionally plain text without interpreting pa
   await assert.rejects(f.client.capture('%1; touch /tmp/injected'), /pane ID/);
 });
 
+test('deep capture reads only a bounded explicit amount of history without changing tmux state', async (t) => {
+  const f = await fixture(t);
+  await f.client.capture('%1', { historyLines: 1 });
+  await f.client.capture('%1', { historyLines: 10_000 });
+  await f.client.capture('%1', { historyLines: 20_000, escapes: false });
+  assert.deepEqual(f.calls, [
+    { args: ['capture-pane', '-p', '-e', '-J', '-S', '-1', '-t', '%1'] },
+    { args: ['capture-pane', '-p', '-e', '-J', '-S', '-10000', '-t', '%1'] },
+    { args: ['capture-pane', '-p', '-J', '-S', '-20000', '-t', '%1'] },
+  ]);
+});
+
+test('capture rejects unbounded or malformed history depth before invoking tmux', async (t) => {
+  const f = await fixture(t);
+  for (const historyLines of [0, -1, 1.5, 20_001, Infinity, NaN, Number.MAX_SAFE_INTEGER, '20000', null, '-; send-keys Enter']) {
+    await assert.rejects(f.client.capture('%1', { historyLines }), /historyLines must be an integer from 1 to 20000/);
+  }
+  assert.equal(f.calls.length, 0);
+});
+
 test('pastes literal Unicode and multiline input through a unique private stdin buffer', async (t) => {
   const f = await fixture(t);
   const text = '中文 👩🏽‍💻\n$(touch /tmp/not-executed) `date` "quotes" ; --force';

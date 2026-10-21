@@ -10,6 +10,7 @@ const STORE = new RegExp(`^/(?:[^/]+/)*\\.cursor/chats/[^/]+/(${UUID})/store\\.d
 const SESSION = new RegExp(`^${UUID}$`, 'i');
 const MAX_PASTED_TEXT_BYTES = 8 * 1024 * 1024;
 const MAX_INPUT_COLUMNS = 1007;
+const MAX_CAPTURE_HISTORY_LINES = 20_000;
 
 function inputColumns(value, exclusive = false) {
   const maximum = exclusive ? 2007 : MAX_INPUT_COLUMNS;
@@ -318,8 +319,14 @@ export class TmuxClient {
     }
   }
 
-  async capture(paneId, { escapes = true } = {}) {
-    const result = await this.run(['capture-pane', '-p', ...(escapes ? ['-e'] : []), '-J', '-S', '-500', '-t', paneTarget(paneId)]);
+  async capture(paneId, { escapes = true, historyLines = 500 } = {}) {
+    // Deep recovery snapshots may need an older visible user message. Limit the
+    // read without changing scrollback, pane size, cursor position, or input;
+    // the runner's existing time and output limits still apply independently.
+    if (!Number.isSafeInteger(historyLines) || historyLines < 1 || historyLines > MAX_CAPTURE_HISTORY_LINES) {
+      throw new Error(`Cursor capture historyLines must be an integer from 1 to ${MAX_CAPTURE_HISTORY_LINES}`);
+    }
+    const result = await this.run(['capture-pane', '-p', ...(escapes ? ['-e'] : []), '-J', '-S', `-${historyLines}`, '-t', paneTarget(paneId)]);
     return String(result.stdout || '');
   }
 
