@@ -38,8 +38,8 @@ Cursor 登录属于远端用户环境。使用正确 SSH 用户并由账号拥�
 在 laptop 任意目录运行，把 `my-dev` 换成安装时的源 SSH 别名：
 
 ```sh
-npx --yes --package=https://github.com/KatarinaYuan/cursor-codex-bridge/releases/download/v0.1.16/cursor-codex-bridge-0.1.16.tgz cursor-codex upgrade --ssh my-dev
-npx --yes --package=https://github.com/KatarinaYuan/cursor-codex-bridge/releases/download/v0.1.16/cursor-codex-bridge-0.1.16.tgz cursor-codex doctor --ssh my-dev
+npx --yes --package=https://github.com/KatarinaYuan/cursor-codex-bridge/releases/download/v0.1.17/cursor-codex-bridge-0.1.17.tgz cursor-codex upgrade --ssh my-dev
+npx --yes --package=https://github.com/KatarinaYuan/cursor-codex-bridge/releases/download/v0.1.17/cursor-codex-bridge-0.1.17.tgz cursor-codex doctor --ssh my-dev
 ```
 
 原来使用自定义桥别名时，两条命令都补上相同的 `--alias my-cursor`。若升级和诊断通过而 App 仍显示旧列表，在 SSH 设置中断开桥连接后重新连接。全局最近列表有条数上限，较旧会话未进入当前列表不代表丢失；仍可在对应项目中查找。诊断和列表检查不会发送模型消息。
@@ -48,7 +48,7 @@ npx --yes --package=https://github.com/KatarinaYuan/cursor-codex-bridge/releases
 
 确认 Agent 处于同一用户的默认 tmux server，使用受支持的终端布局，并且输入框为空、当前轮次结束且没有菜单或审批。模型切换、审批和自由文本回答先在原 CLI 处理。
 
-若出现 `unrecognized-footer-or-overlay`，表示输入框下方的状态栏或附加界面未通过识别。窄终端中的路径和分支换行曾触发误判；`v0.1.2` 支持在右边缘空格后换行的分支分隔符。升级后重新连接桥即可加载修复。此错误也可能来自真实菜单或审批，不能据此认定输入框为空；不要自动清空草稿或按键关闭未知界面。
+若出现 `unrecognized-footer-or-overlay`，表示输入框下方的状态栏或附加界面未通过识别。窄终端中的路径和分支换行曾触发误判；`v0.1.2` 支持在右边缘空格后换行的分支分隔符。`v0.1.17` 还支持完整的 ` · ` 恰好结束于右边缘、分支名单独换到下一行的布局。这种误判可能只影响发送，历史和回复仍可同步。升级后重新连接桥即可加载修复。此错误也可能来自真实菜单或审批，不能据此认定输入框为空；不要自动清空草稿或按键关闭未知界面。
 
 若出现：
 
@@ -63,7 +63,7 @@ text remains as an unsubmitted draft in tmux. Review it in Cursor CLI
 
 `v0.1.8` 修复了中英文混排短消息的一种误拒绝：桥按终端显示宽度预测能放入六行，而 Cursor 的输入布局可能额外换行，隐藏最上面一行，导致原文无法完整核验。这不等于 SSH 已断开。新版在粘贴前更保守地规划临时列宽，同时按输入布局核验草稿；保留尾部换行及空行，无需手动拉宽窗口。升级不会自动提交已经留下的草稿；只在相同原文及完整恢复凭据均通过核对后才允许显式重试。若仍不匹配，继续保留草稿并拒绝发送 Enter，不会跳过核验。
 
-`v0.1.6` 修复了短消息超过六个显式文本行时的发送限制。消息不超过 800 个 UTF-16 字符且含超过六行时，桥会临时独占原 pane 的输入，阻止普通 tmux 按键混入，原文只粘贴一次，再移动光标检查全文。临时随机标记帮助识别连续空行；核验完成后先删除标记，再发送一次 Enter。提交原文保留空行、内部换行及首尾换行，不补字符、不合并段落，也不打开外部编辑器。看到旧的 `more than six hard lines; no text was pasted` 错误时，先升级到当前 `v0.1.16` 并运行诊断。
+`v0.1.6` 修复了短消息超过六个显式文本行时的发送限制。消息不超过 800 个 UTF-16 字符且含超过六行时，桥会临时独占原 pane 的输入，阻止普通 tmux 按键混入，原文只粘贴一次，再移动光标检查全文。临时随机标记帮助识别连续空行；核验完成后先删除标记，再发送一次 Enter。提交原文保留空行、内部换行及首尾换行，不补字符、不合并段落，也不打开外部编辑器。看到旧的 `more than six hard lines; no text was pasted` 错误时，先升级到当前 `v0.1.17` 并运行诊断。
 
 核验期间请等待临时输入锁自动释放。输入锁最多保留 300 秒，并有独立看门狗负责清理。已有 `pipe-pane`、已经关闭的 pane 输入、草稿或无法确认的布局会使桥拒绝接管。核验失败时不发送 Enter，保留草稿；如果提交是否成功的确认不明确，桥不会自动重发。
 

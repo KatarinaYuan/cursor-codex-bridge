@@ -155,6 +155,48 @@ test('wrapped branch rows require exact edge geometry, dim styling and branch sy
   }
 });
 
+test('recognizes a branch wrapped after the complete separator at the frame edge', () => {
+  // The final space of " · " occupies column 72; only the branch moves down.
+  for (const separator of ['·', '•']) {
+    const path = `  /${'a'.repeat(66)} ${separator} `;
+    const footer = `  ${dim('Gemini 4 Argon Medium · 35.9% · 1 file edited')}   \x1b[35mRun Everything\x1b[39m\n${dim(path)}\n  ${dim('feat/example')}`;
+    const parsed = parseCursorScreen(screen({ footer }));
+    assert.equal(parsed.ready, true);
+    assert.equal(parsed.inputEmpty, true);
+    assert.equal(parsed.modelName, 'Gemini 4 Argon Medium');
+    const draft = parseCursorScreen(screen({ footer, input: '→ Keep this draft' }));
+    assert.equal(draft.ready, false);
+    assert.equal(draft.reason, 'input-has-draft');
+  }
+});
+
+test('a separator at the previous edge cannot disguise padding, menus or approval rows', () => {
+  const path = `  /${'a'.repeat(66)} · `;
+  const row = `  ${dim('feat/example')}`;
+  const footer = (path, branch) => `  ${dim('Gemini 4 Argon Medium · 35.9%')}\n${path}\n${branch}`;
+  for (const [previous, next] of [
+    [dim(path.trimEnd()), row],
+    [dim(`${path} `), row],
+    [dim(path.replace(' · ', '·  ')), row],
+    [dim(path.replace('a', '')), row],
+    [dim(path.replace('a', 'aa')), row],
+    [dim(path.replace('a', '界')), row],
+    [path, row],
+    [dim(path), '  feat/example'],
+    [dim(path), ` ${dim('feat/example')}`],
+    [dim(path), `  ${dim('· feat/example')}`],
+    [dim(path), `  ${dim('feat/example extra')}`],
+    [dim(path), `  ${dim('feat/example · other')}`],
+    ...['Allow', 'Always', 'Continue', 'yes', 'Enter', 'Escape'].map(value => [dim(path), `  ${dim(value)}`]),
+    [dim(path), `${row}\n  ${dim('Allow')}`],
+    [dim(path), `${row}\n  Allow this command? [y/n]`],
+  ]) {
+    const parsed = parseCursorScreen(screen({ footer: footer(previous, next) }));
+    assert.equal(parsed.inputAvailable, false);
+    assert.equal(parsed.reason, 'unrecognized-footer-or-overlay');
+  }
+});
+
 test('status badges cannot disguise approvals, unknown labels, or unstyled menus', () => {
   for (const status of ['\x1b[35mAllow command?\x1b[39m', 'Run Everything', '\x1b[2mRun Everything\x1b[0m']) {
     const footer = ` ${dim('Composer 2.5 · 5.1% · 2 files edited')}   ${status}\n ${dim('/data/workspace')}`;

@@ -113,15 +113,20 @@ function cwdFooter(lines, frameWidth) {
     const previous = lines[index - 1];
     const continuation = lines[index].text.trim();
     const separatorContinuation = /^[·•] [^\s]+$/u.test(continuation);
+    const separatorAtPreviousEdge = /^[\x20-\x7e]* [·•] $/u.test(previous.rawText);
     // Cursor hard-wraps long cwd/branch text at the input frame's right edge.
     // Without a known column width (e.g. wide Unicode), reject continuation
     // rather than treating a menu or approval row as more path text.
     // A separator can start the next row only when its preceding single space
     // occupied the final column. Retain that raw space as edge evidence;
     // arbitrarily padded short paths must not authorize an extra footer row.
-    if (!/^[\x20-\x7e]*$/.test(previous.rawText) || previous.rawText.length !== frameWidth
-      || previous.text.length !== frameWidth - (separatorContinuation ? 1 : 0)
+    if ((!separatorAtPreviousEdge && !/^[\x20-\x7e]*$/.test(previous.rawText)) || previous.rawText.length !== frameWidth
+      || previous.text.length !== frameWidth - (separatorContinuation || separatorAtPreviousEdge ? 1 : 0)
       || lines[index].text.match(/^ */)[0].length !== indent) return false;
+    // The complete separator can also end at the right edge. Only its one
+    // branch token may continue onto the final row; arbitrary padded paths or
+    // extra menu rows must not acquire input permission through this case.
+    if (separatorAtPreviousEdge && (index !== lines.length - 1 || !/^[^\s·•]+$/u.test(continuation))) return false;
     if (!separatorContinuation && !/^[^\s·•]+(?: [·•] [^\s]+)?$/u.test(continuation)
       || /^(?:allow|always|deny|accept|approve|cancel|continue|yes|no|enter|escape)(?:\s|$)/iu.test(
         separatorContinuation ? continuation.slice(2) : continuation)) return false;

@@ -19,15 +19,15 @@ Use Cursor Agent and your Cursor account from the Codex desktop app's native SSH
 在 laptop 上执行，把 `my-dev` 换成你已有的 SSH 别名：
 
 ```sh
-npx --yes --package=https://github.com/KatarinaYuan/cursor-codex-bridge/releases/download/v0.1.16/cursor-codex-bridge-0.1.16.tgz cursor-codex install --ssh my-dev
+npx --yes --package=https://github.com/KatarinaYuan/cursor-codex-bridge/releases/download/v0.1.17/cursor-codex-bridge-0.1.17.tgz cursor-codex install --ssh my-dev
 ```
 
-这是 GitHub 预发布版本 `v0.1.16` 的安装包，不是 npm 同名包。`npx` 会下载该版本及其依赖，然后运行安装器。也可以从源码安装或修改：
+这是 GitHub 预发布版本 `v0.1.17` 的安装包，不是 npm 同名包。`npx` 会下载该版本及其依赖，然后运行安装器。也可以从源码安装或修改：
 
 ```sh
 git clone https://github.com/KatarinaYuan/cursor-codex-bridge.git
 cd cursor-codex-bridge
-git checkout v0.1.16
+git checkout v0.1.17
 npm ci --ignore-scripts
 node cli.mjs install --ssh my-dev
 ```
@@ -51,7 +51,7 @@ node cli.mjs install --ssh my-dev --alias my-cursor \
 以下命令在任意 laptop 目录运行，不需要克隆仓库。先为当前终端设置安装包地址：
 
 ```sh
-BRIDGE_PACKAGE_URL=https://github.com/KatarinaYuan/cursor-codex-bridge/releases/download/v0.1.16/cursor-codex-bridge-0.1.16.tgz
+BRIDGE_PACKAGE_URL=https://github.com/KatarinaYuan/cursor-codex-bridge/releases/download/v0.1.17/cursor-codex-bridge-0.1.17.tgz
 
 # 只读检查；不调用付费模型，也不向现有聊天发测试消息
 npx --yes --package="$BRIDGE_PACKAGE_URL" cursor-codex doctor --ssh my-dev
@@ -64,7 +64,7 @@ npx --yes --package="$BRIDGE_PACKAGE_URL" cursor-codex upgrade --ssh my-dev
 npx --yes --package="$BRIDGE_PACKAGE_URL" cursor-codex uninstall --ssh my-dev
 ```
 
-`doctor` 返回码为 `0` 表示检查通过、`1` 表示发现阻断问题。升级到新版本时，从 [Releases](https://github.com/KatarinaYuan/cursor-codex-bridge/releases) 取得目标版本安装包 URL，替换 `BRIDGE_PACKAGE_URL` 后运行 `upgrade`；它部署当前调用的版本，不自行选择最新版本。用同一版本再次升级也可以。上面的地址已固定到 `v0.1.16`：旧原生预览没有来源凭据、正文又与正式来源不同而阻塞后续同步时，桥可凭原进程、已完成前序锚点和后续稳定请求等独立证据，将旧显示保留为已中断，再同步正式回复和最新请求。它不靠相似正文追认提交归属，保留原输入、客户端消息、Cursor 进程、模型和草稿，不重发请求；具体范围与验收状态见 [v0.1.16 验证说明](docs/verification-v0.1.16.md)。升级完成后运行 `doctor`。已打开的 App 聊天可能继续缓存旧轮次顺序；SSH 重连不保证清空该缓存，客户端缓存重新加载和显示核验需单独完成。
+`doctor` 返回码为 `0` 表示检查通过、`1` 表示发现阻断问题。升级到新版本时，从 [Releases](https://github.com/KatarinaYuan/cursor-codex-bridge/releases) 取得目标版本安装包 URL，替换 `BRIDGE_PACKAGE_URL` 后运行 `upgrade`；它部署当前调用的版本，不自行选择最新版本。用同一版本再次升级也可以。上面的地址已固定到 `v0.1.17`：修复窄终端中完整路径分隔符 ` · ` 刚好占据行末、分支名位于下一行时，空输入框被误判为 `unrecognized-footer-or-overlay` 的问题。桥只接受精确行宽、灰色状态栏和单独分支行；草稿、审批与未知菜单继续阻止发送。验收范围见 [v0.1.17 验证说明](docs/verification-v0.1.17.md)。升级完成后运行 `doctor`。已打开的 App 聊天可能继续缓存旧轮次顺序；SSH 重连不保证清空该缓存，客户端缓存重新加载和显示核验需单独完成。
 
 升级和卸载遇到进行中的桥任务会拒绝操作；等待任务结束后再运行。程序不会结束原 Cursor Agent 或清空 tmux 草稿。源码安装也可在目标版本 checkout 使用 `node cli.mjs` 执行这些子命令，参数相同。
 
@@ -77,7 +77,7 @@ npx --yes --package="$BRIDGE_PACKAGE_URL" cursor-codex uninstall --ssh my-dev
 仓库附带一个安装 skill，可安装到 laptop 的 Codex skill 目录：
 
 ```sh
-npx --yes --package=https://github.com/KatarinaYuan/cursor-codex-bridge/releases/download/v0.1.16/cursor-codex-bridge-0.1.16.tgz cursor-codex install-skill
+npx --yes --package=https://github.com/KatarinaYuan/cursor-codex-bridge/releases/download/v0.1.17/cursor-codex-bridge-0.1.17.tgz cursor-codex install-skill
 ```
 
 也可指定目录：
@@ -88,7 +88,7 @@ npx --yes --package="$BRIDGE_PACKAGE_URL" cursor-codex install-skill --skill-dir
 
 这里的 `BRIDGE_PACKAGE_URL` 使用上文定义的版本地址。源码目录中也可运行 `node cli.mjs install-skill`。`--skill-dir` 指定 skill 的父目录。
 
-已有官方旧版 skill 的朋友也可直接运行同一条 `v0.1.16 install-skill` 命令：与目标内容相同则不改动；识别到未修改的官方 `v0.1.1`、`v0.1.2`、`v0.1.3`、`v0.1.4`、`v0.1.5`、`v0.1.6`、`v0.1.7`、`v0.1.8`、`v0.1.9`、`v0.1.10`、`v0.1.11`、`v0.1.12`、`v0.1.13`、`v0.1.14` 或 `v0.1.15` 两文件内容时，先保留旧目录备份，再原子更新，并输出备份路径。自定义内容、额外文件或符号链接会拒绝覆盖，保留用户修改，无需先手动删除旧目录。
+已有官方旧版 skill 的朋友也可直接运行同一条 `v0.1.17 install-skill` 命令：与目标内容相同则不改动；识别到未修改的官方 `v0.1.1`、`v0.1.2`、`v0.1.3`、`v0.1.4`、`v0.1.5`、`v0.1.6`、`v0.1.7`、`v0.1.8`、`v0.1.9`、`v0.1.10`、`v0.1.11`、`v0.1.12`、`v0.1.13`、`v0.1.14`、`v0.1.15` 或 `v0.1.16` 两文件内容时，先保留旧目录备份，再原子更新，并输出备份路径。自定义内容、额外文件或符号链接会拒绝覆盖，保留用户修改，无需先手动删除旧目录。
 
 也可以一条命令升级远端桥和本机安装 skill：
 
@@ -119,6 +119,8 @@ npx --yes --package="$BRIDGE_PACKAGE_URL" -c 'cursor-codex upgrade --ssh my-dev 
 旧 CLI 会话只支持文字。tmux 内的提问、审批和模型切换需在原 Cursor CLI 处理；已有草稿、忙碌状态或无法识别的界面会阻止代发。主题、Cursor 版本和模型显示格式变化可能需要适配。
 
 `v0.1.6` 支持短消息包含超过六个显式文本行，保留原文、空行及首尾换行，无需合并段落。桥在原 pane 中临时独占输入，粘贴一次，再逐页核验完整草稿，确认后只提交一次；结束后恢复终端输入及临时窗口设置。窄窗口的软换行仍自动处理。已有草稿、输入锁、`pipe-pane` 或不支持的布局会阻止代发；详见 [排障](docs/troubleshooting.md)。
+
+`v0.1.17` 支持完整分隔符 ` · ` 在右边缘结束、分支名换到下一行的状态栏。只在前一行精确填满、分隔符前为 ASCII、后续最后一行只有同缩进的灰色分支名时允许该布局；空格填充、额外菜单、审批、已有草稿和粘贴后正文变化仍阻止发送。
 
 `v0.1.16` 为没有来源凭据、正文与正式来源不同的旧原生显示提供独立收尾。桥核对同一原进程、已映射且完成的前序来源锚点、原生开始所在分钟起的近邻完整来源和严格更晚的最新稳定请求，再用新鲜终端画面核对最新活动。旧显示保留原文和客户端消息 ID，记为已中断并保存显示收尾凭据；正式完成回复单独导入，最新未完成请求由自己的外部观察继续跟踪。它不根据正文相似度绑定来源，也不把暂时带有 `completed` 状态但缺少明确结束证据的 transcript 尾部报为完成。私人 CLI 草稿不受改动，真实任务继续运行；缺少独立证据时继续等待。
 
@@ -155,7 +157,7 @@ npm test
 
 测试使用模拟 Cursor 和隔离的临时数据，不发送付费模型请求。部分集成测试需要真实 Codex CLI；找不到该程序时会跳过。输入租约的进程与终端集成测试需要 Linux 和 tmux，其他环境会跳过。这些跳过不能计为集成验证成功。可通过 `CURSOR_BRIDGE_TEST_REAL_CODEX` 指定 Codex 可执行文件。
 
-附带尚未启用的 [GitHub Actions 模板](docs/github-actions-test.yml)，配置 Node.js 22/24、Linux/macOS。启用时将其保存为 `.github/workflows/test.yml`。真实 SSH、Codex App、Cursor 账号及现有 tmux 的组合需要单独验收。本版测试范围及待验收项见 [v0.1.16 验证说明](docs/verification-v0.1.16.md)；重复封套后续边界恢复的历史验证见 [v0.1.14 验证说明](docs/verification-v0.1.14.md)，完整来源与空闲画面恢复的历史验证见 [v0.1.13 验证说明](docs/verification-v0.1.13.md)，延迟视口扫描的历史验证见 [v0.1.12 验证说明](docs/verification-v0.1.12.md)，附件重传恢复的历史验证见 [v0.1.11 验证说明](docs/verification-v0.1.11.md)，附件路径扫描的历史验证见 [v0.1.10 验证说明](docs/verification-v0.1.10.md)，来源绑定和显示顺序的历史验证见 [v0.1.9 验证说明](docs/verification-v0.1.9.md)，混合宽度输入的历史验证范围见 [v0.1.8 验证说明](docs/verification-v0.1.8.md)，来源身份修复见 [v0.1.7 验证说明](docs/verification-v0.1.7.md)，多行发送等历史功能的测试范围见 [v0.1.6 验证说明](docs/verification-v0.1.6.md)，长消息发送的历史验收见 [v0.1.3 验证说明](docs/verification-v0.1.3.md)。欢迎附带脱敏诊断提交 issue 或 PR。
+附带尚未启用的 [GitHub Actions 模板](docs/github-actions-test.yml)，配置 Node.js 22/24、Linux/macOS。启用时将其保存为 `.github/workflows/test.yml`。真实 SSH、Codex App、Cursor 账号及现有 tmux 的组合需要单独验收。本版验证范围见 [v0.1.17 验证说明](docs/verification-v0.1.17.md)，旧显示收尾的历史验证见 [v0.1.16 验证说明](docs/verification-v0.1.16.md)；重复封套后续边界恢复的历史验证见 [v0.1.14 验证说明](docs/verification-v0.1.14.md)，完整来源与空闲画面恢复的历史验证见 [v0.1.13 验证说明](docs/verification-v0.1.13.md)，延迟视口扫描的历史验证见 [v0.1.12 验证说明](docs/verification-v0.1.12.md)，附件重传恢复的历史验证见 [v0.1.11 验证说明](docs/verification-v0.1.11.md)，附件路径扫描的历史验证见 [v0.1.10 验证说明](docs/verification-v0.1.10.md)，来源绑定和显示顺序的历史验证见 [v0.1.9 验证说明](docs/verification-v0.1.9.md)，混合宽度输入的历史验证范围见 [v0.1.8 验证说明](docs/verification-v0.1.8.md)，来源身份修复见 [v0.1.7 验证说明](docs/verification-v0.1.7.md)，多行发送等历史功能的测试范围见 [v0.1.6 验证说明](docs/verification-v0.1.6.md)，长消息发送的历史验收见 [v0.1.3 验证说明](docs/verification-v0.1.3.md)。欢迎附带脱敏诊断提交 issue 或 PR。
 
 ## 许可证
 
